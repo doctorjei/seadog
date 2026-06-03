@@ -1,0 +1,175 @@
+name: Release
+
+# rc-then-promote release pipeline. Tag-gated, two mutually-exclusive paths:
+#
+#   * rc tag       v<ver>-rc<n>   build all artifacts + checksums, attach to a
+#                                 DRAFT prerelease. Nothing published as latest.
+#   * release tag  v<ver>         NO rebuild. Find the matching rc draft, fetch
+#                                 its exact assets, verify SHA256SUMS, publish
+#                                 them as the final release, delete the rc draft.
+#
+# Promoting the rc's bit-identical assets is the whole point: tested-bits ==
+# shipped-bits. The release tag must have a matching rc draft or it hard-fails.
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+'
+
+# gh release (create/list/download/delete) needs write access to releases.
+permissions:
+  contents: write
+
+# Never cancel a release mid-flight; serialize per ref.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # RC: build + checksum every artifact, attach to a DRAFT prerelease.
+  # ---------------------------------------------------------------------------
+  rc:
+    if: contains(github.ref_name, '-rc')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate tag shape + derive/guard version
+        id: ver
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$'; then
+            echo "::error::rc tag '$tag' is not v<major>.<minor>.<patch>-rc<n>"; exit 1
+          fi
+          base="${tag%-rc*}"
+          ver="${base#v}"
+          # The .deb/.rpm are versioned from the seadog crate's Cargo.toml, so
+          # the tag's base version must match or the assets would be mislabeled.
+          pkg="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/seadog/Cargo.toml | head -1)"
+          if [ "$ver" != "$pkg" ]; then
+            echo "::error::tag base version '$ver' != seadog crate version '$pkg'"; exit 1
+          fi
+          echo "ver=$ver" >>"$GITHUB_OUTPUT"
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "rcnum=${tag##*-rc}" >>"$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install musl linker + packaging tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          cargo install cargo-deb --locked
+          cargo install cargo-generate-rpm --locked
+
+      - name: Build static-musl binaries
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Build .deb
+        run: cargo deb -p seadog --target x86_64-unknown-linux-musl
+
+      - name: Build .rpm
+        run: cargo generate-rpm -p crates/seadog
+
+      - name: Stage release assets
+        id: stage
+        run: |
+          ver="${{ steps.ver.outputs.ver }}"
+          dist="dist"
+          rm -rf "$dist" && mkdir -p "$dist"
+
+          # Tarball: top-level dir with both binaries + the full deploy/ tree
+          # (the tarball-installer path consumes this in Phase 5).
+          troot="seadog-${ver}-x86_64-musl"
+          rm -rf "$troot" && mkdir -p "$troot"
+          cp target/x86_64-unknown-linux-musl/release/seadog "$troot/"
+          cp target/x86_64-unknown-linux-musl/release/seadog-priv "$troot/"
+          cp -r deploy "$troot/deploy"
+          tar -czf "$dist/${troot}.tar.gz" "$troot"
+
+          # Packages (filenames carry the crate version + a -1 package revision).
+          cp "target/debian/seadog_${ver}-1_amd64.deb" "$dist/"
+          cp "target/generate-rpm/seadog-${ver}-1.x86_64.rpm" "$dist/"
+
+          # SHA256SUMS over the three artifacts. Write OUTSIDE dist then move it
+          # in, so the glob never includes the sums file itself (which would
+          # make a later `sha256sum -c` fail on its own stale hash).
+          ( cd "$dist" && sha256sum -- * > ../SHA256SUMS )
+          mv SHA256SUMS "$dist/"
+          echo "dist=$dist" >>"$GITHUB_OUTPUT"
+          echo "--- staged assets ---"; ls -l "$dist"; echo "--- SHA256SUMS ---"; cat "$dist/SHA256SUMS"
+
+      - name: Create draft prerelease
+        run: |
+          tag="${{ steps.ver.outputs.tag }}"
+          dist="${{ steps.stage.outputs.dist }}"
+          title="seadog ${{ steps.ver.outputs.ver }} (rc${{ steps.ver.outputs.rcnum }})"
+          notes="Release candidate for seadog ${{ steps.ver.outputs.ver }}. Built and checksummed by CI; promoted bit-identically when the v${{ steps.ver.outputs.ver }} tag is pushed. Not for production use."
+          # Idempotent on re-runs of the same rc tag.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release delete "$tag" --yes
+          fi
+          gh release create "$tag" --draft --prerelease --title "$title" --notes "$notes" "$dist"/*
+          echo "Draft prerelease $tag created with:"; gh release view "$tag" --json assets --jq '.assets[].name'
+
+  # ---------------------------------------------------------------------------
+  # PROMOTE: no rebuild. Fetch the rc draft's assets, verify, publish, clean up.
+  # ---------------------------------------------------------------------------
+  promote:
+    if: ${{ !contains(github.ref_name, '-rc') }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate tag shape + derive version
+        id: ver
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::release tag '$tag' is not v<major>.<minor>.<patch>"; exit 1
+          fi
+          echo "ver=${tag#v}" >>"$GITHUB_OUTPUT"
+
+      - name: Find matching rc draft
+        id: rc
+        run: |
+          ver="${{ steps.ver.outputs.ver }}"
+          esc="${ver//./\\.}"
+          # Highest-numbered draft prerelease tagged v<ver>-rc<N>.
+          rc="$(gh release list --limit 200 --json tagName,isDraft,isPrerelease \
+                 --jq '.[] | select(.isDraft and .isPrerelease) | .tagName' \
+               | grep -E "^v${esc}-rc[0-9]+$" \
+               | sed -E 's/.*-rc([0-9]+)$/\1 &/' | sort -n | tail -1 | awk '{print $2}')"
+          if [ -z "$rc" ]; then
+            echo "::error::no rc draft prerelease found for v${ver}; push a v${ver}-rc<n> tag first"; exit 1
+          fi
+          echo "rc=$rc" >>"$GITHUB_OUTPUT"
+          echo "Promoting from rc draft: $rc"
+
+      - name: Download + verify rc assets
+        run: |
+          rc="${{ steps.rc.outputs.rc }}"
+          rm -rf staging && mkdir -p staging
+          gh release download "$rc" --dir staging
+          echo "--- downloaded ---"; ls -l staging
+          ( cd staging && sha256sum -c SHA256SUMS )
+
+      - name: Publish final release
+        run: |
+          ver="${{ steps.ver.outputs.ver }}"
+          tag="${GITHUB_REF_NAME}"
+          notes="seadog ${ver}. Promoted bit-identically from ${{ steps.rc.outputs.rc }} (assets verified against SHA256SUMS — tested-bits == shipped-bits)."
+          gh release create "$tag" --title "seadog ${ver}" --notes "$notes" --latest staging/*
+          echo "Published $tag with:"; gh release view "$tag" --json assets --jq '.assets[].name'
+
+      - name: Delete rc draft
+        run: gh release delete "${{ steps.rc.outputs.rc }}" --yes
