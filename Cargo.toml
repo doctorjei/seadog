@@ -6,7 +6,7 @@ members = ["crates/core"]
 # Other crates (seadog, seadog-priv) are added in later phases.
 [workspace.package]
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-or-later"
 authors = ["Jei Blanchard <jjb@eng.ufl.edu>"]
 rust-version = "1.80"
 
