@@ -1,0 +1,52 @@
+# /etc/seadog/config.yaml — seadog provisioner config (annotated example)
+# Read once per invocation. seadog never rewrites this file.
+
+reaper_enabled: true            # master switch; off = escaped envs may live forever
+
+cadence:
+  fast: 60s                     # shell-spawned watcher loop (while >=1 env active)
+  idle: 60m                     # systemd backstop timer (always-on floor)
+
+allocation:
+  vmid_range: [10000, 10999]    # inclusive; the scan + allocator range
+  ip_pool:                      # static IPs at create, lowest-available, atomic lease
+    range: [192.168.0.192, 192.168.0.254]
+    gateway: 192.168.0.1
+    prefix: 24
+  caps:                         # global concurrency ceilings (per-owner overrides below)
+    max_lxc_per_owner: 8
+    max_vm_per_owner: 3
+
+images:                         # allowlist: name -> {ref, modes}; never a caller ref
+  loom:     { ref: ghcr.io/doctorjei/droste:loom,     modes: [lxc] }
+  stuffer:  { ref: ghcr.io/doctorjei/droste:stuffer,  modes: [vm]  }
+  kanibako: { ref: ghcr.io/doctorjei/kanibako:latest, modes: [lxc, vm] }  # first = default
+
+owners:                         # identity (fingerprint->name) lives in authorized_keys;
+  kanibako: { max_lxc: 12 }     # this block is per-owner cap OVERRIDES only (optional)
+
+identity:                       # hardware-fingerprint tie-breaker (flag-only, never reaps)
+  threshold: 0.6                # tune empirically; bias toward sensitivity
+  weights:                      # high-info fields carry weight; low-info ~0
+    network: 3                  # bridge + VLAN + model
+    disk: 3                     # geometry / size
+    machine: 2                  # machine type / BIOS / scsihw
+    memory: 0
+    cores: 0
+
+lifecycle:
+  age_floor: 5m                 # never reap envs younger than this (non-atomic create window)
+  default_duration: 30m         # soft "expected done" alert (informational)
+  default_ttl: 1h               # hard kill; per-env override at create
+  grace: 10m                    # warning window before the hard kill (warn at ttl - grace)
+  herd_cap: 10                  # max reaps per sweep; remainder carried to next tick
+
+retention:
+  terminal: 7d                  # keep DB rows for GONE envs (reaped/vanished) — history only
+  # Live envs are NEVER pruned, no matter how overdue.
+
+notify:
+  journald: true                # default sink, always on, priority-tagged
+  command: null                 # optional push sink: run per event
+  dir: null                     # optional push sink: drop a file per event
+  reescalate: 30m               # unresolved OUR problems re-alert on this backoff

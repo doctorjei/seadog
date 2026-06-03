@@ -1,0 +1,21 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local state / secrets (never commit)
+*.db
+*.db-wal
+*.db-shm
+*.key
+*_ed25519
+*.pem
+owners.toml
+config.toml
+
+# kanibako infrastructure — never commit (managed outside the project)
+/vault/
+
+# Editor / OS
+*.swp
+.DS_Store

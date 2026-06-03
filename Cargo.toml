@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/core"]
+
+# Shared package metadata inherited by member crates via `field.workspace = true`.
+# Other crates (seadog, seadog-priv) are added in later phases.
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Jei Blanchard <jjb@eng.ufl.edu>"]
+rust-version = "1.80"
+
+# Centralized dependency versions so member crates stay in lockstep.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
+humantime-serde = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+thiserror = "2"
+
+[profile.release]
+# Static-musl deploy target: optimize for size + strip, single codegen unit.
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
