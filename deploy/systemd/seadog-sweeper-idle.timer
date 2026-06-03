@@ -1,0 +1,30 @@
+# seadog-sweeper-idle.timer — the always-on backstop + reaper heartbeat.
+#
+# This timer is the slow, always-running floor under the reaper. The
+# FAST path is `seadog-priv watch`: an in-process flock-singleton loop
+# the front-end spawns (`setsid sudo seadog-priv watch`) whenever an env
+# is in play, sweeping on `cadence.fast` and self-extinguishing when
+# idle. That watcher is DELIBERATELY NOT a systemd unit — keeping the
+# two reaping mechanisms in different failure domains (a wedged systemd /
+# a wedged timer can't take out the in-process loop, and vice versa).
+#
+# Effective reap latency self-heals to min(active-watcher-cadence,
+# this-timer). When envs are active the fast watcher dominates; when the
+# watcher has exited (idle) this timer is the backstop that still stamps
+# the heartbeat and reaps anything that escaped.
+
+[Unit]
+Description=seadog reaper backstop timer (idle floor + heartbeat)
+Documentation=https://github.com/doctorjei/seadog
+
+[Timer]
+Unit=seadog-sweeper.service
+# First sweep 10 min after boot (let PVE settle), then at most 60 min
+# after each run finishes. No Persistent=: the schedule is monotonic, so
+# a missed window simply self-heals on the next run — we do not want a
+# burst of catch-up sweeps after downtime.
+OnBootSec=10min
+OnUnitInactiveSec=60min
+
+[Install]
+WantedBy=timers.target

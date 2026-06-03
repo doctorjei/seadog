@@ -1,0 +1,12 @@
+# seadog sudoers drop-in — install to /etc/sudoers.d/seadog, mode 0440.
+#
+# Lets the unprivileged `testenv` front-end shell out to the root helper
+# `seadog-priv` (the elevation bridge in seadog::elevate). The wildcard
+# matches ANY args on purpose: argument validation is the helper's job,
+# NOT sudoers' — seadog-priv re-loads its own /etc/seadog/config.yaml and
+# re-validates every argument independently (it trusts nothing from the
+# front-end and does not even link the SSH-command parser). Trying to
+# pin args in the sudoers match would be both brittle and a false sense
+# of security. Verify with `visudo -cf` before install.
+Defaults:testenv !requiretty, env_reset, secure_path="/usr/sbin:/usr/bin:/sbin:/bin"
+testenv ALL=(root) NOPASSWD: /usr/lib/seadog/seadog-priv *

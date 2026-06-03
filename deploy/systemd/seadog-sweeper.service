@@ -1,0 +1,44 @@
+# seadog-sweeper.service — the one-shot backstop reaper pass.
+#
+# Runs `seadog-priv sweep` ONCE as root: open the DB, run the shared
+# core::reap sweep (reap expired+unanimous envs, write the heartbeat,
+# route notifications), prune aged-out terminal rows, exit. The
+# always-on `seadog-sweeper-idle.timer` triggers this on a slow cadence
+# as the failure-domain-diverse backstop to the fast in-process watcher
+# (`seadog-priv watch`, which is deliberately NOT a systemd unit).
+#
+# This unit runs as root (the operator is root on blue) with NO sudo:
+# `seadog-priv` self-guards on euid 0 and re-validates everything.
+
+[Unit]
+Description=seadog one-shot reaper sweep (backstop)
+Documentation=https://github.com/doctorjei/seadog
+# Never sweep before Proxmox is up: a sweep that can't reach pmxcfs /
+# pvedaemon would see no quorum and abort the tick (harmless, but
+# pointless). Ordering only — these are not hard requirements so the
+# timer still fires on a node where PVE is intentionally down.
+After=pve-cluster.service pvedaemon.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/seadog/seadog-priv sweep
+# A hung `qm destroy` / `pct destroy` must not stall reaping forever:
+# cap the whole pass and let the next timer cycle retry the remainder.
+RuntimeMaxSec=300
+# Light sandbox. We deliberately do NOT set ProtectSystem=strict: the
+# sweep writes through the /etc/pve pmxcfs FUSE mount and PVE storage,
+# and strict would remount most of the filesystem read-only and break
+# those writes. NoNewPrivileges + ProtectHome are safe and cheap.
+NoNewPrivileges=yes
+ProtectHome=yes
+# Keep DB WAL/SHM sidecars group-writable for the testenv front-end (the
+# binary also sets umask(002), but this is belt-and-suspenders for any
+# file the sweep creates). Pairs with the setgid group `seadog` on
+# /var/lib/seadog.
+UMask=0002
+SyslogIdentifier=seadog
+
+[Install]
+# Not enabled directly; the timer is what gets enabled. Present so the
+# unit can also be started by hand (`systemctl start seadog-sweeper`).
+WantedBy=multi-user.target
