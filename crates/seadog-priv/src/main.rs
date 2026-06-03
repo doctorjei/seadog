@@ -28,6 +28,10 @@ use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
+// The reaper entry points live in the library face (so the integration
+// suite can drive them); the binary calls into them like any other module.
+use seadog_priv::{sweep, watch};
+
 use seadog_core::config::Config;
 use seadog_core::kento::Kento;
 use seadog_core::models::Mode;
@@ -55,9 +59,10 @@ enum Verb {
     SetMeta(set_meta::SetMetaArgs),
     /// Start the in-CT sshd on a verified seadog LXC.
     StartSshd(start_sshd::StartSshdArgs),
-    /// Reaper watcher loop (Phase 3b — stub).
+    /// Reaper watcher loop: fast self-extinguishing sweep loop (flock
+    /// singleton; exits when idle).
     Watch,
-    /// One-shot sweep (Phase 3b — stub).
+    /// One-shot sweep: the 60-min systemd-timer backstop.
     Sweep,
 }
 
@@ -110,17 +115,33 @@ fn load_config() -> Result<Config> {
 /// Split out from `main` (which selects the real backend + does the euid
 /// guard) so tests drive it directly with a `FakeKento` and a fixture
 /// config. Returns the JSON the verb prints on success.
+/// `dispatch` covers the verbs whose behavior is fully determined by their
+/// args + the `Kento`/`Config` seam. `watch`/`sweep` additionally need DB
+/// access (deadlines + heartbeat live in `$SEADOG_DB`); they open the DB
+/// inside their own modules (`sweep::run` / `watch::run`) so provision/
+/// teardown/etc. keep their exact signatures and never touch the DB. `main`
+/// routes those two there directly.
 fn dispatch(verb: &Verb, kento: &dyn Kento, config: &Config) -> Result<Value> {
     match verb {
         Verb::Provision(args) => provision::run(args, kento, config),
         Verb::Teardown(args) => teardown::run(args, kento, config),
         Verb::SetMeta(args) => set_meta::run(args, kento, config),
         Verb::StartSshd(args) => start_sshd::run(args, kento, config),
-        Verb::Watch | Verb::Sweep => Ok(json!({
-            "ok": false,
-            "error": "watch/sweep are not yet implemented (Phase 3b)",
-        })),
+        // watch/sweep open the DB themselves (they are the only DB-touching
+        // verbs); `now` is wall-clock in prod.
+        Verb::Sweep => sweep::run(kento, config, wall_clock_now()),
+        Verb::Watch => watch::run(kento, config),
     }
+}
+
+/// Wall-clock seconds since the unix epoch (the `sweep` one-shot's clock;
+/// the watch loop reads its own per-tick clock internally).
+fn wall_clock_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Log every privileged op to journald (best-effort, non-fatal): the
@@ -263,14 +284,24 @@ mod tests {
     }
 
     #[test]
-    fn watch_and_sweep_are_stubs() {
-        // Stubs return a structured "not implemented" payload, never error.
+    fn watch_and_sweep_run_against_an_isolated_db() {
+        // With no active envs, both verbs run cleanly: sweep over an empty
+        // DB returns ok; watch acquires the lock, self-extinguishes on the
+        // first idle tick, and returns ok. We point both at temp paths so
+        // the test never touches the prod DB / lock.
         let cfg = crate::test_support::config();
         let k = seadog_core::kento::FakeKento::new();
-        let v = dispatch(&Verb::Watch, &k, &cfg).unwrap();
-        assert_eq!(v["ok"], serde_json::Value::Bool(false));
+        let _g = crate::test_support::TempEnv::isolated();
+
         let v = dispatch(&Verb::Sweep, &k, &cfg).unwrap();
-        assert_eq!(v["ok"], serde_json::Value::Bool(false));
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["reaped"], 0);
+
+        let v = dispatch(&Verb::Watch, &k, &cfg).unwrap();
+        assert_eq!(v["ok"], true);
+        // Either it ran one idle tick, or (if a stray lock existed) reported
+        // already-running; both are ok=true.
+        assert!(v["watcher"].is_string());
     }
 }
 
@@ -294,5 +325,51 @@ images:
         let c = Config::from_yaml_str(yaml).unwrap();
         c.validate().unwrap();
         c
+    }
+
+    /// Point `$SEADOG_DB` + `$SEADOG_WATCHER_LOCK` at fresh temp paths for a
+    /// test that exercises the prod `dispatch` path (which opens the DB /
+    /// flock by env). Restores the prior values on drop.
+    pub struct TempEnv {
+        _dir: std::path::PathBuf,
+        prev_db: Option<std::ffi::OsString>,
+        prev_lock: Option<std::ffi::OsString>,
+    }
+
+    impl TempEnv {
+        pub fn isolated() -> Self {
+            let unique = format!(
+                "seadog-priv-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let dir = std::env::temp_dir().join(unique);
+            std::fs::create_dir_all(&dir).unwrap();
+            let prev_db = std::env::var_os("SEADOG_DB");
+            let prev_lock = std::env::var_os("SEADOG_WATCHER_LOCK");
+            std::env::set_var("SEADOG_DB", dir.join("seadog.db"));
+            std::env::set_var("SEADOG_WATCHER_LOCK", dir.join("watcher.lock"));
+            TempEnv {
+                _dir: dir,
+                prev_db,
+                prev_lock,
+            }
+        }
+    }
+
+    impl Drop for TempEnv {
+        fn drop(&mut self) {
+            match &self.prev_db {
+                Some(v) => std::env::set_var("SEADOG_DB", v),
+                None => std::env::remove_var("SEADOG_DB"),
+            }
+            match &self.prev_lock {
+                Some(v) => std::env::set_var("SEADOG_WATCHER_LOCK", v),
+                None => std::env::remove_var("SEADOG_WATCHER_LOCK"),
+            }
+        }
     }
 }

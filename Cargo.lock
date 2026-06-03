@@ -661,6 +661,7 @@ dependencies = [
  "clap",
  "libc",
  "regex",
+ "rusqlite",
  "seadog-core",
  "serde_json",
  "tracing",

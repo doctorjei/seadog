@@ -10,6 +10,14 @@ rust-version.workspace = true
 # IMPORTANT: this binary deliberately does NOT depend on the `seadog`
 # crate — the untrusted SSH-command parser must never be linked into the
 # privileged binary. It depends only on `seadog-core` (path).
+# A thin library face exists ALONGSIDE the binary so the reaper entry
+# points (`sweep`/`watch`) can be exercised end-to-end from integration
+# tests (a separate crate) with a primed `FakeKento`. The binary still
+# owns the privilege-sensitive verb dispatch.
+[lib]
+name = "seadog_priv"
+path = "src/lib.rs"
+
 [[bin]]
 name = "seadog-priv"
 path = "src/main.rs"
@@ -25,6 +33,7 @@ real-kento = ["seadog-core/real-kento"]
 
 [dependencies]
 seadog-core = { path = "../core" }
+rusqlite = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
