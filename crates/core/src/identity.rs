@@ -36,6 +36,14 @@ pub const GUID_MARKER_PREFIX: &str = "seadog-guid:";
 /// The `seadog-` name prefix that marks one of our guests.
 pub const NAME_PREFIX: &str = "seadog-";
 
+/// The owner marker block written into a guest's `description`.
+///
+/// Format is a single line `seadog-owner:<OWNER>`, written by `provision`
+/// alongside the GUID marker so the privileged teardown can verify the
+/// guest is owned by the requesting owner against **live PVE** (never the
+/// DB). [`extract_desc_owner`] parses it back out.
+pub const OWNER_MARKER_PREFIX: &str = "seadog-owner:";
+
 /// Hardware fingerprint of one live guest. Every field is optional
 /// because the sweeper may not observe all of them (e.g. a half-built
 /// guest), and absence must never be read as a match.
@@ -163,6 +171,26 @@ pub fn extract_desc_guid(description: Option<&str>) -> Option<String> {
             let guid = rest.trim();
             if !guid.is_empty() {
                 return Some(guid.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Parse the owner out of a guest description marker block, if present.
+///
+/// Scans lines for `seadog-owner:<OWNER>` (leading/trailing whitespace
+/// tolerated) and returns the first owner found. Returns `None` if the
+/// description is absent or carries no owner marker. Mirrors
+/// [`extract_desc_guid`].
+pub fn extract_desc_owner(description: Option<&str>) -> Option<String> {
+    let desc = description?;
+    for line in desc.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix(OWNER_MARKER_PREFIX) {
+            let owner = rest.trim();
+            if !owner.is_empty() {
+                return Some(owner.to_string());
             }
         }
     }
@@ -640,5 +668,13 @@ images:
         assert_eq!(extract_desc_guid(Some(&d)), Some("xyz-123".to_string()));
         assert_eq!(extract_desc_guid(Some("nothing here")), None);
         assert_eq!(extract_desc_guid(None), None);
+    }
+
+    #[test]
+    fn extract_desc_owner_parses_marker() {
+        let d = format!("line1\n  {OWNER_MARKER_PREFIX}jei  \n{GUID_MARKER_PREFIX}xyz");
+        assert_eq!(extract_desc_owner(Some(&d)), Some("jei".to_string()));
+        assert_eq!(extract_desc_owner(Some("nothing here")), None);
+        assert_eq!(extract_desc_owner(None), None);
     }
 }

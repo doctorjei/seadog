@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::identity::GuestSignals;
+use crate::identity::{GuestSignals, GUID_MARKER_PREFIX, OWNER_MARKER_PREFIX};
 use crate::models::Mode;
 use crate::Error;
 
@@ -30,37 +30,77 @@ pub trait Kento {
     /// Destroy the guest at `vmid` (LXC via `pct`, VM via `qm`).
     fn teardown(&self, vmid: u32, mode: Mode) -> Result<(), Error>;
 
-    /// Provision a new guest. Implemented in a later phase.
-    fn provision(&self, _spec: &ProvisionSpec) -> Result<(), Error> {
-        Err(Error::Kento(
-            "provision not implemented in this phase".into(),
-        ))
-    }
+    /// Create a new guest from a fully-resolved [`ProvisionSpec`] and write
+    /// the seadog guest-side markers (the `seadog-` name, the
+    /// `seadog-guid:`/`seadog-owner:` description marker block, and the
+    /// assigned MAC) so a later teardown can triangulate it against live
+    /// PVE. The caller (`seadog-priv provision`) has already re-validated
+    /// every field; this method only realizes the guest.
+    fn provision(&self, spec: &ProvisionSpec) -> Result<(), Error>;
 
-    /// Write seadog metadata (name/description GUID marker) onto a guest.
-    /// Implemented in a later phase.
-    fn set_meta(&self, _vmid: u32, _name: &str, _description: &str) -> Result<(), Error> {
-        Err(Error::Kento(
-            "set_meta not implemented in this phase".into(),
-        ))
-    }
+    /// Narrow metadata update on an **already-verified** seadog guest:
+    /// optionally set the description and/or the TTL-deadline marker. The
+    /// caller validates the target is in-range + seadog-marked first; this
+    /// is `qm set`/`pct set`, never a general passthrough.
+    fn set_meta(&self, vmid: u32, mode: Mode, meta: &MetaUpdate) -> Result<(), Error>;
 
-    /// Start the in-guest sshd. Implemented in a later phase.
-    fn start_sshd(&self, _vmid: u32, _mode: Mode) -> Result<(), Error> {
-        Err(Error::Kento(
-            "start_sshd not implemented in this phase".into(),
-        ))
+    /// Start the in-guest sshd inside an **already-verified** seadog CT
+    /// (loom ships sshd disabled). LXC-only — the caller validates the
+    /// target is an in-range, seadog-marked container first. This is a
+    /// narrow `pct exec … systemctl start ssh`, not a general
+    /// `pct exec` passthrough.
+    fn start_sshd(&self, vmid: u32) -> Result<(), Error>;
+}
+
+/// A fully-resolved provisioning request: every field has already been
+/// re-validated by `seadog-priv` against its own config load. The MAC,
+/// IP, vmid, name and GUID were allocated by the (untrusted) front-end but
+/// re-checked here; `image_ref` is the allowlisted ref the server picked,
+/// never a raw caller ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionSpec {
+    /// Allocated Proxmox guest id (re-validated in-range).
+    pub vmid: u32,
+    /// LXC or VM.
+    pub mode: Mode,
+    /// Allowlisted OCI image ref (server-resolved, never caller-supplied).
+    pub image_ref: String,
+    /// `seadog-…` guest name (re-validated DNS label).
+    pub name: String,
+    /// Assigned MAC (re-validated shape).
+    pub mac: String,
+    /// Leased IPv4 as a string (re-validated to parse).
+    pub ip: String,
+    /// Instance GUID minted by the front-end (written into the desc marker).
+    pub guid: String,
+    /// Resolved owner (trusted from the front-end; written into the desc
+    /// marker so teardown can verify ownership against live PVE).
+    pub owner: String,
+}
+
+impl ProvisionSpec {
+    /// The guest `description` body seadog writes at create: the GUID and
+    /// owner marker lines [`crate::identity`] greps back out. Kept here so
+    /// `FakeKento` (markers in-memory) and `RealKento` (markers via
+    /// `qm`/`pct set --description`) build an identical block.
+    pub fn description_marker(&self) -> String {
+        format!(
+            "{GUID_MARKER_PREFIX}{guid}\n{OWNER_MARKER_PREFIX}{owner}",
+            guid = self.guid,
+            owner = self.owner,
+        )
     }
 }
 
-/// Minimal provisioning request shape (filled out in a later phase).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProvisionSpec {
-    pub vmid: u32,
-    pub mode: Mode,
-    pub image_ref: String,
-    pub name: String,
-    pub mac: String,
+/// A narrow metadata update for [`Kento::set_meta`]: any combination of a
+/// new description and/or a TTL-deadline (unix epoch seconds). Both are
+/// optional so a caller can touch just one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetaUpdate {
+    /// Replacement description body, if updating it.
+    pub description: Option<String>,
+    /// TTL-deadline as a unix epoch second, if updating it.
+    pub ttl_deadline: Option<i64>,
 }
 
 /// In-memory [`Kento`] for tests. Always compiled (not `#[cfg(test)]`) so
@@ -80,6 +120,12 @@ pub struct FakeKento {
 struct FakeState {
     guests: Vec<GuestSignals>,
     teardowns: Vec<(u32, Mode)>,
+    /// Provision calls recorded so tests can assert exact params.
+    provisions: Vec<ProvisionSpec>,
+    /// `set_meta` calls recorded, in order.
+    set_metas: Vec<(u32, Mode, MetaUpdate)>,
+    /// vmids `start_sshd` was called on, in order.
+    sshd_starts: Vec<u32>,
     /// When set, every op returns this quorum-loss message.
     quorum_lost: Option<String>,
     /// Optional per-vmid teardown failures (non-quorum), to test errors.
@@ -116,6 +162,21 @@ impl FakeKento {
     pub fn teardowns(&self) -> Vec<(u32, Mode)> {
         self.inner.lock().unwrap().teardowns.clone()
     }
+
+    /// The provision calls recorded so far, in order.
+    pub fn provisions(&self) -> Vec<ProvisionSpec> {
+        self.inner.lock().unwrap().provisions.clone()
+    }
+
+    /// The `set_meta` calls recorded so far, in order.
+    pub fn set_metas(&self) -> Vec<(u32, Mode, MetaUpdate)> {
+        self.inner.lock().unwrap().set_metas.clone()
+    }
+
+    /// The vmids `start_sshd` was called on, in order.
+    pub fn sshd_starts(&self) -> Vec<u32> {
+        self.inner.lock().unwrap().sshd_starts.clone()
+    }
 }
 
 impl Kento for FakeKento {
@@ -142,6 +203,44 @@ impl Kento for FakeKento {
             return Err(Error::Kento(msg));
         }
         st.teardowns.push((vmid, mode));
+        // Remove the guest so a subsequent list_guests reflects the destroy.
+        st.guests.retain(|g| g.vmid != vmid);
+        Ok(())
+    }
+
+    fn provision(&self, spec: &ProvisionSpec) -> Result<(), Error> {
+        let mut st = self.inner.lock().unwrap();
+        if let Some(msg) = &st.quorum_lost {
+            return Err(Error::QuorumLost(msg.clone()));
+        }
+        // Realize the guest in-memory WITH the markers, so a later
+        // teardown can triangulate it exactly as live PVE would present it.
+        st.guests.push(GuestSignals {
+            vmid: spec.vmid,
+            name: Some(spec.name.clone()),
+            description: Some(spec.description_marker()),
+            mac: Some(spec.mac.clone()),
+            fingerprint: Default::default(),
+        });
+        st.provisions.push(spec.clone());
+        Ok(())
+    }
+
+    fn set_meta(&self, vmid: u32, mode: Mode, meta: &MetaUpdate) -> Result<(), Error> {
+        let mut st = self.inner.lock().unwrap();
+        if let Some(msg) = &st.quorum_lost {
+            return Err(Error::QuorumLost(msg.clone()));
+        }
+        st.set_metas.push((vmid, mode, meta.clone()));
+        Ok(())
+    }
+
+    fn start_sshd(&self, vmid: u32) -> Result<(), Error> {
+        let mut st = self.inner.lock().unwrap();
+        if let Some(msg) = &st.quorum_lost {
+            return Err(Error::QuorumLost(msg.clone()));
+        }
+        st.sshd_starts.push(vmid);
         Ok(())
     }
 }
@@ -268,6 +367,86 @@ mod real {
                 Mode::Vm => self.run("qm", &["destroy", &vmid, "--purge"]).map(|_| ()),
             }
         }
+
+        fn provision(&self, spec: &ProvisionSpec) -> Result<(), Error> {
+            // Realize the guest via `kento`, then stamp the seadog markers
+            // onto it with `qm`/`pct set` so teardown can later triangulate.
+            // Full templating lands in a later phase; here we only need the
+            // safety-wrapped exec path to compile under `--features
+            // real-kento`. Not exercised by tests (no blue).
+            let vmid = spec.vmid.to_string();
+            let mode = match spec.mode {
+                Mode::Lxc => "lxc",
+                Mode::Vm => "vm",
+            };
+            self.run(
+                "kento",
+                &[
+                    "create",
+                    "--vmid",
+                    &vmid,
+                    "--mode",
+                    mode,
+                    "--image-ref",
+                    &spec.image_ref,
+                    "--name",
+                    &spec.name,
+                    "--mac",
+                    &spec.mac,
+                    "--ip",
+                    &spec.ip,
+                ],
+            )?;
+            let desc = spec.description_marker();
+            match spec.mode {
+                Mode::Lxc => self.run(
+                    "pct",
+                    &[
+                        "set",
+                        &vmid,
+                        "--hostname",
+                        &spec.name,
+                        "--description",
+                        &desc,
+                    ],
+                )?,
+                Mode::Vm => self.run(
+                    "qm",
+                    &["set", &vmid, "--name", &spec.name, "--description", &desc],
+                )?,
+            };
+            Ok(())
+        }
+
+        fn set_meta(&self, vmid: u32, mode: Mode, meta: &MetaUpdate) -> Result<(), Error> {
+            let vmid = vmid.to_string();
+            let mut args: Vec<String> = vec!["set".to_string(), vmid];
+            if let Some(desc) = &meta.description {
+                args.push("--description".to_string());
+                args.push(desc.clone());
+            }
+            if let Some(ttl) = meta.ttl_deadline {
+                // Carried in a tag so it survives PVE round-tripping.
+                args.push("--tags".to_string());
+                args.push(format!("seadog-ttl-{ttl}"));
+            }
+            if args.len() == 2 {
+                // Nothing to set.
+                return Ok(());
+            }
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            match mode {
+                Mode::Lxc => self.run("pct", &argv).map(|_| ()),
+                Mode::Vm => self.run("qm", &argv).map(|_| ()),
+            }
+        }
+
+        fn start_sshd(&self, vmid: u32) -> Result<(), Error> {
+            let vmid = vmid.to_string();
+            // Narrow exec: start the in-CT sshd only. LXC-only by contract.
+            self.run("pct", &["exec", &vmid, "--", "systemctl", "start", "ssh"])
+                .map(|_| ())
+        }
     }
 }
 
@@ -298,6 +477,52 @@ mod tests {
 
         k.teardown(10010, Mode::Vm).unwrap();
         assert_eq!(k.teardowns(), vec![(10010, Mode::Vm)]);
+    }
+
+    #[test]
+    fn fake_provision_realizes_triangulatable_guest() {
+        use crate::identity::{extract_desc_guid, extract_desc_owner};
+        let k = FakeKento::new();
+        let spec = ProvisionSpec {
+            vmid: 10010,
+            mode: Mode::Lxc,
+            image_ref: "registry/loom:1".into(),
+            name: "seadog-jei-proj-ab12".into(),
+            mac: "aa:bb:cc:dd:ee:ff".into(),
+            ip: "192.168.0.200".into(),
+            guid: "guid-abc".into(),
+            owner: "jei".into(),
+        };
+        k.provision(&spec).unwrap();
+        assert_eq!(k.provisions(), vec![spec.clone()]);
+
+        // The realized guest carries every marker teardown triangulates on.
+        let listed = k.list_guests((10000, 10999)).unwrap();
+        assert_eq!(listed.len(), 1);
+        let g = &listed[0];
+        assert_eq!(g.name.as_deref(), Some("seadog-jei-proj-ab12"));
+        assert_eq!(g.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+        assert_eq!(
+            extract_desc_guid(g.description.as_deref()),
+            Some("guid-abc".into())
+        );
+        assert_eq!(
+            extract_desc_owner(g.description.as_deref()),
+            Some("jei".into())
+        );
+    }
+
+    #[test]
+    fn fake_records_set_meta_and_sshd() {
+        let k = FakeKento::new();
+        let meta = MetaUpdate {
+            description: Some("d".into()),
+            ttl_deadline: Some(5000),
+        };
+        k.set_meta(10010, Mode::Vm, &meta).unwrap();
+        k.start_sshd(10010).unwrap();
+        assert_eq!(k.set_metas(), vec![(10010, Mode::Vm, meta)]);
+        assert_eq!(k.sshd_starts(), vec![10010]);
     }
 
     #[test]

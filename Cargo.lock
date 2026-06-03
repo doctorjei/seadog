@@ -654,6 +654,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "seadog-priv"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "regex",
+ "seadog-core",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"

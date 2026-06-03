@@ -1,0 +1,33 @@
+[package]
+name = "seadog-priv"
+version = "0.1.0"
+description = "Root-privileged helper for seadog: re-validates + realizes/destroys PVE guests"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# IMPORTANT: this binary deliberately does NOT depend on the `seadog`
+# crate — the untrusted SSH-command parser must never be linked into the
+# privileged binary. It depends only on `seadog-core` (path).
+[[bin]]
+name = "seadog-priv"
+path = "src/main.rs"
+
+[features]
+# The privileged binary ALWAYS needs the real backend in production, so
+# `real-kento` is ON by default: the helper must never silently operate
+# against a fake. Tests drive `dispatch` with a `FakeKento` directly
+# (no feature needed for that), and `cargo test` keeps the feature on so
+# the real backend stays compiled. Disable with `--no-default-features`.
+default = ["real-kento"]
+real-kento = ["seadog-core/real-kento"]
+
+[dependencies]
+seadog-core = { path = "../core" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+libc = { workspace = true }
+tracing = { workspace = true }

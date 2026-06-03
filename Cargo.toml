@@ -1,9 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/seadog"]
+members = ["crates/core", "crates/seadog", "crates/seadog-priv"]
 
 # Shared package metadata inherited by member crates via `field.workspace = true`.
-# The `seadog-priv` crate is added in a later phase.
 [workspace.package]
 edition = "2021"
 license = "GPL-3.0-or-later"
@@ -30,6 +29,7 @@ tracing-subscriber = "0.3"
 wait-timeout = "0.2"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
+libc = "0.2"
 
 [profile.release]
 # Static-musl deploy target: optimize for size + strip, single codegen unit.
