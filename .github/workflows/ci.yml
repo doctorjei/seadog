@@ -1,0 +1,109 @@
+name: CI
+
+# First CI for the repo. Build + test the workspace on every push to main and
+# on PRs, lint Rust + shell, build the deployable static-musl artifact, and run
+# the host-mutating pseudo-soak in an isolated job.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref (e.g. rapid pushes / PR updates).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Stable toolchain with fmt + clippy and the static-musl deploy target.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # musl-tools provides the musl linker (musl-gcc) for the deploy build.
+      # shellcheck/jq/sqlite3 are preinstalled on ubuntu-latest.
+      - name: Install musl linker
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      # Workspace clippy. Because seadog-priv has `default = ["real-kento"]`
+      # (which pulls in seadog-core/real-kento), feature unification turns the
+      # `real-kento` feature ON for seadog-core's own lib AND test targets in a
+      # `--workspace --all-targets` pass, so the RealKento module + its
+      # parser_tests are already linted here.
+      - name: Clippy (workspace)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Cheap insurance: an explicit RealKento-core pass. Redundant with the
+      # workspace pass above (verified via `cargo clippy -v`), but pins the
+      # contract that seadog-core's real-kento module + parser tests must lint
+      # clean even if the workspace feature graph ever changes.
+      - name: Clippy (seadog-core real-kento)
+        run: cargo clippy -p seadog-core --features real-kento --all-targets -- -D warnings
+
+      - name: Test (workspace)
+        run: cargo test --workspace
+
+      # The deployable artifact: static-musl release binaries.
+      - name: Build release (static musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      # Lint shell scripts. The fake-PVE shims have bash shebangs but no .sh
+      # extension, so they are listed explicitly.
+      - name: Shellcheck
+        run: |
+          shellcheck deploy/*.sh test/*.sh \
+            test/fake-pve/qm test/fake-pve/pct test/fake-pve/kento \
+            test/fake-pve/pvesh test/fake-pve/_lib.sh
+
+      # The :edge-equivalent artifact: both static binaries.
+      - name: Upload musl binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: seadog-musl-binaries
+          path: |
+            target/x86_64-unknown-linux-musl/release/seadog
+            target/x86_64-unknown-linux-musl/release/seadog-priv
+
+  # Separate job so a flake in the host-mutating soak does not mask the
+  # unit-test signal from `test`.
+  #
+  # WARNING: this job is GitHub-hosted-ephemeral-ONLY. The pseudo-soak
+  # `sudo ln -sf`s fake qm/pct/kento/pvesh into /usr/sbin and runs seadog-priv
+  # as real root. It MUST NEVER run on a self-hosted runner or a real PVE node
+  # — only on a disposable GitHub-hosted runner. The script also self-guards
+  # (refuses to run if a real qm/pct/pvesh is present).
+  pseudo-soak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No musl target needed — the soak builds debug binaries itself.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # jq + sqlite3 drive the soak's fake-state inspection and DB checks.
+      # Preinstalled on ubuntu-latest, but install defensively in case the
+      # image changes.
+      - name: Ensure jq + sqlite3
+        run: |
+          if ! command -v jq >/dev/null || ! command -v sqlite3 >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y jq sqlite3
+          fi
+
+      # Uses sudo internally (available on the runner).
+      - name: Run pseudo-soak
+        run: test/pseudo-soak.sh
