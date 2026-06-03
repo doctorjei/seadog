@@ -40,4 +40,10 @@ pub struct Ctx<'a> {
     pub config: &'a Config,
     /// Injected "now" (unix epoch seconds), set once at the call site.
     pub now_unix: i64,
+    /// The resolved DB path (same file `conn` is open on). The elevated
+    /// `create` path needs a *writable* connection for the atomic
+    /// allocate-+-insert (`core::alloc::allocate` takes `&mut Connection`),
+    /// which it opens fresh from this path — `conn` is shared (`&`) so it
+    /// can't be re-borrowed mutably. WAL makes the second handle safe.
+    pub db_path: String,
 }

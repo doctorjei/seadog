@@ -27,10 +27,15 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_config(CONFIG_YAML)
+    }
+
+    /// Build a fixture with a custom config YAML (e.g. to set a low cap).
+    fn with_config(config_yaml: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("seadog.db").to_str().unwrap().to_string();
         let config_path = dir.path().join("config.yaml").to_str().unwrap().to_string();
-        std::fs::write(&config_path, CONFIG_YAML).unwrap();
+        std::fs::write(&config_path, config_yaml).unwrap();
         // Touch the DB (open creates + migrates).
         let _ = store::open(&db_path).unwrap();
         Fixture {
@@ -47,14 +52,29 @@ impl Fixture {
     /// Run `seadog --owner <owner> <args...>` (direct argv path) and return
     /// (exit_success, stdout_json_or_null, stderr_string).
     fn run(&self, owner: &str, args: &[&str]) -> (bool, Value, String) {
+        self.run_envs(owner, args, &[])
+    }
+
+    /// Like [`Fixture::run`] but with extra `(key, value)` env vars layered
+    /// on (used to point the privileged path at the fake helper).
+    fn run_envs(&self, owner: &str, args: &[&str], envs: &[(&str, &str)]) -> (bool, Value, String) {
         let exe = env!("CARGO_BIN_EXE_seadog");
         let mut cmd = Command::new(exe);
         cmd.env("SEADOG_DB", &self.db_path)
             .env("SEADOG_CONFIG", &self.config_path)
             .env_remove("SSH_ORIGINAL_COMMAND")
             .env_remove("SSH_AUTH_INFO_0")
+            // Default the privileged path to the fake helper with no sudo and
+            // no setsid, so verbs that opportunistically spawn the watcher
+            // don't shell a real `setsid sudo /usr/lib/...` during tests.
+            .env("SEADOG_SUDO", "")
+            .env("SEADOG_SETSID", "")
+            .env("SEADOG_PRIV_BIN", fake_priv_path())
             .arg("--owner")
             .arg(owner);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
         for a in args {
             cmd.arg(a);
         }
@@ -64,6 +84,26 @@ impl Fixture {
         let json = serde_json::from_str(&stdout).unwrap_or(Value::Null);
         (out.status.success(), json, stderr)
     }
+}
+
+/// Absolute path to the fake `seadog-priv` script, `chmod +x`'d once. The
+/// front-end shells this with `$SEADOG_SUDO=""` so no real sudo runs.
+fn fake_priv_path() -> String {
+    use std::sync::Once;
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fake-seadog-priv.sh");
+    static CHMOD: Once = Once::new();
+    CHMOD.call_once(|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+    });
+    path.to_str().unwrap().to_string()
 }
 
 fn mk_env(guid: &str, vmid: u32, owner: &str, status: EnvStatus, created_at: i64, ttl: i64) -> Env {
@@ -282,17 +322,236 @@ fn history_and_stats_read() {
 }
 
 #[test]
-fn create_returns_bridge_not_wired() {
+fn create_shells_provision_and_writes_active_row() {
     let fx = Fixture::new();
-    let (ok, _json, err) = fx.run("alice", &["create", "--image", "loom"]);
-    assert!(!ok, "create must fail in Phase 2a");
-    let errobj: Value = serde_json::from_str(&err).unwrap();
-    let msg = errobj["error"].as_str().unwrap();
-    assert!(msg.contains("Phase 2b"), "got: {msg}");
+    let log = fx._dir.path().join("fake.log");
+    let log_s = log.to_str().unwrap().to_string();
+
+    let (ok, json, err) = fx.run_envs(
+        "alice",
+        &["create", "--image", "loom"],
+        &[("SEADOG_FAKE_LOG", &log_s)],
+    );
+    assert!(ok, "create should succeed; stderr: {err}");
+
+    // The verb's JSON result.
+    let id = json["id"].as_str().expect("id present");
+    assert!(!id.is_empty());
+    assert_eq!(json["ip"].as_str().unwrap(), "192.168.0.192");
+    let name = json["name"].as_str().unwrap();
+    assert!(name.starts_with("seadog-alice-loom-"), "got: {name}");
+    let vmid = json["vmid"].as_u64().unwrap();
+    assert_eq!(vmid, 10000);
+    assert_eq!(json["mode"], "lxc");
+    assert!(json["ttl_deadline"].is_i64());
+
+    // The DB row exists and is Active.
+    let env = store::get_env(&fx.conn(), id).unwrap().unwrap();
+    assert_eq!(env.status, EnvStatus::Active);
+    assert_eq!(env.owner, "alice");
+    assert_eq!(env.vmid, 10000);
+
+    // The fake was shelled with `provision` and the right argv.
+    let logged = std::fs::read_to_string(&log).unwrap();
+    let prov = logged
+        .lines()
+        .find(|l| l.starts_with("provision "))
+        .expect("provision was invoked");
+    assert!(prov.contains("--owner alice"), "argv: {prov}");
+    assert!(prov.contains(&format!("--vmid {vmid}")), "argv: {prov}");
+    assert!(prov.contains("--ip 192.168.0.192"), "argv: {prov}");
+    assert!(prov.contains(&format!("--name {name}")), "argv: {prov}");
+    assert!(prov.contains(&format!("--guid {id}")), "argv: {prov}");
+    // Resolved image *ref* (from the allowlist), not the bare name.
+    assert!(
+        prov.contains("--image-ref ghcr.io/x/droste:loom"),
+        "argv: {prov}"
+    );
+    // A locally-administered MAC was minted and passed.
+    assert!(prov.contains("--mac "), "argv: {prov}");
 }
 
 #[test]
-fn destroy_returns_bridge_not_wired() {
+fn create_rolls_back_when_provision_fails() {
+    let fx = Fixture::new();
+    let log = fx._dir.path().join("fake.log");
+    let log_s = log.to_str().unwrap().to_string();
+
+    let (ok, _json, err) = fx.run_envs(
+        "alice",
+        &["create", "--image", "loom"],
+        &[("SEADOG_FAKE_LOG", &log_s), ("SEADOG_FAKE_FAIL", "1")],
+    );
+    assert!(!ok, "create must fail when provision fails");
+    let errobj: Value = serde_json::from_str(&err).unwrap();
+    assert!(
+        errobj["error"].as_str().unwrap().contains("provision"),
+        "error should mention the helper: {err}"
+    );
+
+    // The fake WAS invoked (allocation happened, then provision failed).
+    let logged = std::fs::read_to_string(&log).unwrap();
+    assert!(logged.lines().any(|l| l.starts_with("provision ")));
+
+    // The lease must be freed: no Active row remains for alice.
+    let actives: Vec<_> = store::list_by_owner(&fx.conn(), "alice")
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.status == EnvStatus::Active)
+        .collect();
+    assert!(actives.is_empty(), "rollback must free the lease");
+    // And the row was retained as Vanished (history), not Active.
+    let vanished: Vec<_> = store::list_by_status(&fx.conn(), EnvStatus::Vanished).unwrap();
+    assert_eq!(vanished.len(), 1, "failed attempt kept as Vanished");
+}
+
+#[test]
+fn create_rejected_at_cap_before_allocating() {
+    // A config with an lxc cap of 1 for everyone.
+    let capped = r#"
+allocation:
+  caps: { max_lxc_per_owner: 1, max_vm_per_owner: 1 }
+images:
+  loom: { ref: "ghcr.io/x/droste:loom", modes: [lxc] }
+"#;
+    let fx = Fixture::with_config(capped);
+    let conn = fx.conn();
+    // Seed alice at the lxc cap (1 active lxc).
+    store::insert_env(
+        &conn,
+        &mk_env("g-existing", 10005, "alice", EnvStatus::Active, 1000, 5000),
+    )
+    .unwrap();
+
+    let log = fx._dir.path().join("fake.log");
+    let log_s = log.to_str().unwrap().to_string();
+
+    let (ok, _json, err) = fx.run_envs(
+        "alice",
+        &["create", "--image", "loom"],
+        &[("SEADOG_FAKE_LOG", &log_s)],
+    );
+    assert!(!ok, "create must be rejected at cap");
+    let errobj: Value = serde_json::from_str(&err).unwrap();
+    assert!(
+        errobj["error"].as_str().unwrap().contains("cap"),
+        "error should mention the cap: {err}"
+    );
+
+    // No new row was inserted (still exactly one active for alice).
+    let actives: Vec<_> = store::list_by_owner(&fx.conn(), "alice")
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.status == EnvStatus::Active)
+        .collect();
+    assert_eq!(actives.len(), 1, "no allocation past the cap");
+    // And the fake `provision` was never called (rejected before elevate).
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !logged.lines().any(|l| l.starts_with("provision ")),
+        "helper must not be shelled when capped"
+    );
+}
+
+#[test]
+fn destroy_shells_teardown_and_refuses_foreign_or_unknown() {
+    let fx = Fixture::new();
+    let conn = fx.conn();
+    store::insert_env(
+        &conn,
+        &mk_env("g-mine", 10010, "alice", EnvStatus::Active, 1000, 5000),
+    )
+    .unwrap();
+    store::insert_env(
+        &conn,
+        &mk_env("g-theirs", 10011, "bob", EnvStatus::Active, 1000, 5000),
+    )
+    .unwrap();
+
+    let log = fx._dir.path().join("fake.log");
+    let log_s = log.to_str().unwrap().to_string();
+
+    // alice destroys her own env.
+    let (ok, json, err) = fx.run_envs(
+        "alice",
+        &["destroy", "g-mine"],
+        &[("SEADOG_FAKE_LOG", &log_s)],
+    );
+    assert!(ok, "destroy own env should succeed; stderr: {err}");
+    assert_eq!(json["id"], "g-mine");
+    assert_eq!(json["status"], "reaped");
+    // Row flipped to Reaped (lease freed).
+    let env = store::get_env(&fx.conn(), "g-mine").unwrap().unwrap();
+    assert_eq!(env.status, EnvStatus::Reaped);
+    // Teardown shelled with structured args.
+    let logged = std::fs::read_to_string(&log).unwrap();
+    let td = logged
+        .lines()
+        .find(|l| l.starts_with("teardown "))
+        .expect("teardown invoked");
+    assert!(td.contains("--owner alice"), "argv: {td}");
+    assert!(td.contains("--guid g-mine"), "argv: {td}");
+    assert!(td.contains("--vmid 10010"), "argv: {td}");
+    assert!(td.contains("--mode lxc"), "argv: {td}");
+
+    // alice cannot destroy bob's env (refused).
+    let (ok, _json, err) = fx.run("alice", &["destroy", "g-theirs"]);
+    assert!(!ok, "foreign destroy must be refused");
+    let errobj: Value = serde_json::from_str(&err).unwrap();
+    assert!(errobj["error"].as_str().unwrap().contains("not owned"));
+    // bob's env untouched.
+    assert_eq!(
+        store::get_env(&fx.conn(), "g-theirs")
+            .unwrap()
+            .unwrap()
+            .status,
+        EnvStatus::Active
+    );
+
+    // Unknown id errors.
+    let (ok, _json, err) = fx.run("alice", &["destroy", "nope"]);
+    assert!(!ok, "unknown id must error");
+    let errobj: Value = serde_json::from_str(&err).unwrap();
+    assert!(errobj["error"].as_str().unwrap().contains("not found"));
+}
+
+#[test]
+fn watcher_spawns_at_most_once() {
+    // Two opportunistic spawns racing for the same flock: exactly one wins
+    // and writes a marker line. The fake `watch` holds the lock across a
+    // short sleep so the second invocation overlaps and is rejected.
+    let fx = Fixture::new();
+    let lock = fx._dir.path().join("watcher.lock");
+    let marker = fx._dir.path().join("watcher.marker");
+    let lock_s = lock.to_str().unwrap().to_string();
+    let marker_s = marker.to_str().unwrap().to_string();
+
+    // Each `ls` opportunistically spawns the detached watcher. Fire two
+    // quickly so their `watch` invocations overlap on the flock.
+    let envs = [
+        ("SEADOG_WATCHER_LOCK", lock_s.as_str()),
+        ("SEADOG_WATCHER_MARKER", marker_s.as_str()),
+    ];
+    let (ok1, _, e1) = fx.run_envs("alice", &["ls"], &envs);
+    let (ok2, _, e2) = fx.run_envs("alice", &["ls"], &envs);
+    assert!(ok1, "ls 1: {e1}");
+    assert!(ok2, "ls 2: {e2}");
+
+    // The detached watchers race; give them time to resolve the flock.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+
+    let marker_lines = std::fs::read_to_string(&marker).unwrap_or_default();
+    let n = marker_lines.lines().filter(|l| !l.is_empty()).count();
+    assert_eq!(
+        n, 1,
+        "exactly one watcher may hold the lock; marker:\n{marker_lines}"
+    );
+}
+
+#[test]
+fn watcher_spawn_failure_does_not_break_verb() {
+    // Point the helper at a nonexistent path: the opportunistic watcher
+    // spawn fails, but `ls` must still succeed (best-effort hook).
     let fx = Fixture::new();
     let conn = fx.conn();
     store::insert_env(
@@ -301,10 +560,13 @@ fn destroy_returns_bridge_not_wired() {
     )
     .unwrap();
 
-    let (ok, _json, err) = fx.run("alice", &["destroy", "g-1"]);
-    assert!(!ok, "destroy must fail in Phase 2a");
-    let errobj: Value = serde_json::from_str(&err).unwrap();
-    assert!(errobj["error"].as_str().unwrap().contains("Phase 2b"));
+    let (ok, json, err) = fx.run_envs(
+        "alice",
+        &["ls"],
+        &[("SEADOG_PRIV_BIN", "/nonexistent/seadog-priv-xyz")],
+    );
+    assert!(ok, "ls must survive a watcher spawn failure; stderr: {err}");
+    assert_eq!(json["count"], 1);
 }
 
 #[test]

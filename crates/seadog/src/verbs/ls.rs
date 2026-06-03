@@ -6,10 +6,16 @@ use seadog_core::EnvStatus;
 use serde_json::{json, Value};
 
 use super::Ctx;
+use crate::elevate::spawn_watcher;
 
 /// `ls [--all]`. Without `--all`: the caller's own **active** envs. With
 /// `--all`: every env in the DB regardless of owner/status (operator view).
 pub fn run(ctx: &Ctx, all: bool) -> Result<Value> {
+    // Opportunistic reap hook: `ls` is a common, cheap touch, so it's a
+    // good place to ensure the root watcher is alive. Best-effort — a
+    // spawn failure never affects the listing.
+    let _ = spawn_watcher();
+
     let envs = if all {
         // Every env, newest first — union across statuses via a full scan
         // by listing each status; simpler: list by owner is wrong here, so

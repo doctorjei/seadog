@@ -159,6 +159,7 @@ fn run() -> anyhow::Result<serde_json::Value> {
         conn: &conn,
         config: &config,
         now_unix: seadog_core::now_unix(),
+        db_path,
     };
 
     dispatch(&ctx, cli.verb)
