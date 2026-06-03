@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/core"]
+members = ["crates/core", "crates/seadog"]
 
 # Shared package metadata inherited by member crates via `field.workspace = true`.
-# Other crates (seadog, seadog-priv) are added in later phases.
+# The `seadog-priv` crate is added in a later phase.
 [workspace.package]
 edition = "2021"
 license = "GPL-3.0-or-later"
@@ -19,6 +19,11 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 thiserror = "2"
 serde_json = "1"
 regex = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+shell-words = "1"
+humantime = "2"
+sha2 = "0.10"
 tracing = "0.1"
 tracing-journald = "0.3"
 tracing-subscriber = "0.3"

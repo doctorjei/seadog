@@ -208,6 +208,21 @@ pub fn mark_reaped(conn: &Connection, guid: &str) -> Result<(), Error> {
     set_status(conn, guid, EnvStatus::Reaped)
 }
 
+/// Update an env's hard-kill `ttl_deadline` (the DB-authoritative kill
+/// time). Used by the unprivileged `extend` verb — no PVE/root op is
+/// needed since the deadline lives only in the DB. `NotFound` if the
+/// `guid` has no row.
+pub fn set_ttl_deadline(conn: &Connection, guid: &str, ttl_deadline: i64) -> Result<(), Error> {
+    let n = conn.execute(
+        "UPDATE envs SET ttl_deadline = ?1 WHERE guid = ?2",
+        params![ttl_deadline, guid],
+    )?;
+    if n == 0 {
+        return Err(Error::NotFound(format!("env guid '{guid}'")));
+    }
+    Ok(())
+}
+
 /// Transition an env to `Vanished` (guest disappeared from PVE).
 pub fn mark_vanished(conn: &Connection, guid: &str) -> Result<(), Error> {
     set_status(conn, guid, EnvStatus::Vanished)

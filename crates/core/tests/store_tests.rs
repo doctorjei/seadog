@@ -117,6 +117,29 @@ fn mark_reaped_and_vanished_transition_status() {
 }
 
 #[test]
+fn set_ttl_deadline_updates_and_errors_on_missing() {
+    let conn = store::open_in_memory().unwrap();
+    let env = sample_env("g1", 10000, "alice");
+    store::insert_env(&conn, &env).unwrap();
+    assert_eq!(env.ttl_deadline, 4_600);
+
+    // Bump the deadline (the `extend` verb's DB op).
+    store::set_ttl_deadline(&conn, "g1", 9_000).unwrap();
+    assert_eq!(
+        store::get_env(&conn, "g1").unwrap().unwrap().ttl_deadline,
+        9_000
+    );
+
+    // Other env columns untouched.
+    let got = store::get_env(&conn, "g1").unwrap().unwrap();
+    assert_eq!(got.owner, "alice");
+    assert_eq!(got.status, EnvStatus::Active);
+
+    // Missing guid is a typed NotFound error.
+    assert!(store::set_ttl_deadline(&conn, "nope", 1).is_err());
+}
+
+#[test]
 fn notify_state_write_read() {
     let conn = store::open_in_memory().unwrap();
     store::insert_env(&conn, &sample_env("g1", 10000, "alice")).unwrap();
