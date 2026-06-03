@@ -17,8 +17,13 @@
 
 pub mod alloc;
 pub mod config;
+pub mod identity;
+pub mod kento;
 pub mod models;
+pub mod notify;
+pub mod reap;
 pub mod store;
+pub mod validate;
 
 pub use config::Config;
 pub use models::{Env, EnvStatus, Mode, NotifyState};
@@ -47,6 +52,19 @@ pub enum Error {
     /// The vmid range or IP pool had no free slot.
     #[error("resource exhausted: {0}")]
     Exhausted(String),
+
+    /// Caller-supplied input failed validation (bad vmid, name, image).
+    #[error("validation error: {0}")]
+    Validation(String),
+
+    /// A `kento`/runtime-bridge operation failed (spawn, exec, timeout).
+    #[error("kento error: {0}")]
+    Kento(String),
+
+    /// The pmxcfs quorum was lost / the cluster filesystem is read-only.
+    /// Surfaced (not retried) so sweeps stop cleanly instead of spinning.
+    #[error("quorum lost: {0}")]
+    QuorumLost(String),
 
     /// A raw rusqlite error (connection, SQL, type conversion).
     #[error("sqlite error: {0}")]

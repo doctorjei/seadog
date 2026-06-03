@@ -213,6 +213,25 @@ pub fn mark_vanished(conn: &Connection, guid: &str) -> Result<(), Error> {
     set_status(conn, guid, EnvStatus::Vanished)
 }
 
+/// Prune **terminal** env rows (`Reaped`/`Vanished`) whose `created_at`
+/// is older than `now_unix - retention_secs`. Live envs are NEVER pruned
+/// no matter how overdue — only history ages out. Returns the number of
+/// rows removed. (Phase 1b addition: retention policy lives in `notify`/
+/// `reap`, but the SQL belongs here next to the other env CRUD.)
+pub fn prune_terminal(
+    conn: &Connection,
+    now_unix: i64,
+    retention_secs: i64,
+) -> Result<usize, Error> {
+    let cutoff = now_unix - retention_secs;
+    let n = conn.execute(
+        "DELETE FROM envs \
+         WHERE status IN ('reaped', 'vanished') AND created_at < ?1",
+        params![cutoff],
+    )?;
+    Ok(n)
+}
+
 // --- notify state ---
 
 /// Upsert per-env notify state.
