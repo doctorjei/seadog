@@ -245,55 +245,103 @@ fn home_dir() -> String {
 /// Build the program argv from the raw process argv + an env lookup.
 ///
 /// Pure over `(raw_argv, getenv)` so it is unit-testable without a real
-/// sshd. Resolution order:
-/// 1. If invoked as a login shell with `-c "<cmd>"` (sshd's form when a
-///    command is supplied; argv0 may carry a leading `-`), tokenize
-///    `<cmd>` with `shell-words` into argv.
-/// 2. Else if `$SSH_ORIGINAL_COMMAND` is set (forced-command setups),
-///    tokenize that.
-/// 3. Else treat the remaining real argv (after argv0) as the command
-///    directly — local-testing path.
+/// sshd. The discriminator is whether `$SSH_ORIGINAL_COMMAND` is set, which
+/// is true **iff** an `authorized_keys` forced command is in play:
 ///
-/// A `--owner <name>` that sshd appended to the *login-shell* invocation
-/// (the forced-command convention) sits in the real argv **before** `-c`,
-/// so we splice it back onto the tokenized command so owner resolution
-/// sees it. An empty/absent command is an error (this is not an
-/// interactive shell).
+/// 1. **Forced command (`SSH_ORIGINAL_COMMAND` set).** sshd runs the
+///    root-controlled forced command through the login shell, so the real
+///    invocation is e.g. `seadog -c "seadog --owner kanibako"` (login
+///    shell = seadog) or `seadog --owner kanibako` (login shell = bash,
+///    seadog exec'd directly), and the client's actual verb lands in
+///    `$SSH_ORIGINAL_COMMAND`. The **verb** therefore comes from
+///    tokenizing `$SSH_ORIGINAL_COMMAND` (client-controlled — used only as
+///    the verb). The **trusted owner** comes from the forced command:
+///    prefer a `--owner <name>` already in the real argv, else mine it out
+///    of the `-c` payload (which here is the root forced command, so
+///    mining `--owner` from it is safe).
+///
+/// 2. **Plain login shell (`SSH_ORIGINAL_COMMAND` unset).** No forced
+///    command, so any `-c "<cmd>"` payload is the *client's* command. Its
+///    tokens are the verb; we never mine `--owner` from it (untrusted) —
+///    owner falls through to the fingerprint fallback. With no `-c`, the
+///    remaining real argv is the verb directly (local-testing path).
+///
+/// In both cases the trusted owner pair (`--owner <val>`) is spliced to the
+/// **front** of the verb tokens so [`owner::owner_from_args`] consumes the
+/// trusted owner first; any client-supplied `--owner` lands later in the
+/// verb argv where clap rejects it (never an override). An empty verb is an
+/// error (this is not an interactive shell).
 fn resolve_argv(
     raw: &[String],
     getenv: impl Fn(&str) -> Option<String>,
 ) -> anyhow::Result<Vec<String>> {
-    // Collect any trusted `--owner <name>` present in the *real* argv
-    // (sshd-injected by the forced command), to splice in front of the
-    // tokenized user command. `direct` is the real argv with the first
-    // `--owner <name>` pair and any `-c <cmd>` removed (the local-testing
-    // verb argv).
+    // Split the real argv tail into a trusted `--owner <name>` pair, a
+    // `-c <cmd>` payload, and the leftover direct argv.
     let real_tail = &raw[raw.len().min(1)..];
-    let (owner_pair, dash_c, direct) = scan_login_argv(real_tail);
+    let (real_owner_pair, dash_c, direct) = scan_login_argv(real_tail);
 
-    let mut tokens: Vec<String> = if let Some(cmd) = dash_c {
-        shell_words::split(&cmd).map_err(|e| anyhow::anyhow!("could not tokenize command: {e}"))?
-    } else if let Some(cmd) = getenv("SSH_ORIGINAL_COMMAND") {
-        shell_words::split(&cmd).map_err(|e| anyhow::anyhow!("could not tokenize command: {e}"))?
-    } else {
-        // Local-testing direct argv (owner pair already stripped).
-        direct
-    };
+    let (mut verb_tokens, owner_pair): (Vec<String>, Option<(String, String)>) =
+        match getenv("SSH_ORIGINAL_COMMAND") {
+            Some(orig) => {
+                // Forced command in play. The verb is the client's
+                // SSH_ORIGINAL_COMMAND (used only as a verb). The trusted
+                // owner is the ROOT-controlled forced command: the
+                // real-argv `--owner` (bash-as-login-shell wiring) or,
+                // failing that, mined from the `-c` payload (the forced
+                // command itself, safe to mine ONLY in this branch).
+                let verb = shell_words::split(&orig)
+                    .map_err(|e| anyhow::anyhow!("could not tokenize command: {e}"))?;
+                let owner = match real_owner_pair {
+                    Some(pair) => Some(pair),
+                    None => dash_c.as_deref().and_then(owner_pair_from_cmd),
+                };
+                (verb, owner)
+            }
+            None => {
+                // Plain login shell, no forced command. A `-c` payload is
+                // the client command: tokenize it as the verb but NEVER
+                // mine `--owner` from it. The owner pair (normally None)
+                // is only the real-argv one.
+                let verb = if let Some(cmd) = dash_c {
+                    shell_words::split(&cmd)
+                        .map_err(|e| anyhow::anyhow!("could not tokenize command: {e}"))?
+                } else {
+                    // Local-testing direct argv (owner pair already stripped).
+                    direct
+                };
+                (verb, real_owner_pair)
+            }
+        };
 
-    if let Some((flag, val)) = owner_pair {
-        // Prepend the trusted owner so `owner_from_args` consumes it.
-        let mut spliced = vec![flag, val];
-        spliced.append(&mut tokens);
-        tokens = spliced;
-    }
-
-    if tokens.is_empty() {
+    // Check verb emptiness BEFORE splicing the owner, so a no-command login
+    // (e.g. `ssh testenv@vm`) gives the clean error rather than a clap
+    // "missing subcommand" error.
+    if verb_tokens.is_empty() {
         anyhow::bail!(
             "no command supplied (seadog is a non-interactive login shell; \
              use a verb like `ls`, `health`, or `create --image <name>`)"
         );
     }
-    Ok(tokens)
+
+    if let Some((flag, val)) = owner_pair {
+        // Splice the trusted owner to the FRONT so `owner_from_args`
+        // consumes it first; any client `--owner` lands later (rejected).
+        let mut spliced = vec![flag, val];
+        spliced.append(&mut verb_tokens);
+        verb_tokens = spliced;
+    }
+
+    Ok(verb_tokens)
+}
+
+/// Mine the first trusted `--owner <name>` pair out of a command string by
+/// tokenizing it and reusing [`owner::owner_from_args`]. Used ONLY for the
+/// root-controlled forced-command `-c` payload (never client text).
+/// Returns `None` if the string has no `--owner` or fails to tokenize.
+fn owner_pair_from_cmd(cmd: &str) -> Option<(String, String)> {
+    let toks = shell_words::split(cmd).ok()?;
+    let (owner, _) = owner::owner_from_args(&toks);
+    owner.map(|val| ("--owner".to_string(), val))
 }
 
 /// Scan a login-shell argv tail for a trusted `--owner <name>` pair and a
@@ -481,5 +529,113 @@ mod tests {
         let raw = vec!["seadog".to_string(), "ls".to_string(), "--all".to_string()];
         let argv = resolve_argv(&raw, no_env).unwrap();
         assert_eq!(argv, vec!["ls".to_string(), "--all".to_string()]);
+    }
+
+    /// Build a `getenv` closure that returns `val` for `SSH_ORIGINAL_COMMAND`.
+    fn orig_env(val: &'static str) -> impl Fn(&str) -> Option<String> {
+        move |k: &str| {
+            if k == "SSH_ORIGINAL_COMMAND" {
+                Some(val.to_string())
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn forced_command_seadog_login_shell_mines_owner_from_dash_c() {
+        // The bug: seadog IS the login shell, so the forced command runs as
+        // `seadog -c "seadog --owner kanibako"` with the real verb in
+        // SSH_ORIGINAL_COMMAND. Owner must be mined from the `-c` payload
+        // (the root forced command), verb from SSH_ORIGINAL_COMMAND.
+        let raw = vec![
+            "-seadog".to_string(),
+            "-c".to_string(),
+            "seadog --owner kanibako".to_string(),
+        ];
+        let argv = resolve_argv(&raw, orig_env("health")).unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "--owner".to_string(),
+                "kanibako".to_string(),
+                "health".to_string()
+            ]
+        );
+        // And owner resolution yields kanibako with verb `["health"]`.
+        let (owner, verb) = owner::owner_from_args(&argv);
+        assert_eq!(owner.as_deref(), Some("kanibako"));
+        assert_eq!(verb, vec!["health".to_string()]);
+    }
+
+    #[test]
+    fn forced_command_bash_login_shell_uses_real_owner() {
+        // bash IS the login shell, so seadog is exec'd directly with
+        // `--owner` in real argv; verb still comes from SSH_ORIGINAL_COMMAND.
+        let raw = vec![
+            "seadog".to_string(),
+            "--owner".to_string(),
+            "kanibako".to_string(),
+        ];
+        let argv = resolve_argv(&raw, orig_env("ls --all")).unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "--owner".to_string(),
+                "kanibako".to_string(),
+                "ls".to_string(),
+                "--all".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn client_cannot_inject_owner_via_original_command() {
+        // Forced command sets the trusted owner (`trusted`); the client
+        // tries to override via SSH_ORIGINAL_COMMAND. The trusted owner is
+        // spliced first and wins; the client `--owner attacker` survives as
+        // literal verb tokens (clap would reject them — never an override).
+        let raw = vec![
+            "-seadog".to_string(),
+            "-c".to_string(),
+            "seadog --owner trusted".to_string(),
+        ];
+        let argv = resolve_argv(&raw, orig_env("ls --owner attacker")).unwrap();
+        assert_eq!(&argv[..2], &["--owner".to_string(), "trusted".to_string()]);
+        let (owner, verb) = owner::owner_from_args(&argv);
+        assert_eq!(owner.as_deref(), Some("trusted"));
+        assert!(verb.contains(&"--owner".to_string()));
+        assert!(verb.contains(&"attacker".to_string()));
+        // The trusted owner is never overridden by the client.
+        assert_ne!(owner.as_deref(), Some("attacker"));
+    }
+
+    #[test]
+    fn plain_login_shell_does_not_mine_owner() {
+        // Regression: plain login shell (no SSH_ORIGINAL_COMMAND). The `-c`
+        // payload is the client command — tokenized as verb, no owner mined.
+        let raw = vec![
+            "-seadog".to_string(),
+            "-c".to_string(),
+            "health".to_string(),
+        ];
+        let argv = resolve_argv(&raw, no_env).unwrap();
+        assert_eq!(argv, vec!["health".to_string()]);
+        let (owner, _) = owner::owner_from_args(&argv);
+        assert_eq!(owner, None);
+    }
+
+    #[test]
+    fn empty_original_command_with_forced_owner_is_error() {
+        // Forced command present (owner kanibako) but the client supplied no
+        // command: SSH_ORIGINAL_COMMAND is empty. Must bail with the clean
+        // "no command supplied" error rather than splicing a verbless owner.
+        let raw = vec![
+            "-seadog".to_string(),
+            "-c".to_string(),
+            "seadog --owner kanibako".to_string(),
+        ];
+        let err = resolve_argv(&raw, orig_env("")).unwrap_err();
+        assert!(err.to_string().contains("no command supplied"));
     }
 }
