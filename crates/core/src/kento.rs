@@ -317,8 +317,11 @@ mod real {
 
     /// Fixed PATH set before exec. `qm`/`pct` honor `PATH`/`PERL5LIB`, so
     /// we `env_clear()` and pin a known-good search path to avoid
-    /// hijacking via the ambient environment.
-    const SAFE_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+    /// hijacking via the ambient environment. `kento` installs to
+    /// `/usr/local/bin` (while `qm`/`pct`/`pvesh` live in `/usr/sbin`/
+    /// `/usr/bin`), so the pinned path mirrors root's standard PATH and
+    /// includes the `/usr/local` bins — all root-owned system dirs.
+    const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
     /// Substrings that mark a pmxcfs quorum-loss / read-only condition.
     const QUORUM_MARKERS: &[&str] = &[
