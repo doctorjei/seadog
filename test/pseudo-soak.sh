@@ -115,6 +115,27 @@ release_watcher_lock() {
 # real qm/pct live, so this mirrors prod resolution.
 SAFE_BIN="/usr/sbin"
 FAKE_SHIMS="qm pct kento pvesh"
+
+# Disposable-host guard. This test symlinks fake qm/pct/kento/pvesh into
+# /usr/sbin and runs seadog-priv as real root — catastrophic on a real PVE
+# node. Before ANY host mutation, refuse to run if a real qm/pct/pvesh (the
+# tools a genuine PVE node ships) already lives at ${SAFE_BIN}, unless it is
+# already OUR own symlink into ${FAKE_PVE_DIR} (so a re-run after a clean
+# prior run still passes). Uses the same ownership test as
+# remove_fakes_from_safe_path.
+assert_disposable_host() {
+  local tool path
+  for tool in qm pct pvesh; do
+    path="${SAFE_BIN}/${tool}"
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      if [ -L "$path" ] && [ "$(readlink "$path")" = "${FAKE_PVE_DIR}/${tool}" ]; then
+        continue
+      fi
+      printf "pseudo-soak: refusing to run — found real '%s' at %s. This test symlinks fake qm/pct/kento/pvesh into /usr/sbin and is for DISPOSABLE hosts only (CI ephemeral runners), never a real PVE node.\n" "$tool" "$path" >&2
+      exit 1
+    fi
+  done
+}
 install_fakes_on_safe_path() {
   local shim
   for shim in $FAKE_SHIMS; do
@@ -234,6 +255,7 @@ db_status() {
 
 # ---------------------------------------------------------------------------
 main() {
+  assert_disposable_host
   build
   setup
   printf '\n== scenario: create via front-end ==\n'
