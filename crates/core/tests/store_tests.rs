@@ -140,6 +140,28 @@ fn set_ttl_deadline_updates_and_errors_on_missing() {
 }
 
 #[test]
+fn set_mac_updates_and_errors_on_missing() {
+    let conn = store::open_in_memory().unwrap();
+    let env = sample_env("g1", 10000, "alice");
+    store::insert_env(&conn, &env).unwrap();
+
+    // Record the effective (kento-assigned) MAC read back after provision.
+    store::set_mac(&conn, "g1", "bc:00:00:27:10:00").unwrap();
+    assert_eq!(
+        store::get_env(&conn, "g1").unwrap().unwrap().mac,
+        "bc:00:00:27:10:00"
+    );
+
+    // Other columns untouched.
+    let got = store::get_env(&conn, "g1").unwrap().unwrap();
+    assert_eq!(got.owner, "alice");
+    assert_eq!(got.status, EnvStatus::Active);
+
+    // Missing guid is a typed NotFound error.
+    assert!(store::set_mac(&conn, "nope", "bc:00:00:00:00:00").is_err());
+}
+
+#[test]
 fn notify_state_write_read() {
     let conn = store::open_in_memory().unwrap();
     store::insert_env(&conn, &sample_env("g1", 10000, "alice")).unwrap();

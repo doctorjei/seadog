@@ -16,7 +16,7 @@ The end-to-end driver that uses them is `../pseudo-soak.sh`.
 | `pvesh`     | `pvesh`       | `get /cluster/resources --output-format json` |
 | `qm`        | `qm` (VMs)    | `config`, `set`, `create`, `destroy` |
 | `pct`       | `pct` (LXC)   | `config`, `set`, `create`, `destroy`, `exec` |
-| `kento`     | `kento`       | `create` |
+| `kento`     | `kento`       | `<lxc\|vm> create\|run\|destroy\|info`, `ls`, `pull` |
 | `_lib.sh`   | (shared lib)  | sourced by the shims; owns the state file + formatters |
 
 ## The command contract (what `RealKento` invokes)
@@ -26,10 +26,15 @@ Derived directly from `crates/core/src/kento.rs`:
 - **`list_guests`** → `pvesh get /cluster/resources --output-format json`
   (enumerate vmid+type), then per in-range guest `qm config <vmid>` (VM) /
   `pct config <vmid>` (LXC).
-- **`teardown`** → `pct destroy <vmid> --purge` / `qm destroy <vmid> --purge`.
-- **`provision`** → `kento create --vmid <v> --mode <lxc|vm> --image-ref
-  <ref> --name <n> --mac <m> --ip <ip>`, then `pct set <v> --hostname <n>
-  --description <d>` / `qm set <v> --name <n> --description <d>`.
+- **`teardown`** → `kento <lxc|vm> destroy -f <name>` (removes **by instance
+  name**, so kento's overlay state is cleaned too).
+- **`provision`** → `kento <lxc|vm> create --vmid <v> --name <n> --network
+  bridge=<b> --ip <ip>/<prefix> --gateway <gw> --ssh-host-keys --start
+  [--mac <m> for VM ONLY] <image-ref>` (kento owns networking/ssh/start),
+  then `pct set <v> --description <d>` / `qm set <v> --description <d>` to
+  stamp the markers. For an **LXC** the MAC is kento-assigned (`--mac` is
+  VM-only), so `provision` reads it back with `pct config <v>` and returns
+  the effective MAC.
 - **`set_meta`** → `pct set <v> [--description <d>] [--tags seadog-ttl-<ts>]`
   / `qm set …`.
 - **`start_sshd`** → `pct exec <v> -- systemctl start ssh`.
@@ -70,14 +75,16 @@ PVE round-trips a `--description` body — which exercises `RealKento`'s
 
 Semantics:
 
-- **create / provision** (`kento create`, or `qm`/`pct create`) → adds a
-  guest row with realistic hardware/fingerprint defaults; `qm`/`pct set`
-  then stamp the seadog name/description markers.
+- **create / provision** (`kento <lxc|vm> create`, or `qm`/`pct create`) →
+  adds a guest row with realistic hardware/fingerprint defaults; for an LXC
+  the MAC is synthesized (kento auto-assigns it). `qm`/`pct set` then stamp
+  the seadog description markers.
 - **set** → mutates `name`/`hostname`, `description`, or appends a tag.
 - **config / list / `pvesh get /cluster/resources`** → renders the table (or
   one guest's config) in the same `key: value` / JSON-array shape the real
   tools produce, so the `RealKento` parser consumes it unchanged.
-- **destroy / teardown** → removes the guest row.
+- **destroy / teardown** → removes the guest row (`kento <lxc|vm> destroy`
+  removes **by name**; `qm`/`pct destroy` by vmid).
 - A missing guest → non-zero exit with a realistic "does not exist" message.
 
 The state file is kept world-writable (`0666`): `RealKento::run()`

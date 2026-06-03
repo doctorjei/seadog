@@ -82,7 +82,10 @@ fn sweep_one_shot_mixes_fixtures_and_routes_each() {
 
     // expired+unanimous → reaped (teardown called + row marked).
     assert_eq!(v["reaped"], 1);
-    assert_eq!(k.teardowns(), vec![(10010, Mode::Vm)]);
+    assert_eq!(
+        k.teardowns(),
+        vec![("seadog-alice-p-expired".to_string(), Mode::Vm)]
+    );
     assert_eq!(
         store::get_env(&conn, "expired").unwrap().unwrap().status,
         EnvStatus::Reaped
@@ -157,7 +160,10 @@ fn watch_loop_reaps_one_then_self_extinguishes() {
     assert_eq!(summary.ticks, 1);
     assert_eq!(summary.reaped, 1);
     assert_eq!(summary.stop, watch::StopReason::Idle);
-    assert_eq!(k.teardowns(), vec![(10010, Mode::Vm)]);
+    assert_eq!(
+        k.teardowns(),
+        vec![("seadog-alice-p-g1".to_string(), Mode::Vm)]
+    );
     assert_eq!(
         store::get_env(&conn, "g1").unwrap().unwrap().status,
         EnvStatus::Reaped

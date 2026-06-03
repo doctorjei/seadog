@@ -34,6 +34,7 @@ fn parses_annotated_example() {
         Ipv4Addr::new(192, 168, 99, 1)
     );
     assert_eq!(cfg.allocation.ip_pool.prefix, 24);
+    assert_eq!(cfg.allocation.bridge, "vmbr0");
     assert_eq!(cfg.allocation.caps.max_lxc_per_owner, 8);
     assert_eq!(cfg.allocation.caps.max_vm_per_owner, 3);
 
@@ -92,6 +93,7 @@ images:
         Ipv4Addr::new(192, 168, 99, 192)
     );
     assert_eq!(cfg.allocation.caps.max_lxc_per_owner, 8);
+    assert_eq!(cfg.allocation.bridge, "vmbr0"); // default applied when omitted
     assert_eq!(cfg.lifecycle.default_ttl, Duration::from_secs(3600));
     assert_eq!(cfg.lifecycle.herd_cap, 10);
     assert_eq!(cfg.retention.terminal, Duration::from_secs(7 * 24 * 3600));

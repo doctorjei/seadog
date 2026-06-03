@@ -367,7 +367,13 @@ mod tests {
         assert_eq!(summary.ticks, 1);
         assert_eq!(summary.reaped, 1);
         assert_eq!(summary.stop, StopReason::Idle);
-        assert_eq!(k.teardowns(), vec![(10010, seadog_core::models::Mode::Vm)]);
+        assert_eq!(
+            k.teardowns(),
+            vec![(
+                "seadog-alice-p-g1".to_string(),
+                seadog_core::models::Mode::Vm
+            )]
+        );
         assert_eq!(
             store::get_env(&conn, "g1").unwrap().unwrap().status,
             EnvStatus::Reaped

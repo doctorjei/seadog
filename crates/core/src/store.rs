@@ -223,6 +223,23 @@ pub fn set_ttl_deadline(conn: &Connection, guid: &str, ttl_deadline: i64) -> Res
     Ok(())
 }
 
+/// Update an env's recorded `mac` to the **effective** MAC the guest
+/// actually carries after provision. On the LXC path kento assigns the MAC
+/// (`--mac` is VM-only), so the front-end mints a provisional MAC, lets the
+/// helper read the real one back, and records it here so identity /
+/// triangulation use the real MAC. Mirrors [`set_ttl_deadline`].
+/// `NotFound` if the `guid` has no row.
+pub fn set_mac(conn: &Connection, guid: &str, mac: &str) -> Result<(), Error> {
+    let n = conn.execute(
+        "UPDATE envs SET mac = ?1 WHERE guid = ?2",
+        params![mac, guid],
+    )?;
+    if n == 0 {
+        return Err(Error::NotFound(format!("env guid '{guid}'")));
+    }
+    Ok(())
+}
+
 /// Transition an env to `Vanished` (guest disappeared from PVE).
 pub fn mark_vanished(conn: &Connection, guid: &str) -> Result<(), Error> {
     set_status(conn, guid, EnvStatus::Vanished)

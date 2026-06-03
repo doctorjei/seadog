@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 # Fake `kento` (the seadog guest realizer) for the pseudo-soak. Implements
-# the one subcommand RealKento::provision invokes:
-#   kento create --vmid <v> --mode <lxc|vm> --image-ref <ref> --name <n>
-#                --mac <m> --ip <ip>
-# It adds a guest row (with realistic hardware/fingerprint defaults) to the
-# shared JSON guest table. RealKento then stamps the seadog markers via the
-# subsequent `qm set`/`pct set`. State + helpers live in _lib.sh.
+# the REAL kento 1.2.0 CLI surface seadog drives:
+#   kento <lxc|vm> create [flags] <image>   # create (+ --start to start)
+#   kento <lxc|vm> run    [flags] <image>   # = create and start
+#   kento <lxc|vm> destroy [-f] NAME [...]   # remove BY NAME (-f forces)
+#   kento <lxc|vm> info [--json] NAME        # instance details
+#   kento ls                                 # list (no flags)
+#   kento pull <image>
+# create/run flags honored: --vmid --name --network --ip --gateway --mac
+# (VM ONLY) plus pass-through no-ops (--ssh-host-keys --start --force …).
+# It records the guest into the shared JSON guest table with realistic
+# hardware/fingerprint defaults; for LXC it SYNTHESIZES a MAC (since --mac is
+# VM-only). RealKento then stamps the seadog markers via the subsequent
+# `qm set`/`pct set`. State + helpers live in _lib.sh.
 
 set -euo pipefail
 
@@ -13,44 +20,144 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=/dev/null
 . "${SCRIPT_DIR}/_lib.sh"
 
-sub="${1:-}"
-shift || true
+# Synthesize a deterministic locally-administered MAC for an LXC from its
+# vmid (kento assigns the CT MAC; --mac is VM-only). Mirrors the Rust
+# FakeKento::synthesized_lxc_mac shape (`bc:` first octet).
+synth_lxc_mac() {
+  local vmid="$1"
+  printf 'bc:%02x:%02x:%02x:%02x:00' "$(((vmid >> 24) & 255))" "$(((vmid >> 16) & 255))" "$(((vmid >> 8) & 255))" "$((vmid & 255))"
+}
 
-case "$sub" in
-  create)
+# Strip the optional `bridge=` / `host` / `none` etc. wrapper off a
+# --network value, leaving just the bridge name when present (else empty).
+network_bridge() {
+  local net="$1"
+  case "$net" in
+    bridge=*) printf '%s' "${net#bridge=}" ;;
+    *) printf 'vmbr0' ;;
+  esac
+}
+
+# create/run share all flag parsing. $1 is the resolved mode; the rest is
+# the flag/positional tail (mode + subcommand already stripped by the caller).
+do_create() {
+  local mode="$1"
+  shift
+  quorum_guard
+  local vmid="" name="" mac="" bridge="vmbr0" image=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --vmid) vmid="$2"; shift 2 ;;
+      --name) name="$2"; shift 2 ;;
+      --mac) mac="$2"; shift 2 ;;
+      --ip) shift 2 ;;
+      --gateway) shift 2 ;;
+      --dns) shift 2 ;;
+      --memory) shift 2 ;;
+      --cores) shift 2 ;;
+      --config-mode) shift 2 ;;
+      --ssh-key) shift 2 ;;
+      --ssh-key-user) shift 2 ;;
+      --network) bridge="$(network_bridge "$2")"; shift 2 ;;
+      --ssh-host-keys | --start | --force) shift ;;
+      -*) shift ;;
+      *) image="$1"; shift ;;
+    esac
+  done
+  if [ -z "$vmid" ] || [ -z "$name" ]; then
+    printf 'kento %s create: missing --vmid/--name\n' "$mode" >&2
+    exit 2
+  fi
+  if [ -z "$image" ]; then
+    printf 'kento %s create: missing <image>\n' "$mode" >&2
+    exit 2
+  fi
+  if guest_exists "$vmid"; then
+    printf 'kento %s create: vmid %s already exists\n' "$mode" "$vmid" >&2
+    exit 2
+  fi
+  if [ "$mode" = "lxc" ]; then
+    # --mac is VM-only: kento assigns the CT MAC.
+    mac="$(synth_lxc_mac "$vmid")"
+    upsert_guest "$vmid" lxc "name=$name" "mac=$mac" "bridge=$bridge" model=veth machine= bios= scsihw= memory=1024 cores=2 disk_geometry=local:"$vmid"/vm-"$vmid"-disk-0.raw disk_size=$((8 * 1024 * 1024 * 1024))
+  else
+    upsert_guest "$vmid" vm "name=$name" "mac=$mac" "bridge=$bridge" model=virtio machine=q35 bios=seabios scsihw=virtio-scsi-pci memory=2048 cores=2 disk_geometry=local-lvm:vm-"$vmid"-disk-0 disk_size=$((20 * 1024 * 1024 * 1024))
+  fi
+  printf '{"ok":true,"vmid":%s,"mode":"%s","name":"%s","mac":"%s"}\n' "$vmid" "$mode" "$name" "$mac"
+}
+
+# destroy BY NAME: [-f] NAME [NAME...] ($1 is the mode; rest is the tail).
+do_destroy() {
+  local mode="$1"
+  shift
+  quorum_guard
+  local removed=0 n
+  for n in "$@"; do
+    case "$n" in
+      -f | --force) continue ;;
+    esac
+    local vmid
+    vmid="$(read_state | jq -r --arg name "$n" '.guests[] | select(.name == $name) | .vmid' | head -n1)"
+    if [ -z "$vmid" ] || [ "$vmid" = "null" ]; then
+      printf 'kento %s destroy: no instance named %s\n' "$mode" "$n" >&2
+      exit 2
+    fi
+    remove_guest "$vmid"
+    removed=$((removed + 1))
+  done
+  printf '{"ok":true,"mode":"%s","destroyed":%s}\n' "$mode" "$removed"
+}
+
+# info [--json] NAME ($1 is the mode; rest is the tail).
+do_info() {
+  local mode="$1"
+  shift
+  quorum_guard
+  local json=0 name=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  local g
+  g="$(read_state | jq -c --arg name "$name" '.guests[] | select(.name == $name)' | head -n1)"
+  if [ -z "$g" ]; then
+    printf 'kento %s info: no instance named %s\n' "$mode" "$name" >&2
+    exit 2
+  fi
+  if [ "$json" -eq 1 ]; then
+    printf '%s\n' "$g"
+  else
+    printf '%s' "$g" | jq -r '"name: \(.name)\nvmid: \(.vmid)\nmac: \(.mac)"'
+  fi
+}
+
+mode="${1:-}"
+case "$mode" in
+  lxc | vm)
+    sub="${2:-}"
+    # Strip the mode + subcommand, leaving just the flag/positional tail.
+    shift 2 || true
+    case "$sub" in
+      create | run) do_create "$mode" "$@" ;;
+      destroy) do_destroy "$mode" "$@" ;;
+      info) do_info "$mode" "$@" ;;
+      *)
+        printf 'fake kento: unsupported %s subcommand %s\n' "$mode" "$sub" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  ls)
     quorum_guard
-    vmid=""
-    mode=""
-    name=""
-    mac=""
-    while [ "$#" -gt 0 ]; do
-      case "$1" in
-        --vmid) vmid="$2"; shift 2 ;;
-        --mode) mode="$2"; shift 2 ;;
-        --image-ref) shift 2 ;;
-        --name) name="$2"; shift 2 ;;
-        --mac) mac="$2"; shift 2 ;;
-        --ip) shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    if [ -z "$vmid" ] || [ -z "$mode" ]; then
-      printf 'kento create: missing --vmid/--mode\n' >&2
-      exit 2
-    fi
-    if guest_exists "$vmid"; then
-      printf 'kento create: vmid %s already exists\n' "$vmid" >&2
-      exit 2
-    fi
-    if [ "$mode" = "lxc" ]; then
-      upsert_guest "$vmid" lxc "name=$name" "mac=$mac" bridge=vmbr0 model=veth machine= bios= scsihw= memory=1024 cores=2 disk_geometry=local:"$vmid"/vm-"$vmid"-disk-0.raw disk_size=$((8 * 1024 * 1024 * 1024))
-    else
-      upsert_guest "$vmid" vm "name=$name" "mac=$mac" bridge=vmbr0 model=virtio machine=q35 bios=seabios scsihw=virtio-scsi-pci memory=2048 cores=2 disk_geometry=local-lvm:vm-"$vmid"-disk-0 disk_size=$((20 * 1024 * 1024 * 1024))
-    fi
-    printf '{"ok":true,"vmid":%s,"mode":"%s"}\n' "$vmid" "$mode"
+    read_state | jq -r '.guests[] | "\(.vmid)\t\(.name)\t\(.mode)"'
+    ;;
+  pull)
+    printf '{"ok":true,"pulled":"%s"}\n' "${2:-}"
     ;;
   *)
-    printf 'fake kento: unsupported subcommand %s\n' "$sub" >&2
+    printf 'fake kento: unsupported command %s\n' "$mode" >&2
     exit 2
     ;;
 esac

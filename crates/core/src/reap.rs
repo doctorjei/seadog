@@ -206,8 +206,31 @@ fn handle_reap_candidate(
         return Ok(());
     }
 
-    // Tear it down, then mark the row reaped.
-    match kento.teardown(g.vmid, env.mode) {
+    // Tear it down by the LIVE guest name (kento destroys by name, cleaning
+    // its overlay state too). A `Reap` classification is unanimous, which
+    // requires the seadog- name prefix, so `g.name` is present here; guard
+    // defensively against a missing name rather than ever passing an empty
+    // one to a destroy.
+    let live_name = match g.name.as_deref() {
+        Some(n) if !n.is_empty() => n,
+        _ => {
+            outcome.deferred += 1;
+            route(
+                conn,
+                config,
+                now_unix,
+                Event::OverdueUnreaped {
+                    guid: guid.to_string(),
+                    detail: format!(
+                        "teardown of env {} (vmid {}) skipped: live guest has no name",
+                        guid, g.vmid
+                    ),
+                },
+            );
+            return Ok(());
+        }
+    };
+    match kento.teardown(live_name, env.mode) {
         Ok(()) => {
             store::mark_reaped(conn, guid)?;
             outcome.reaped += 1;
@@ -373,7 +396,10 @@ images:
 
         let out = sweep(&k, &conn, &c, now).unwrap();
         assert_eq!(out.reaped, 1);
-        assert_eq!(k.teardowns(), vec![(10010, Mode::Vm)]);
+        assert_eq!(
+            k.teardowns(),
+            vec![("seadog-alice-p-g1".to_string(), Mode::Vm)]
+        );
         assert_eq!(
             store::get_env(&conn, "g1").unwrap().unwrap().status,
             EnvStatus::Reaped
@@ -450,7 +476,7 @@ images:
         k.set_guests(vec![signals_for(&conn, "g1", 10010)]);
         // Teardown fails for a non-quorum reason → deferred, not reaped,
         // and the row stays Active (no spin).
-        k.fail_teardown(10010, "lock busy");
+        k.fail_teardown("seadog-alice-p-g1", "lock busy");
 
         let out = sweep(&k, &conn, &c, now).unwrap();
         assert_eq!(out.reaped, 0);

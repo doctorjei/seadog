@@ -9,6 +9,7 @@ cadence:
 
 allocation:
   vmid_range: [10000, 10999]    # inclusive; the scan + allocator range
+  bridge: vmbr0                 # bridge kento attaches guests to; set to your node's bridge
   ip_pool:                      # static IPs at create, lowest-available, atomic lease
     # EXAMPLE range — set to a free range on your network.
     range: [192.168.99.192, 192.168.99.254]

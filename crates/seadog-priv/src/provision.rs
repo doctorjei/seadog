@@ -116,7 +116,10 @@ pub fn run(args: &ProvisionArgs, kento: &dyn Kento, config: &Config) -> Result<V
     }
     validate_image_ref(&args.image_ref, mode, config)?;
 
-    // Create the guest with exactly the allocated params + markers.
+    // Create the guest with exactly the allocated params + markers. The
+    // bridge + IP prefix/gateway come from the helper's own config (kento
+    // owns networking; we pass `--network bridge=<bridge> --ip <ip>/<prefix>
+    // --gateway <gw>`).
     let spec = ProvisionSpec {
         vmid: args.vmid,
         mode,
@@ -124,10 +127,16 @@ pub fn run(args: &ProvisionArgs, kento: &dyn Kento, config: &Config) -> Result<V
         name: args.name.clone(),
         mac: args.mac.clone(),
         ip: args.ip.clone(),
+        prefix: config.allocation.ip_pool.prefix,
+        gateway: config.allocation.ip_pool.gateway.to_string(),
+        bridge: config.allocation.bridge.clone(),
         guid: args.guid.clone(),
         owner: args.owner.clone(),
     };
-    kento.provision(&spec).map_err(|e| anyhow!(e))?;
+    // `--mac` is VM-only; for an LXC kento assigns the MAC and provision
+    // reads it back. The effective MAC flows back to the front-end so it
+    // records the REAL mac on the DB row.
+    let outcome = kento.provision(&spec).map_err(|e| anyhow!(e))?;
 
     // loom ships sshd disabled; on the LXC path bring it up after create.
     let sshd_started = if mode == Mode::Lxc {
@@ -144,6 +153,9 @@ pub fn run(args: &ProvisionArgs, kento: &dyn Kento, config: &Config) -> Result<V
         "mode": mode.as_str(),
         "guid": args.guid,
         "owner": args.owner,
+        // The EFFECTIVE mac the guest actually carries (passed for vm,
+        // kento-assigned + read-back for lxc). The front-end records this.
+        "mac": outcome.mac,
         "sshd_started": sshd_started,
     }))
 }
@@ -175,6 +187,11 @@ mod tests {
         let out = run(&args(), &k, &cfg).unwrap();
         assert_eq!(out["ok"], true);
         assert_eq!(out["sshd_started"], true);
+        // LXC: kento assigns the MAC, so the effective MAC in the output is
+        // NOT the one the front-end passed (which it would record on the row).
+        let eff_mac = out["mac"].as_str().unwrap();
+        assert!(!eff_mac.is_empty());
+        assert_ne!(eff_mac, "aa:bb:cc:dd:ee:ff");
 
         // FakeKento.provision was called with the exact params.
         let provs = k.provisions();
@@ -214,6 +231,8 @@ mod tests {
         assert_eq!(out["sshd_started"], false);
         assert!(k.sshd_starts().is_empty());
         assert_eq!(k.provisions().len(), 1);
+        // VM: --mac is honored, so the effective MAC is the one we passed.
+        assert_eq!(out["mac"], "aa:bb:cc:dd:ee:ff");
     }
 
     #[test]

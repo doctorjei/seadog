@@ -104,9 +104,18 @@ pub fn run(args: &TeardownArgs, kento: &dyn Kento, config: &Config) -> Result<Va
         ),
     }
 
-    // ALL checks passed → destroy.
+    // ALL checks passed → destroy. kento removes BY NAME (cleaning its
+    // overlay state too); use the name read from LIVE PVE during
+    // triangulation, never a caller-supplied one. The guest passed the
+    // `seadog-` name-prefix check above, so the name is present.
+    let live_name = guest.name.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "refusing teardown: vmid {} has no live name to destroy by",
+            args.vmid
+        )
+    })?;
     kento
-        .teardown(args.vmid, mode)
+        .teardown(live_name, mode)
         .map_err(anyhow::Error::from)?;
 
     Ok(json!({
@@ -158,7 +167,10 @@ mod tests {
         k.set_guests(vec![seadog_guest(10010, GUID, "alice")]);
         let out = run(&args(10010, GUID, "alice"), &k, &cfg).unwrap();
         assert_eq!(out["ok"], true);
-        assert_eq!(k.teardowns(), vec![(10010, Mode::Lxc)]);
+        assert_eq!(
+            k.teardowns(),
+            vec![("seadog-alice-proj-ab12".to_string(), Mode::Lxc)]
+        );
     }
 
     #[test]

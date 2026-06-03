@@ -140,14 +140,32 @@ pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
     let req = ElevateArgs::new("provision", ctx.owner.clone(), argv);
 
     match elevate(&req) {
-        Ok(_outcome) => Ok(json!({
-            "id": guid,
-            "ip": allocation.ip.to_string(),
-            "name": name,
-            "vmid": allocation.vmid,
-            "mode": mode.as_str(),
-            "ttl_deadline": ttl_deadline,
-        })),
+        Ok(outcome) => {
+            // The helper returns the EFFECTIVE mac the guest actually carries
+            // (the minted one for a VM; the kento-assigned one read back for
+            // an LXC, since `--mac` is VM-only). Record it on the DB row so
+            // identity/triangulation use the real MAC. Best-effort: a missing
+            // or unchanged mac is not fatal to the create.
+            let effective_mac = outcome
+                .result
+                .get("mac")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&mac);
+            if effective_mac != mac {
+                if let Err(e) = store::set_mac(&wconn, &guid, effective_mac) {
+                    eprintln!("seadog: recording effective mac for '{guid}' failed: {e}");
+                }
+            }
+            Ok(json!({
+                "id": guid,
+                "ip": allocation.ip.to_string(),
+                "name": name,
+                "vmid": allocation.vmid,
+                "mode": mode.as_str(),
+                "mac": effective_mac,
+                "ttl_deadline": ttl_deadline,
+            }))
+        }
         Err(e) => {
             // Rollback: mark the row Vanished so the lease frees. Best-effort
             // — if the rollback itself fails we still surface the original

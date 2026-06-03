@@ -73,6 +73,10 @@ pub struct Allocation {
     /// Inclusive `[low, high]` vmid scan + allocate range.
     #[serde(default = "default_vmid_range")]
     pub vmid_range: [u32; 2],
+    /// The PVE bridge kento attaches guests to (e.g. `vmbr0`). Passed to
+    /// `kento create` as `--network bridge=<this>`.
+    #[serde(default = "default_bridge")]
+    pub bridge: String,
     #[serde(default)]
     pub ip_pool: IpPool,
     #[serde(default)]
@@ -83,6 +87,7 @@ impl Default for Allocation {
     fn default() -> Self {
         Allocation {
             vmid_range: default_vmid_range(),
+            bridge: default_bridge(),
             ip_pool: IpPool::default(),
             caps: Caps::default(),
         }
@@ -373,6 +378,9 @@ fn days_7() -> Duration {
 }
 fn default_vmid_range() -> [u32; 2] {
     [10000, 10999]
+}
+fn default_bridge() -> String {
+    "vmbr0".to_string()
 }
 fn default_ip_range() -> [Ipv4Addr; 2] {
     // Example fallback only; operators set ip_pool to a free range on their network.
