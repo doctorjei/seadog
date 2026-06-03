@@ -258,13 +258,17 @@ fn run_with_real_backend(verb: &Verb, config: &Config) -> Result<Value> {
         {
             Err(no_backend_err())
         }
-        fn teardown(&self, _vmid: u32, _mode: Mode) -> std::result::Result<(), seadog_core::Error> {
+        fn teardown(
+            &self,
+            _name: &str,
+            _mode: Mode,
+        ) -> std::result::Result<(), seadog_core::Error> {
             Err(no_backend_err())
         }
         fn provision(
             &self,
             _spec: &seadog_core::kento::ProvisionSpec,
-        ) -> std::result::Result<(), seadog_core::Error> {
+        ) -> std::result::Result<seadog_core::kento::ProvisionOutcome, seadog_core::Error> {
             Err(no_backend_err())
         }
         fn set_meta(
