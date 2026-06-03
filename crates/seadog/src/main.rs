@@ -107,6 +107,11 @@ enum Verb {
 }
 
 fn main() -> ExitCode {
+    // Keep the SQLite WAL/SHM sidecars group-writable (shared `seadog`
+    // group) so the root reaper and this front-end can both write the DB.
+    // Mirrors seadog-priv; must run before the DB is opened.
+    unsafe { libc::umask(0o002) };
+
     match run() {
         Ok(value) => {
             // Pretty JSON to stdout; JSON-only is the project decision.

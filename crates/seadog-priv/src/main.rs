@@ -164,6 +164,14 @@ fn log_op(verb: &Verb) {
 }
 
 fn main() {
+    // Shared-DB footgun: the SQLite WAL/SHM sidecars must stay
+    // group-writable (group `seadog`) so the testenv front-end and the root
+    // reaper can both write the DB. The setgid `/var/lib/seadog` dir fixes
+    // group *ownership*; this fixes the file *mode* regardless of how sudo
+    // (watcher) or systemd (sweeper) leaves our umask. Must run before any
+    // file is created.
+    unsafe { libc::umask(0o002) };
+
     seadog_core::notify::init_logging();
 
     let cli = Cli::parse();

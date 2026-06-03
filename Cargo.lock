@@ -625,6 +625,7 @@ dependencies = [
  "anyhow",
  "clap",
  "humantime",
+ "libc",
  "rand",
  "rusqlite",
  "seadog-core",
