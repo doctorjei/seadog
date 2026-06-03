@@ -105,6 +105,23 @@ sudo ./deploy/install.sh
 See `deploy/install.sh` for the bootstrap-key arguments that authorize
 the first owner.
 
+### Managing owners
+
+Each owner is a key in the root-owned `/etc/seadog/authorized_keys`,
+carrying its forced `command=".../seadog --owner <name>"`. Rather than
+hand-editing that file, use `seadog-priv` (it validates the name, writes
+the line atomically, and re-asserts `root:root 0644`):
+
+```sh
+sudo /usr/lib/seadog/seadog-priv add-owner --owner alice --key "ssh-ed25519 AAAA... alice@host"
+sudo /usr/lib/seadog/seadog-priv list-owners
+sudo /usr/lib/seadog/seadog-priv remove-owner --owner alice
+```
+
+`add-owner` is idempotent on the key blob: re-adding the same key for the
+same owner is a no-op, and a key already mapped to a *different* owner is
+rejected.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE.md](LICENSE.md).

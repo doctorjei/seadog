@@ -78,6 +78,38 @@ pub fn validate_guest_name(name: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Validate an *owner* name (the `--owner <name>` identity carried by each
+/// authorized key).
+///
+/// Rules: non-empty, charset `[a-z0-9-]` only, no leading/trailing hyphen,
+/// length ≤ 32. The owner feeds both the `seadog-<owner>-…` DNS label and
+/// the forced-command line written into `authorized_keys`, so it must be
+/// label-safe and free of any quote/space/shell metacharacter.
+pub fn validate_owner_name(name: &str) -> Result<(), Error> {
+    if name.is_empty() {
+        return Err(Error::Validation("owner name must not be empty".into()));
+    }
+    if name.len() > 32 {
+        return Err(Error::Validation(format!(
+            "owner name '{name}' exceeds 32 chars"
+        )));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(Error::Validation(format!(
+            "owner name '{name}' must be lowercase [a-z0-9-] only"
+        )));
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        return Err(Error::Validation(format!(
+            "owner name '{name}' must not start or end with a hyphen"
+        )));
+    }
+    Ok(())
+}
+
 /// A resolved image: the real OCI ref plus the effective mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedImage {
@@ -193,6 +225,40 @@ images:
         let long = format!("seadog-{}", "a".repeat(60));
         assert!(long.len() > 63);
         assert!(validate_guest_name(&long).is_err());
+    }
+
+    #[test]
+    fn owner_name_accepts_valid() {
+        assert!(validate_owner_name("alice").is_ok());
+        assert!(validate_owner_name("team-a").is_ok());
+        assert!(validate_owner_name("a").is_ok());
+        assert!(validate_owner_name("ci-2026").is_ok());
+    }
+
+    #[test]
+    fn owner_name_rejects_empty() {
+        assert!(validate_owner_name("").is_err());
+    }
+
+    #[test]
+    fn owner_name_rejects_bad_charset() {
+        assert!(validate_owner_name("Alice").is_err());
+        assert!(validate_owner_name("a_b").is_err());
+        assert!(validate_owner_name("a b").is_err());
+        assert!(validate_owner_name("a.b").is_err());
+        assert!(validate_owner_name("a\"b").is_err());
+    }
+
+    #[test]
+    fn owner_name_rejects_edge_hyphens() {
+        assert!(validate_owner_name("-alice").is_err());
+        assert!(validate_owner_name("alice-").is_err());
+    }
+
+    #[test]
+    fn owner_name_rejects_over_cap() {
+        assert!(validate_owner_name(&"a".repeat(33)).is_err());
+        assert!(validate_owner_name(&"a".repeat(32)).is_ok());
     }
 
     #[test]

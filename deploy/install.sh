@@ -185,9 +185,11 @@ seadog install complete.
 
 Manual follow-ups:
   - Review ${CONFIG} (image allowlist, IP pool, caps).
-  - Authorize each owner by appending a forced-command line to
-    ${AUTHKEYS} (root-owned). Format:
-      command="${FRONTEND} --owner <name>",restrict <keytype> <blob> <comment>
+  - Authorize each owner with the seadog-priv owner verbs (they manage
+    ${AUTHKEYS} root-owned, atomically, 0644):
+      sudo ${PRIV} add-owner --owner <name> --key "<keytype> <blob> <comment>"
+      sudo ${PRIV} list-owners
+      sudo ${PRIV} remove-owner --owner <name>
     (or re-run this installer with BOOTSTRAP_KEY + BOOTSTRAP_OWNER.)
   - Confirm sshd picked up /etc/ssh/sshd_config.d/seadog.conf.
   - Smoke test from a client:  ssh ${USER_NAME}@<pve-host> health

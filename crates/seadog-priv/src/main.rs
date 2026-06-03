@@ -18,6 +18,7 @@
 //! Every verb emits **JSON on stdout** (the front-end parses it); an error
 //! emits JSON on stderr and exits non-zero.
 
+mod owners;
 mod provision;
 mod set_meta;
 mod start_sshd;
@@ -64,6 +65,12 @@ enum Verb {
     Watch,
     /// One-shot sweep: the 60-min systemd-timer backstop.
     Sweep,
+    /// Authorize a key for an owner in the root-owned authorized_keys.
+    AddOwner(owners::AddOwnerArgs),
+    /// List the owner→key mappings in the root-owned authorized_keys.
+    ListOwners(owners::ListOwnersArgs),
+    /// Remove an owner's mapping(s) from the root-owned authorized_keys.
+    RemoveOwner(owners::RemoveOwnerArgs),
 }
 
 impl Verb {
@@ -76,6 +83,9 @@ impl Verb {
             Verb::StartSshd(_) => "start-sshd",
             Verb::Watch => "watch",
             Verb::Sweep => "sweep",
+            Verb::AddOwner(_) => "add-owner",
+            Verb::ListOwners(_) => "list-owners",
+            Verb::RemoveOwner(_) => "remove-owner",
         }
     }
 }
@@ -131,6 +141,12 @@ fn dispatch(verb: &Verb, kento: &dyn Kento, config: &Config) -> Result<Value> {
         // verbs); `now` is wall-clock in prod.
         Verb::Sweep => sweep::run(kento, config, wall_clock_now()),
         Verb::Watch => watch::run(kento, config),
+        // Owner-management verbs touch only the root-owned authorized_keys
+        // file — no Kento backend, no DB — so they bypass that part of the
+        // seam (like watch/sweep bypass others). `kento` is unused here.
+        Verb::AddOwner(a) => owners::add_owner(a),
+        Verb::ListOwners(a) => owners::list_owners(a),
+        Verb::RemoveOwner(a) => owners::remove_owner(a),
     }
 }
 
@@ -154,6 +170,9 @@ fn log_op(verb: &Verb) {
         Verb::SetMeta(a) => ("-", format!("vmid {}", a.vmid)),
         Verb::StartSshd(a) => ("-", format!("vmid {}", a.vmid)),
         Verb::Watch | Verb::Sweep => ("-", "-".to_string()),
+        Verb::AddOwner(a) => (a.owner.as_str(), a.owner.clone()),
+        Verb::RemoveOwner(a) => (a.owner.as_str(), a.owner.clone()),
+        Verb::ListOwners(_) => ("-", "-".to_string()),
     };
     tracing::info!(
         owner = owner,

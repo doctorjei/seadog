@@ -16,6 +16,7 @@
 //!   for callers.
 
 pub mod alloc;
+pub mod authkeys;
 pub mod config;
 pub mod identity;
 pub mod kento;
