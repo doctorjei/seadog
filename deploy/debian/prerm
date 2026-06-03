@@ -1,0 +1,20 @@
+#!/bin/sh
+# seadog .deb prerm — stop the service/timer before files are removed.
+#
+# Runs on both `remove` and the prerm of an upgrade. We disable+stop the
+# timer/service in every case (the upgrade's postinst re-enables them);
+# leaving a running unit pointed at a binary that's about to be replaced
+# is the thing we want to avoid. Best-effort.
+set -e
+
+case "$1" in
+remove | upgrade | deconfigure | failed-upgrade)
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now seadog-sweeper-idle.timer seadog-sweeper.service \
+            >/dev/null 2>&1 || true
+    fi
+    ;;
+*) ;;
+esac
+
+exit 0

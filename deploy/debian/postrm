@@ -1,0 +1,51 @@
+#!/bin/sh
+# seadog .deb postrm — reverse the install glue.
+#
+# On a plain `remove` we leave per-deployment state (config, DB,
+# authorized_keys, the user/group) in place so a reinstall resumes
+# cleanly. Only `purge` tears everything down: drop the /etc/shells entry,
+# remove /etc/seadog + /var/lib/seadog, and delete the user/group.
+# Everything best-effort + idempotent.
+set -e
+
+LIBDIR="/usr/lib/seadog"
+ETCDIR="/etc/seadog"
+VARDIR="/var/lib/seadog"
+FRONTEND="${LIBDIR}/seadog"
+USER_NAME="testenv"
+GROUP_NAME="seadog"
+
+case "$1" in
+purge)
+    # 1. Drop the login-shell registration.
+    if command -v remove-shell >/dev/null 2>&1; then
+        remove-shell "${FRONTEND}" || true
+    elif [ -f /etc/shells ]; then
+        # Portable fallback: strip the exact line.
+        grep -vxF "${FRONTEND}" /etc/shells >/etc/shells.seadog-tmp 2>/dev/null \
+            && cat /etc/shells.seadog-tmp >/etc/shells
+        rm -f /etc/shells.seadog-tmp || true
+    fi
+
+    # 2. Remove per-deployment state.
+    rm -rf "${ETCDIR}" "${VARDIR}" || true
+
+    # 3. Delete the user then the group (user first; it owns the gid as
+    # primary group). Best-effort — absent already = fine.
+    if command -v deluser >/dev/null 2>&1; then
+        deluser --quiet "${USER_NAME}" >/dev/null 2>&1 || true
+    fi
+    if command -v delgroup >/dev/null 2>&1; then
+        delgroup --quiet --only-if-empty "${GROUP_NAME}" >/dev/null 2>&1 || true
+    fi
+
+    # 4. Let systemd forget the removed units.
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    ;;
+remove | upgrade | failed-upgrade | abort-install | abort-upgrade | disappear) ;;
+*) ;;
+esac
+
+exit 0

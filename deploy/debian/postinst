@@ -1,0 +1,74 @@
+#!/bin/sh
+# seadog .deb postinst — declarative-first install glue.
+#
+# Idempotent + best-effort. The heavy lifting (users, dirs, files) is
+# declarative: sysusers.d creates the group/user, tmpfiles.d creates
+# /run/seadog, and dpkg has already laid down every packaged file. This
+# script only does what packaging can't express: trigger sysusers/tmpfiles,
+# fix the setgid dir ownership, register the login shell, seed the
+# never-packaged per-deployment files (authorized_keys, the DB), and
+# wire up systemd + sshd.
+set -e
+
+LIBDIR="/usr/lib/seadog"
+ETCDIR="/etc/seadog"
+VARDIR="/var/lib/seadog"
+FRONTEND="${LIBDIR}/seadog"
+AUTHKEYS="${ETCDIR}/authorized_keys"
+DB="${VARDIR}/seadog.db"
+USER_NAME="testenv"
+GROUP_NAME="seadog"
+
+case "$1" in
+configure)
+    # 1. Declarative user/group + runtime dir (idempotent re-assertion).
+    if command -v systemd-sysusers >/dev/null 2>&1; then
+        systemd-sysusers /usr/lib/sysusers.d/seadog.conf || true
+    fi
+    if command -v systemd-tmpfiles >/dev/null 2>&1; then
+        systemd-tmpfiles --create /usr/lib/tmpfiles.d/seadog.conf || true
+    fi
+
+    # 2. /var/lib/seadog must be setgid group seadog (2775 root:seadog) so
+    # root- and testenv-created DB sidecars stay group-writable. dpkg ships
+    # the dir but can't express setgid+group ownership here.
+    chgrp "${GROUP_NAME}" "${VARDIR}" 2>/dev/null || true
+    chmod 2775 "${VARDIR}" 2>/dev/null || true
+
+    # 3. Register the front-end as a valid login shell (testenv's shell).
+    if command -v add-shell >/dev/null 2>&1; then
+        add-shell "${FRONTEND}" || true
+    elif [ -f /etc/shells ] && ! grep -qxF "${FRONTEND}" /etc/shells; then
+        printf '%s\n' "${FRONTEND}" >>/etc/shells || true
+    fi
+
+    # 4. Per-deployment files (NEVER package content). Create only if absent.
+    if [ ! -f "${AUTHKEYS}" ]; then
+        install -m 0644 -o root -g root /dev/null "${AUTHKEYS}" || true
+    fi
+    if [ ! -e "${DB}" ]; then
+        # Empty DB owned testenv:seadog 0664; the binaries create the schema
+        # on first open. Only seed if the user already exists (sysusers ran).
+        if id -u "${USER_NAME}" >/dev/null 2>&1; then
+            install -m 0664 -o "${USER_NAME}" -g "${GROUP_NAME}" /dev/null "${DB}" || true
+        fi
+    fi
+
+    # 5. systemd: reload units + enable/start the backstop timer.
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload || true
+        systemctl enable --now seadog-sweeper-idle.timer || true
+    fi
+
+    # 6. sshd: only reload if the merged config still validates.
+    if command -v sshd >/dev/null 2>&1 && sshd -t >/dev/null 2>&1; then
+        systemctl reload sshd 2>/dev/null \
+            || systemctl reload ssh 2>/dev/null \
+            || true
+    fi
+    ;;
+abort-upgrade | abort-remove | abort-deconfigure) ;;
+*) ;;
+esac
+
+exit 0

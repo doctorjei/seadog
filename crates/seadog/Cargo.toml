@@ -28,3 +28,91 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+# ====================================================================
+# Debian package (cargo-deb) — PRIMARY artifact.
+#
+# Build:  cargo build --release --target x86_64-unknown-linux-musl
+#         cargo deb -p seadog --target x86_64-unknown-linux-musl
+# Output: target/debian/seadog_0.1.0-1_amd64.deb
+#
+# ONE .deb holds BOTH binaries + every deploy/ asset. The explicit
+# `assets` list fully replaces cargo-deb's auto-include of this crate's
+# own binary, so each binary appears exactly once. We do NOT enable
+# cargo-deb's systemd-units integration — systemd is driven by the
+# hand-rolled maintainer scripts in deploy/debian/.
+# ====================================================================
+[package.metadata.deb]
+maintainer = "Jei Blanchard <jjb@eng.ufl.edu>"
+copyright = "2026, Jei Blanchard <jjb@eng.ufl.edu>"
+license-file = ["../../LICENSE.md", "0"]
+extended-description = """\
+seadog provisions ephemeral, owner-scoped Proxmox VE test environments. \
+Callers SSH into a locked-down `testenv` login shell that runs one verb \
+per connection; a root helper (seadog-priv) realizes/destroys guests and \
+a systemd-timer-driven backstop sweeper reaps expired environments. This \
+package ships both static-musl binaries plus the sudoers/sshd/systemd/ \
+tmpfiles/sysusers plumbing.\
+"""
+section = "admin"
+priority = "optional"
+# Static-musl binaries → no library deps. systemd is the only runtime
+# integration we rely on (units, sysusers, tmpfiles).
+depends = "systemd"
+# /etc/seadog/config.yaml is a dpkg conffile: preserved (prompted) on
+# upgrade, never silently clobbered.
+conf-files = ["/etc/seadog/config.yaml"]
+maintainer-scripts = "../../deploy/debian/"
+# Build the musl binaries ourselves (above); don't let cargo-deb rebuild
+# for the default target.
+assets = [
+    ["target/release/seadog", "/usr/lib/seadog/seadog", "755"],
+    ["target/release/seadog-priv", "/usr/lib/seadog/seadog-priv", "755"],
+    ["../../deploy/sudoers.d/seadog", "/etc/sudoers.d/seadog", "440"],
+    ["../../deploy/sshd-snippet.conf", "/etc/ssh/sshd_config.d/seadog.conf", "644"],
+    ["../../deploy/systemd/seadog-sweeper.service", "/lib/systemd/system/seadog-sweeper.service", "644"],
+    ["../../deploy/systemd/seadog-sweeper-idle.timer", "/lib/systemd/system/seadog-sweeper-idle.timer", "644"],
+    ["../../deploy/tmpfiles.d/seadog.conf", "/usr/lib/tmpfiles.d/seadog.conf", "644"],
+    ["../../deploy/sysusers.d/seadog.conf", "/usr/lib/sysusers.d/seadog.conf", "644"],
+    ["../../deploy/config.yaml.example", "/etc/seadog/config.yaml", "644"],
+    ["../../deploy/seadog-wrapper.sh", "/usr/bin/seadog-wrapper", "755"],
+]
+
+# ====================================================================
+# Fedora/RHEL package (cargo-generate-rpm).
+#
+# Build:  cargo generate-rpm -p crates/seadog
+#           (NO --target: the asset `source` paths below already point at
+#            the musl release dir, so build the binaries with --target
+#            first, then run generate-rpm WITHOUT it. Passing --target here
+#            produced no artifact in testing.)
+# Output: target/generate-rpm/seadog-0.1.0-1.x86_64.rpm
+#
+# Same asset layout as the .deb. /etc/seadog/config.yaml is flagged
+# config(noreplace) — the rpm analog of the dpkg conffile. Scriptlets in
+# deploy/rpm/ mirror the deb maintainer scripts (RPM $1 = package count:
+# install=1, upgrade=2, final-removal=0).
+# ====================================================================
+[package.metadata.generate-rpm]
+summary = "Unprivileged login-shell front-end + root helper for the seadog ephemeral PVE test-env provisioner."
+# Static-musl: no auto-detected shared-lib requires; only systemd matters.
+auto-req = "no"
+requires = { systemd = "*" }
+assets = [
+    { source = "target/x86_64-unknown-linux-musl/release/seadog", dest = "/usr/lib/seadog/seadog", mode = "0755" },
+    { source = "target/x86_64-unknown-linux-musl/release/seadog-priv", dest = "/usr/lib/seadog/seadog-priv", mode = "0755" },
+    { source = "deploy/sudoers.d/seadog", dest = "/etc/sudoers.d/seadog", mode = "0440" },
+    { source = "deploy/sshd-snippet.conf", dest = "/etc/ssh/sshd_config.d/seadog.conf", mode = "0644" },
+    { source = "deploy/systemd/seadog-sweeper.service", dest = "/lib/systemd/system/seadog-sweeper.service", mode = "0644" },
+    { source = "deploy/systemd/seadog-sweeper-idle.timer", dest = "/lib/systemd/system/seadog-sweeper-idle.timer", mode = "0644" },
+    { source = "deploy/tmpfiles.d/seadog.conf", dest = "/usr/lib/tmpfiles.d/seadog.conf", mode = "0644" },
+    { source = "deploy/sysusers.d/seadog.conf", dest = "/usr/lib/sysusers.d/seadog.conf", mode = "0644" },
+    { source = "deploy/config.yaml.example", dest = "/etc/seadog/config.yaml", mode = "0644", config = "noreplace" },
+    { source = "deploy/seadog-wrapper.sh", dest = "/usr/bin/seadog-wrapper", mode = "0755" },
+]
+# Scriptlets are given as file paths (cargo-generate-rpm reads the file
+# when the string resolves to an existing path, else treats it as inline
+# script text). These map to RPM %post / %preun / %postun.
+post_install_script = "deploy/rpm/post.sh"
+pre_uninstall_script = "deploy/rpm/preun.sh"
+post_uninstall_script = "deploy/rpm/postun.sh"
