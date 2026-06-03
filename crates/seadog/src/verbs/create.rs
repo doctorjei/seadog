@@ -141,16 +141,20 @@ pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
 
     match elevate(&req) {
         Ok(outcome) => {
-            // The helper returns the EFFECTIVE mac the guest actually carries
-            // (the minted one for a VM; the kento-assigned one read back for
-            // an LXC, since `--mac` is VM-only). Record it on the DB row so
-            // identity/triangulation use the real MAC. Best-effort: a missing
-            // or unchanged mac is not fatal to the create.
-            let effective_mac = outcome
+            // The helper reports the EFFECTIVE mac the guest actually carries.
+            // For a VM it is the minted MAC (a JSON string). For an LXC the
+            // MAC is unobservable via `pct config`, so the helper emits JSON
+            // `null` (or omits it): the allocated MAC is fictional, so we
+            // record `""` ("no MAC recorded") on the row rather than leave the
+            // fiction. Identity then treats MAC as confirming-when-present.
+            // Best-effort: a recording failure is not fatal to the create.
+            // VM → the real MAC string; LXC / unobservable → null or absent,
+            // which `unwrap_or_default` maps to "" ("no MAC recorded").
+            let effective_mac: &str = outcome
                 .result
                 .get("mac")
                 .and_then(|v| v.as_str())
-                .unwrap_or(&mac);
+                .unwrap_or_default();
             if effective_mac != mac {
                 if let Err(e) = store::set_mac(&wconn, &guid, effective_mac) {
                     eprintln!("seadog: recording effective mac for '{guid}' failed: {e}");

@@ -224,10 +224,11 @@ pub fn set_ttl_deadline(conn: &Connection, guid: &str, ttl_deadline: i64) -> Res
 }
 
 /// Update an env's recorded `mac` to the **effective** MAC the guest
-/// actually carries after provision. On the LXC path kento assigns the MAC
-/// (`--mac` is VM-only), so the front-end mints a provisional MAC, lets the
-/// helper read the real one back, and records it here so identity /
-/// triangulation use the real MAC. Mirrors [`set_ttl_deadline`].
+/// actually carries after provision. For a VM this is the minted MAC. On the
+/// LXC path the MAC is unobservable via `pct config`, so the helper reports
+/// none and the front-end records `""` here ("no MAC recorded") rather than
+/// the fictional allocated MAC — identity then treats MAC as
+/// confirming-when-present. Mirrors [`set_ttl_deadline`].
 /// `NotFound` if the `guid` has no row.
 pub fn set_mac(conn: &Connection, guid: &str, mac: &str) -> Result<(), Error> {
     let n = conn.execute(

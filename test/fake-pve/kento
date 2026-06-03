@@ -10,8 +10,10 @@
 # create/run flags honored: --vmid --name --network --ip --gateway --mac
 # (VM ONLY) plus pass-through no-ops (--ssh-host-keys --start --force …).
 # It records the guest into the shared JSON guest table with realistic
-# hardware/fingerprint defaults; for LXC it SYNTHESIZES a MAC (since --mac is
-# VM-only). RealKento then stamps the seadog markers via the subsequent
+# hardware/fingerprint defaults. For an LXC the MAC is left UNSET, mirroring
+# the live Tier-2 reality: a kento LXC exposes no hwaddr via `pct config`, so
+# RealKento reads back no MAC (the row records ""). --mac is VM-only.
+# RealKento then stamps the seadog markers via the subsequent
 # `qm set`/`pct set`. State + helpers live in _lib.sh.
 
 set -euo pipefail
@@ -19,14 +21,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=/dev/null
 . "${SCRIPT_DIR}/_lib.sh"
-
-# Synthesize a deterministic locally-administered MAC for an LXC from its
-# vmid (kento assigns the CT MAC; --mac is VM-only). Mirrors the Rust
-# FakeKento::synthesized_lxc_mac shape (`bc:` first octet).
-synth_lxc_mac() {
-  local vmid="$1"
-  printf 'bc:%02x:%02x:%02x:%02x:00' "$(((vmid >> 24) & 255))" "$(((vmid >> 16) & 255))" "$(((vmid >> 8) & 255))" "$((vmid & 255))"
-}
 
 # Strip the optional `bridge=` / `host` / `none` etc. wrapper off a
 # --network value, leaving just the bridge name when present (else empty).
@@ -77,8 +71,9 @@ do_create() {
     exit 2
   fi
   if [ "$mode" = "lxc" ]; then
-    # --mac is VM-only: kento assigns the CT MAC.
-    mac="$(synth_lxc_mac "$vmid")"
+    # --mac is VM-only and a kento LXC exposes no hwaddr via `pct config`, so
+    # the CT MAC is left UNSET — RealKento reads back no MAC for an LXC.
+    mac=""
     upsert_guest "$vmid" lxc "name=$name" "mac=$mac" "bridge=$bridge" model=veth machine= bios= scsihw= memory=1024 cores=2 disk_geometry=local:"$vmid"/vm-"$vmid"-disk-0.raw disk_size=$((8 * 1024 * 1024 * 1024))
   else
     upsert_guest "$vmid" vm "name=$name" "mac=$mac" "bridge=$bridge" model=virtio machine=q35 bios=seabios scsihw=virtio-scsi-pci memory=2048 cores=2 disk_geometry=local-lvm:vm-"$vmid"-disk-0 disk_size=$((20 * 1024 * 1024 * 1024))

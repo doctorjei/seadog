@@ -409,6 +409,55 @@ images:
     }
 
     #[test]
+    fn lxc_no_mac_past_deadline_reaps() {
+        // An LXC env: the DB row records no MAC ("") and the live guest
+        // exposes none (mac=None), but GUID/name/desc all agree. Past its
+        // deadline + age floor, it must reap — the regression this fixes
+        // (previously the fictional row MAC vs None blocked the LXC path).
+        let c = config();
+        let conn = store::open_in_memory().unwrap();
+        let now = 1_000_000i64;
+        // Insert an LXC row with an empty MAC (the "unknown" sentinel).
+        let env = Env {
+            guid: "lxc1".into(),
+            vmid: 10020,
+            mode: Mode::Lxc,
+            owner: "alice".into(),
+            image: "loom".into(),
+            name: "seadog-alice-p-lxc1".into(),
+            ip: "192.168.99.201".into(),
+            mac: String::new(),
+            created_at: now - 3600,
+            ttl_deadline: now - 100,
+            soft_deadline: now - 700,
+            status: EnvStatus::Active,
+        };
+        store::insert_env(&conn, &env).unwrap();
+        // Live signals as a kento LXC would present: markers + seadog- name,
+        // but NO MAC.
+        let s = GuestSignals {
+            vmid: 10020,
+            name: Some("seadog-alice-p-lxc1".into()),
+            description: Some(format!("{GUID_MARKER_PREFIX}lxc1")),
+            mac: None,
+            fingerprint: Fingerprint::default(),
+        };
+        let k = FakeKento::new();
+        k.set_guests(vec![s]);
+
+        let out = sweep(&k, &conn, &c, now).unwrap();
+        assert_eq!(out.reaped, 1, "LXC with no live MAC must reap");
+        assert_eq!(
+            k.teardowns(),
+            vec![("seadog-alice-p-lxc1".to_string(), Mode::Lxc)]
+        );
+        assert_eq!(
+            store::get_env(&conn, "lxc1").unwrap().unwrap().status,
+            EnvStatus::Reaped
+        );
+    }
+
+    #[test]
     fn ambiguous_is_flagged_not_reaped() {
         let c = config();
         let conn = store::open_in_memory().unwrap();

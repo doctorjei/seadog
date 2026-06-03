@@ -350,6 +350,10 @@ fn create_shells_provision_and_writes_active_row() {
     assert_eq!(env.status, EnvStatus::Active);
     assert_eq!(env.owner, "alice");
     assert_eq!(env.vmid, 10000);
+    // LXC: the helper reports no effective MAC (this fake omits the field),
+    // so the front-end records "" ("no MAC recorded") rather than the
+    // fictional minted MAC. Identity treats MAC as confirming-when-present.
+    assert_eq!(env.mac, "", "LXC row must record an empty MAC");
 
     // The fake was shelled with `provision` and the right argv.
     let logged = std::fs::read_to_string(&log).unwrap();

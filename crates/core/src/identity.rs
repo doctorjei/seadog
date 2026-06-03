@@ -206,6 +206,10 @@ fn has_seadog_name(signals: &GuestSignals) -> bool {
 }
 
 /// Case-insensitive MAC comparison (PVE may emit either case).
+///
+/// An empty `b` (the DB-row sentinel for "no MAC recorded", e.g. a kento
+/// LXC) never equals a real live MAC: a non-empty live `a` can only equal a
+/// non-empty `b`, so `mac_eq(live, "")` is `false`.
 fn mac_eq(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
@@ -370,10 +374,22 @@ pub fn classify(
     };
 
     let guid_in_desc = desc_guid.as_deref() == Some(env.guid.as_str());
+    // `mac_observable`: did the live guest expose a MAC at all? (A kento LXC
+    // exposes none via `pct config`, so this is `false` for the LXC path.)
+    // `mac_matches`: the strict "live MAC present AND equals the DB row" key —
+    // still used for the VmidReuse anomaly so a genuinely-mismatched marker
+    // flags. `mac_ok`: MAC is **confirming-when-present** — when the live
+    // guest exposes no MAC it drops out of the reap decision (`true`); when it
+    // does expose one it must equal the DB row.
+    let mac_observable = signals.mac.is_some();
     let mac_matches = signals.mac.as_deref().is_some_and(|m| mac_eq(m, &env.mac));
+    let mac_ok = signals.mac.as_deref().map_or(true, |m| mac_eq(m, &env.mac));
 
     // VMID reuse: a marker is present but neither strong instance key
-    // matches this row → the row is stale / the vmid was reused.
+    // matches this row → the row is stale / the vmid was reused. Keyed on
+    // the STRICT `mac_matches`: when the live MAC is unobservable this branch
+    // is reached only if `!guid_in_desc` too (a marked guest whose desc-GUID
+    // doesn't match the row), which is correctly a reuse/stale anomaly.
     if !guid_in_desc && !mac_matches {
         return Classification::Anomaly {
             reason: Reason::VmidReuse,
@@ -384,9 +400,12 @@ pub fn classify(
         };
     }
 
-    // Unanimous: every strong signal agrees. GUID in desc AND DB,
-    // MAC matches DB, seadog- name present, desc-GUID present.
-    let unanimous = guid_in_desc && mac_matches && has_name && desc_guid.is_some();
+    // Unanimous: every strong signal agrees. GUID in desc AND DB, MAC
+    // confirming-when-present (matches if the live guest exposes one;
+    // unobservable drops out), seadog- name present, desc-GUID present. A
+    // present-but-mismatched MAC (VM path) makes `mac_ok` false → falls
+    // through to the partial-match Anomaly below (never reaps).
+    let unanimous = guid_in_desc && mac_ok && has_name && desc_guid.is_some();
     if unanimous {
         return Classification::Reap {
             guid: env.guid.clone(),
@@ -395,18 +414,32 @@ pub fn classify(
     }
 
     // A strong marker is present but agreement is partial → anomaly.
-    // Classify the specific shape for a clearer operator message.
-    let reason = if !has_name && guid_in_desc && mac_matches {
+    // Classify the specific shape for a clearer operator message. MAC is
+    // confirming-when-present, so `mac_ok` (not the strict `mac_matches`)
+    // gates the Renamed/DescriptionClobbered shapes — an LXC whose MAC is
+    // simply unobservable must not be downgraded out of those shapes.
+    let reason = if !has_name && guid_in_desc && mac_ok {
         Reason::Renamed
-    } else if desc_guid.is_none() && mac_matches && has_name {
+    } else if desc_guid.is_none() && mac_ok && has_name {
         Reason::DescriptionClobbered
     } else {
         Reason::PartialMatch
     };
+    // Render MAC as `n/a` when the live guest exposed none (unobservable),
+    // else `true`/`false` for the strict match against the DB row.
+    let mac_detail = if mac_observable {
+        if mac_matches {
+            "true"
+        } else {
+            "false"
+        }
+    } else {
+        "n/a"
+    };
     Classification::Anomaly {
         reason,
         detail: format!(
-            "vmid {} (DB row {}) partially matches: guid_in_desc={guid_in_desc} mac={mac_matches} seadog_name={has_name} desc_guid_present={}",
+            "vmid {} (DB row {}) partially matches: guid_in_desc={guid_in_desc} mac={mac_detail} seadog_name={has_name} desc_guid_present={}",
             signals.vmid,
             env.guid,
             desc_guid.is_some()
@@ -483,6 +516,46 @@ images:
                 assert_eq!(reason, Reason::Unanimous);
             }
             other => panic!("expected Reap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lxc_no_live_mac_yields_reap() {
+        // The core regression: an LXC-shaped guest exposes NO MAC via
+        // `pct config` (signals.mac = None) and the DB row records no MAC
+        // (""), yet GUID-in-desc + seadog- name + desc-GUID all agree. MAC
+        // is confirming-when-present, so an unobservable MAC drops out and
+        // the guest is unanimously reapable.
+        let c = config();
+        let mut e = env("guid-lxc", "");
+        e.mode = Mode::Lxc;
+        let mut s = full_signals("guid-lxc", "ignored");
+        s.mac = None; // kento LXC: no MAC observable
+        match classify(&s, Some(&e), None, &c) {
+            Classification::Reap { guid, reason } => {
+                assert_eq!(guid, "guid-lxc");
+                assert_eq!(reason, Reason::Unanimous);
+            }
+            other => panic!("expected Reap(Unanimous), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_present_mismatched_mac_yields_anomaly() {
+        // VM path: the live guest DOES expose a MAC and it does NOT match the
+        // DB row. Confirming-when-present means a present-but-mismatched MAC
+        // must flag (never reap). GUID/name/desc all agree otherwise, so the
+        // only disagreement is the MAC → a PartialMatch anomaly.
+        let c = config();
+        let e = env("guid-abc", "aa:bb:cc:dd:ee:ff");
+        let mut s = full_signals("guid-abc", "aa:bb:cc:dd:ee:ff");
+        s.mac = Some("00:11:22:33:44:55".to_string());
+        match classify(&s, Some(&e), None, &c) {
+            Classification::Anomaly { reason, detail } => {
+                assert_eq!(reason, Reason::PartialMatch);
+                assert!(detail.contains("mac=false"), "detail: {detail}");
+            }
+            other => panic!("expected Anomaly(PartialMatch), got {other:?}"),
         }
     }
 
@@ -627,6 +700,12 @@ images:
         // desc-guid missing.
         let mut s = full_signals("guid-abc", "aa:bb:cc:dd:ee:ff");
         s.description = Some("no marker".to_string());
+        variants.push(s);
+
+        // LXC with no observable MAC but a desc-GUID that does NOT match the
+        // row: an unobservable MAC must not paper over the GUID disagreement.
+        let mut s = full_signals("guid-WRONG", "ignored");
+        s.mac = None;
         variants.push(s);
 
         for s in variants {

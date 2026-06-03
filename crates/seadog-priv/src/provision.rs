@@ -133,9 +133,11 @@ pub fn run(args: &ProvisionArgs, kento: &dyn Kento, config: &Config) -> Result<V
         guid: args.guid.clone(),
         owner: args.owner.clone(),
     };
-    // `--mac` is VM-only; for an LXC kento assigns the MAC and provision
-    // reads it back. The effective MAC flows back to the front-end so it
-    // records the REAL mac on the DB row.
+    // `--mac` is VM-only. For a VM the effective MAC is the minted one; for
+    // an LXC the MAC is unobservable via `pct config`, so the outcome MAC is
+    // `None`. The effective MAC flows back to the front-end (serialized as a
+    // string for a VM, JSON `null` for an LXC) so it records the REAL mac (or
+    // `""` for the unobservable LXC) on the DB row.
     let outcome = kento.provision(&spec).map_err(|e| anyhow!(e))?;
 
     // loom ships sshd disabled; on the LXC path bring it up after create.
@@ -153,8 +155,9 @@ pub fn run(args: &ProvisionArgs, kento: &dyn Kento, config: &Config) -> Result<V
         "mode": mode.as_str(),
         "guid": args.guid,
         "owner": args.owner,
-        // The EFFECTIVE mac the guest actually carries (passed for vm,
-        // kento-assigned + read-back for lxc). The front-end records this.
+        // The EFFECTIVE mac the guest actually carries: a string for a VM
+        // (the minted MAC), JSON `null` for an LXC (unobservable). The
+        // front-end records the string, or `""` when null.
         "mac": outcome.mac,
         "sshd_started": sshd_started,
     }))
@@ -187,11 +190,9 @@ mod tests {
         let out = run(&args(), &k, &cfg).unwrap();
         assert_eq!(out["ok"], true);
         assert_eq!(out["sshd_started"], true);
-        // LXC: kento assigns the MAC, so the effective MAC in the output is
-        // NOT the one the front-end passed (which it would record on the row).
-        let eff_mac = out["mac"].as_str().unwrap();
-        assert!(!eff_mac.is_empty());
-        assert_ne!(eff_mac, "aa:bb:cc:dd:ee:ff");
+        // LXC: the MAC is unobservable via pct config, so the effective MAC
+        // in the output is JSON null (the front-end records "" for it).
+        assert!(out["mac"].is_null());
 
         // FakeKento.provision was called with the exact params.
         let provs = k.provisions();

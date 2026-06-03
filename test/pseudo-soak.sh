@@ -250,7 +250,10 @@ main() {
     else
       fail "create: guest vmid $vmid missing from fake table"
     fi
-    # Markers: seadog- name + desc-GUID + desc-owner + correct MAC.
+    # Markers: seadog- name + desc-GUID + desc-owner + MAC. `loom` is an LXC,
+    # whose MAC is unobservable via `pct config`, so the live guest carries no
+    # MAC and the DB row records "" (confirming-when-present). Both empty is
+    # the correct, matching state.
     local g_name g_desc g_mac db_mac
     g_name="$(jq -r --argjson v "$vmid" '.guests[] | select(.vmid==$v) | .name' "$FAKE_PVE_STATE")"
     g_desc="$(jq -r --argjson v "$vmid" '.guests[] | select(.vmid==$v) | .description' "$FAKE_PVE_STATE")"
@@ -259,7 +262,7 @@ main() {
     if [[ "$g_name" == seadog-* ]]; then pass "create: guest has seadog- name ($g_name)"; else fail "create: guest name not seadog- ($g_name)"; fi
     if printf '%s' "$g_desc" | grep -q "seadog-guid:$guid"; then pass "create: desc carries guid marker"; else fail "create: desc missing guid marker"; fi
     if printf '%s' "$g_desc" | grep -q "seadog-owner:jei"; then pass "create: desc carries owner marker"; else fail "create: desc missing owner marker"; fi
-    if [ "$g_mac" = "$db_mac" ] && [ -n "$g_mac" ]; then pass "create: guest MAC matches DB row ($g_mac)"; else fail "create: MAC mismatch (table=$g_mac db=$db_mac)"; fi
+    if [ -z "$g_mac" ] && [ -z "$db_mac" ]; then pass "create: LXC has no observable MAC; DB row records \"\""; else fail "create: LXC MAC should be empty on both sides (table=$g_mac db=$db_mac)"; fi
     if [ "$(db_status "$guid")" = "active" ]; then pass "create: DB row is active"; else fail "create: DB row not active"; fi
   else
     fail "create: front-end create failed"

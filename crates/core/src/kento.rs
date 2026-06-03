@@ -41,12 +41,13 @@ pub trait Kento {
     /// --network bridge=<bridge> --ip <ip>/<prefix> --gateway <gw>
     /// --ssh-host-keys --start [--mac <mac> ONLY for vm] <image-ref>`.
     ///
-    /// `--mac` is **VM-only** — for an LXC `kento` assigns the MAC, so on
-    /// the LXC path `provision` reads the *effective* MAC back after create
-    /// and returns it. The returned [`ProvisionOutcome::mac`] is therefore
-    /// the MAC the guest actually carries (the passed MAC for a VM, the
-    /// kento-assigned one for an LXC); the front-end records it on the DB
-    /// row so identity/triangulation use the real MAC.
+    /// `--mac` is **VM-only**. For a VM the realized guest carries the minted
+    /// MAC, so [`ProvisionOutcome::mac`] is `Some(spec.mac)`. For an LXC the
+    /// MAC is **unobservable via `pct config`** (the hwaddr lives only in the
+    /// raw lxc config and the runtime MAC need not match it), so the read-back
+    /// yields nothing and [`ProvisionOutcome::mac`] is `None`. The front-end
+    /// records `Some` → the real MAC, `None` → `""` ("no MAC recorded") on the
+    /// DB row, so identity/triangulation treat MAC as confirming-when-present.
     fn provision(&self, spec: &ProvisionSpec) -> Result<ProvisionOutcome, Error>;
 
     /// Narrow metadata update on an **already-verified** seadog guest:
@@ -96,14 +97,17 @@ pub struct ProvisionSpec {
 }
 
 /// What [`Kento::provision`] reports back: the **effective** MAC the guest
-/// actually carries after create. For a VM this is the MAC seadog passed
-/// (`--mac`); for an LXC it is the one `kento` auto-assigned (read back from
-/// live PVE, since `--mac` is VM-only). The front-end records it on the DB
-/// row so identity/triangulation use the real MAC.
+/// actually carries after create, or `None` when it is unobservable. For a
+/// VM this is `Some` the MAC seadog passed (`--mac`). For an LXC it is `None`
+/// — a kento LXC's MAC is not exposed by `pct config` (the hwaddr lives only
+/// in the raw lxc config), so there is no real MAC to read back. The
+/// front-end records `Some` → the MAC, `None` → `""` on the DB row, so
+/// identity treats MAC as confirming-when-present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionOutcome {
-    /// The MAC the realized guest actually carries.
-    pub mac: String,
+    /// The MAC the realized guest actually carries, or `None` when it is
+    /// unobservable (the kento LXC path).
+    pub mac: Option<String>,
 }
 
 impl ProvisionSpec {
@@ -208,18 +212,6 @@ impl FakeKento {
     }
 }
 
-/// Synthesize a deterministic locally-administered unicast MAC for an LXC
-/// from its vmid, mirroring how `kento` (and the real read-back) would
-/// surface a kento-assigned MAC. `bc:` first octet has the
-/// locally-administered bit set and the multicast bit clear.
-fn synthesized_lxc_mac(vmid: u32) -> String {
-    let b = vmid.to_be_bytes();
-    format!(
-        "bc:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        b[0], b[1], b[2], b[3], 0x00
-    )
-}
-
 impl Kento for FakeKento {
     fn list_guests(&self, vmid_range: (u32, u32)) -> Result<Vec<GuestSignals>, Error> {
         let st = self.inner.lock().unwrap();
@@ -255,21 +247,20 @@ impl Kento for FakeKento {
         if let Some(msg) = &st.quorum_lost {
             return Err(Error::QuorumLost(msg.clone()));
         }
-        // `--mac` is VM-only: for a VM the effective MAC is the one we
-        // passed; for an LXC kento auto-assigns it, which we synthesize here
-        // (deterministically from the vmid) to mirror the read-back path.
+        // Model REALITY: `--mac` is VM-only. For a VM the realized guest
+        // carries the passed MAC (`Some`). For an LXC the MAC is unobservable
+        // via `pct config` (kento LXC), so the realized guest carries NO MAC
+        // (`None`) and the outcome reports `None`. A later teardown still
+        // triangulates the LXC via the GUID/owner desc markers + seadog- name.
         let effective_mac = match spec.mode {
-            Mode::Vm => spec.mac.clone(),
-            Mode::Lxc => synthesized_lxc_mac(spec.vmid),
+            Mode::Vm => Some(spec.mac.clone()),
+            Mode::Lxc => None,
         };
-        // Realize the guest in-memory WITH the markers + the *effective*
-        // MAC, so a later teardown can triangulate it exactly as live PVE
-        // would present it.
         st.guests.push(GuestSignals {
             vmid: spec.vmid,
             name: Some(spec.name.clone()),
             description: Some(spec.description_marker()),
-            mac: Some(effective_mac.clone()),
+            mac: effective_mac.clone(),
             fingerprint: Default::default(),
         });
         st.provisions.push(spec.clone());
@@ -453,8 +444,9 @@ mod real {
             // kento OWNS networking/ssh/start: one `kento <mode> create`
             // attaches the bridge, assigns the IP/gateway, injects ssh host
             // keys, and starts the guest. `--mac` is VM-ONLY (LXC auto-
-            // assigns), so we only pass it for a VM; for an LXC we read the
-            // effective MAC back afterwards. Then we stamp the seadog markers
+            // assigns and does not expose the MAC via `pct config`), so we
+            // only pass it for a VM; for an LXC the read-back yields no MAC.
+            // Then we stamp the seadog markers
             // (name is already set by --name; description via qm/pct set) so
             // teardown can later triangulate. Not exercised by tests (no real
             // PVE host) but MUST compile under `--features real-kento`.
@@ -496,17 +488,15 @@ mod real {
                 Mode::Vm => self.run("qm", &["set", &vmid, "--description", &desc])?,
             };
 
-            // Effective MAC: the one we passed for a VM; for an LXC read the
-            // kento-assigned MAC back from live PVE (reusing the tested
-            // `pct config` parser). Fall back to the spec MAC only if the
-            // read-back somehow yields nothing.
+            // Effective MAC: `Some` the minted MAC for a VM. For an LXC the
+            // MAC is unobservable via `pct config` (kento LXC), so the
+            // read-back parser yields `None` — and we record exactly that
+            // (no fabricated fallback). The front-end maps `None` → `""`.
             let effective_mac = match spec.mode {
-                Mode::Vm => spec.mac.clone(),
+                Mode::Vm => Some(spec.mac.clone()),
                 Mode::Lxc => {
                     let cfg = self.run("pct", &["config", &vmid])?;
-                    parse_guest_config(spec.vmid, &cfg)
-                        .mac
-                        .unwrap_or_else(|| spec.mac.clone())
+                    parse_guest_config(spec.vmid, &cfg).mac
                 }
             };
             Ok(ProvisionOutcome { mac: effective_mac })
@@ -1012,10 +1002,11 @@ mod tests {
         assert_eq!(listed.len(), 1);
         let g = &listed[0];
         assert_eq!(g.name.as_deref(), Some("seadog-alice-proj-ab12"));
-        // LXC: kento assigns the MAC, so the effective MAC is synthesized
-        // (NOT the spec's), and that effective MAC is what the guest carries.
-        assert_eq!(g.mac.as_deref(), Some(outcome.mac.as_str()));
-        assert_ne!(outcome.mac, spec.mac);
+        // LXC: the MAC is unobservable via pct config, so the outcome MAC is
+        // None and the realized guest carries no MAC. It still triangulates
+        // via the GUID/owner desc markers + the seadog- name (below).
+        assert_eq!(outcome.mac, None);
+        assert_eq!(g.mac, None);
         assert_eq!(
             extract_desc_guid(g.description.as_deref()),
             Some("guid-abc".into())
@@ -1032,11 +1023,11 @@ mod tests {
 
     #[test]
     fn fake_provision_vm_keeps_passed_mac() {
-        // VM path: --mac is honored, so the effective MAC is the spec's.
+        // VM path: --mac is honored, so the effective MAC is Some(spec's).
         let k = FakeKento::new();
         let spec = sample_spec(Mode::Vm);
         let outcome = k.provision(&spec).unwrap();
-        assert_eq!(outcome.mac, spec.mac);
+        assert_eq!(outcome.mac.as_deref(), Some(spec.mac.as_str()));
         let listed = k.list_guests((10000, 10999)).unwrap();
         assert_eq!(listed[0].mac.as_deref(), Some(spec.mac.as_str()));
     }

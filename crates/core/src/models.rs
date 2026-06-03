@@ -113,7 +113,10 @@ pub struct Env {
     pub name: String,
     /// Leased IPv4, as a string (e.g. `192.168.99.192`).
     pub ip: String,
-    /// Leased MAC address.
+    /// Recorded MAC address. An empty string `""` means **no MAC recorded**
+    /// (e.g. a kento LXC, whose MAC is unobservable via `pct config`); the
+    /// reaper treats MAC as confirming-when-present, so `""` simply drops MAC
+    /// out of that env's reap decision.
     pub mac: String,
     /// Create time, unix epoch seconds.
     pub created_at: i64,
