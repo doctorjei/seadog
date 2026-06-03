@@ -418,11 +418,11 @@ mod tests {
 
     #[test]
     fn owner_injected_before_dash_c_is_spliced_in() {
-        // sshd forced-command form: `seadog --owner kanibako -c "ls"`.
+        // sshd forced-command form: `seadog --owner alice -c "ls"`.
         let raw = vec![
             "-seadog".to_string(),
             "--owner".to_string(),
-            "kanibako".to_string(),
+            "alice".to_string(),
             "-c".to_string(),
             "ls --all".to_string(),
         ];
@@ -431,14 +431,14 @@ mod tests {
             argv,
             vec![
                 "--owner".to_string(),
-                "kanibako".to_string(),
+                "alice".to_string(),
                 "ls".to_string(),
                 "--all".to_string()
             ]
         );
         // And owner resolution consumes it, leaving the verb argv.
         let (owner, rest) = owner::owner_from_args(&argv);
-        assert_eq!(owner.as_deref(), Some("kanibako"));
+        assert_eq!(owner.as_deref(), Some("alice"));
         assert_eq!(rest, vec!["ls".to_string(), "--all".to_string()]);
     }
 
@@ -449,7 +449,7 @@ mod tests {
         let raw = vec![
             "-seadog".to_string(),
             "--owner".to_string(),
-            "jei".to_string(),
+            "alice".to_string(),
         ];
         let argv = resolve_argv(&raw, |k| {
             if k == "SSH_ORIGINAL_COMMAND" {
@@ -463,7 +463,7 @@ mod tests {
             argv,
             vec![
                 "--owner".to_string(),
-                "jei".to_string(),
+                "alice".to_string(),
                 "health".to_string()
             ]
         );

@@ -251,20 +251,20 @@ mod tests {
     fn owner_from_args_honored_and_consumed() {
         let argv = vec![
             "--owner".to_string(),
-            "kanibako".to_string(),
+            "team-a".to_string(),
             "ls".to_string(),
             "--all".to_string(),
         ];
         let (owner, rest) = owner_from_args(&argv);
-        assert_eq!(owner.as_deref(), Some("kanibako"));
+        assert_eq!(owner.as_deref(), Some("team-a"));
         assert_eq!(rest, vec!["ls".to_string(), "--all".to_string()]);
     }
 
     #[test]
     fn owner_from_args_equals_form() {
-        let argv = vec!["--owner=jei".to_string(), "ls".to_string()];
+        let argv = vec!["--owner=bob".to_string(), "ls".to_string()];
         let (owner, rest) = owner_from_args(&argv);
-        assert_eq!(owner.as_deref(), Some("jei"));
+        assert_eq!(owner.as_deref(), Some("bob"));
         assert_eq!(rest, vec!["ls".to_string()]);
     }
 
@@ -319,10 +319,10 @@ mod tests {
         let other = "AAAAC3NzaC1lZDI1NTE5AAAAIOtherKeyOtherKeyOtherKeyOtherKeyOtherKeyZ";
         let authorized = format!(
             "command=\"/usr/lib/seadog/seadog --owner alice\",no-pty ssh-ed25519 {other} alice@h\n\
-             command=\"/usr/lib/seadog/seadog --owner kanibako\",no-pty,no-X11-forwarding ssh-ed25519 {blob} kani@h\n"
+             command=\"/usr/lib/seadog/seadog --owner team-a\",no-pty,no-X11-forwarding ssh-ed25519 {blob} team-a@h\n"
         );
         let owner = resolve_owner_from_authinfo(&auth_info, &authorized);
-        assert_eq!(owner.as_deref(), Some("kanibako"));
+        assert_eq!(owner.as_deref(), Some("team-a"));
     }
 
     #[test]

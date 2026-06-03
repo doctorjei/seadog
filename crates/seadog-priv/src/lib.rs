@@ -1,7 +1,7 @@
 //! Library face of `seadog-priv`, exposing the reaper entry points so they
 //! can be exercised end-to-end from integration tests with a primed
 //! [`FakeKento`](seadog_core::kento::FakeKento) against a temp DB — without
-//! a real blue.
+//! a real PVE host.
 //!
 //! The binary (`main.rs`) keeps the privilege-sensitive verb dispatch
 //! (provision/teardown/…) to itself; only the DB-touching reaper modules

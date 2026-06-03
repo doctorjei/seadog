@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# seadog backup — RUN ON blue (nightly via cron/systemd-timer, as root).
+# seadog backup — RUN ON THE PROXMOX HOST (nightly via cron/systemd-timer, as root).
 #
 # Snapshots the WAL-mode SQLite DB CONSISTENTLY using sqlite3's online
 # backup API (`.backup`) — NEVER a raw `cp`, which can capture a torn DB

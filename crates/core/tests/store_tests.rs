@@ -13,7 +13,7 @@ fn sample_env(guid: &str, vmid: u32, owner: &str) -> Env {
         owner: owner.to_string(),
         image: "loom".to_string(),
         name: format!("seadog-{owner}-proj-tok"),
-        ip: "192.168.0.192".to_string(),
+        ip: "192.168.99.192".to_string(),
         mac: "AA:BB:CC:DD:EE:FF".to_string(),
         created_at: 1_000,
         ttl_deadline: 4_600,

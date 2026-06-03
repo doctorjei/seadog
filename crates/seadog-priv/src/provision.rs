@@ -157,12 +157,12 @@ mod tests {
 
     fn args() -> ProvisionArgs {
         ProvisionArgs {
-            owner: "jei".into(),
+            owner: "alice".into(),
             guid: "11111111-1111-4111-8111-111111111111".into(),
             vmid: 10010,
-            ip: "192.168.0.200".into(),
+            ip: "192.168.99.200".into(),
             mac: "aa:bb:cc:dd:ee:ff".into(),
-            name: "seadog-jei-proj-ab12".into(),
+            name: "seadog-alice-proj-ab12".into(),
             mode: "lxc".into(),
             image_ref: "registry.example.com/loom:1.0".into(),
         }
@@ -182,10 +182,10 @@ mod tests {
         let p = &provs[0];
         assert_eq!(p.vmid, 10010);
         assert_eq!(p.mode, Mode::Lxc);
-        assert_eq!(p.name, "seadog-jei-proj-ab12");
+        assert_eq!(p.name, "seadog-alice-proj-ab12");
         assert_eq!(p.mac, "aa:bb:cc:dd:ee:ff");
-        assert_eq!(p.ip, "192.168.0.200");
-        assert_eq!(p.owner, "jei");
+        assert_eq!(p.ip, "192.168.99.200");
+        assert_eq!(p.owner, "alice");
 
         // lxc path started sshd on the right vmid.
         assert_eq!(k.sshd_starts(), vec![10010]);
@@ -199,7 +199,7 @@ mod tests {
         );
         assert_eq!(
             extract_desc_owner(g[0].description.as_deref()).as_deref(),
-            Some("jei")
+            Some("alice")
         );
     }
 

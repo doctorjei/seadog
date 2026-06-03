@@ -50,8 +50,8 @@ mod tests {
     fn seadog_guest(vmid: u32) -> GuestSignals {
         GuestSignals {
             vmid,
-            name: Some("seadog-jei-proj-ab12".into()),
-            description: Some(format!("{GUID_MARKER_PREFIX}g\n{OWNER_MARKER_PREFIX}jei")),
+            name: Some("seadog-alice-proj-ab12".into()),
+            description: Some(format!("{GUID_MARKER_PREFIX}g\n{OWNER_MARKER_PREFIX}alice")),
             mac: Some("aa:bb:cc:dd:ee:ff".into()),
             fingerprint: Default::default(),
         }

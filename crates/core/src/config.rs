@@ -375,13 +375,14 @@ fn default_vmid_range() -> [u32; 2] {
     [10000, 10999]
 }
 fn default_ip_range() -> [Ipv4Addr; 2] {
+    // Example fallback only; operators set ip_pool to a free range on their network.
     [
-        Ipv4Addr::new(192, 168, 0, 192),
-        Ipv4Addr::new(192, 168, 0, 254),
+        Ipv4Addr::new(192, 168, 99, 192),
+        Ipv4Addr::new(192, 168, 99, 254),
     ]
 }
 fn default_gateway() -> Ipv4Addr {
-    Ipv4Addr::new(192, 168, 0, 1)
+    Ipv4Addr::new(192, 168, 99, 1)
 }
 fn default_prefix() -> u8 {
     24

@@ -133,7 +133,7 @@ mod tests {
     fn seadog_guest(vmid: u32, guid: &str, owner: &str) -> GuestSignals {
         GuestSignals {
             vmid,
-            name: Some("seadog-jei-proj-ab12".into()),
+            name: Some("seadog-alice-proj-ab12".into()),
             description: Some(format!(
                 "{GUID_MARKER_PREFIX}{guid}\n{OWNER_MARKER_PREFIX}{owner}"
             )),
@@ -155,8 +155,8 @@ mod tests {
     fn matching_seadog_guest_is_destroyed() {
         let cfg = config();
         let k = FakeKento::new();
-        k.set_guests(vec![seadog_guest(10010, GUID, "jei")]);
-        let out = run(&args(10010, GUID, "jei"), &k, &cfg).unwrap();
+        k.set_guests(vec![seadog_guest(10010, GUID, "alice")]);
+        let out = run(&args(10010, GUID, "alice"), &k, &cfg).unwrap();
         assert_eq!(out["ok"], true);
         assert_eq!(k.teardowns(), vec![(10010, Mode::Lxc)]);
     }
@@ -166,7 +166,7 @@ mod tests {
         let cfg = config();
         let k = FakeKento::new();
         // A production VM at 105: must be impossible to destroy.
-        assert!(run(&args(105, GUID, "jei"), &k, &cfg).is_err());
+        assert!(run(&args(105, GUID, "alice"), &k, &cfg).is_err());
         assert!(k.teardowns().is_empty());
     }
 
@@ -182,7 +182,7 @@ mod tests {
             mac: Some("11:22:33:44:55:66".into()),
             fingerprint: Default::default(),
         }]);
-        assert!(run(&args(10010, GUID, "jei"), &k, &cfg).is_err());
+        assert!(run(&args(10010, GUID, "alice"), &k, &cfg).is_err());
         assert!(k.teardowns().is_empty());
     }
 
@@ -194,9 +194,9 @@ mod tests {
         k.set_guests(vec![seadog_guest(
             10010,
             "99999999-9999-4999-8999-999999999999",
-            "jei",
+            "alice",
         )]);
-        assert!(run(&args(10010, GUID, "jei"), &k, &cfg).is_err());
+        assert!(run(&args(10010, GUID, "alice"), &k, &cfg).is_err());
         assert!(k.teardowns().is_empty());
     }
 
@@ -205,8 +205,8 @@ mod tests {
         let cfg = config();
         let k = FakeKento::new();
         // Same guid, but the guest is owned by someone else.
-        k.set_guests(vec![seadog_guest(10010, GUID, "alice")]);
-        assert!(run(&args(10010, GUID, "jei"), &k, &cfg).is_err());
+        k.set_guests(vec![seadog_guest(10010, GUID, "bob")]);
+        assert!(run(&args(10010, GUID, "alice"), &k, &cfg).is_err());
         assert!(k.teardowns().is_empty());
     }
 
@@ -215,7 +215,7 @@ mod tests {
         let cfg = config();
         let k = FakeKento::new();
         // In-range vmid, but nothing live there.
-        assert!(run(&args(10010, GUID, "jei"), &k, &cfg).is_err());
+        assert!(run(&args(10010, GUID, "alice"), &k, &cfg).is_err());
         assert!(k.teardowns().is_empty());
     }
 }

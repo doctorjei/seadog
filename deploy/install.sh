@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# seadog installer — RUN ON blue AS root (coordinated with the cluster
-# instance). Idempotent: safe to re-run; every step guards before acting.
+# seadog installer — RUN ON THE PROXMOX HOST AS root. Idempotent: safe to
+# re-run; every step guards before acting.
 #
 # Usage:
 #   sudo ./deploy/install.sh [BUILD_DIR] [BOOTSTRAP_KEY] [BOOTSTRAP_OWNER]
@@ -9,7 +9,7 @@
 #   BUILD_DIR        dir holding the two static-musl binaries
 #                    (default: target/x86_64-unknown-linux-musl/release)
 #   BOOTSTRAP_KEY    a public key line to authorize, e.g.
-#                    "ssh-ed25519 AAAA... kani@host"  (optional)
+#                    "ssh-ed25519 AAAA... alice@host"  (optional)
 #   BOOTSTRAP_OWNER  the trusted owner name for that key (optional)
 #
 # Bootstrap key/owner may also come from $SEADOG_BOOTSTRAP_KEY and
@@ -42,7 +42,7 @@ BOOTSTRAP_OWNER="${3:-${SEADOG_BOOTSTRAP_OWNER:-}}"
 log() { printf 'seadog-install: %s\n' "$*"; }
 die() { printf 'seadog-install: ERROR: %s\n' "$*" >&2; exit 1; }
 
-[ "$(id -u)" -eq 0 ] || die "must run as root (on blue)"
+[ "$(id -u)" -eq 0 ] || die "must run as root (on the Proxmox host)"
 
 # ====================================================================
 # 1. Users, groups, directories.
@@ -190,5 +190,5 @@ Manual follow-ups:
       command="${FRONTEND} --owner <name>",restrict <keytype> <blob> <comment>
     (or re-run this installer with BOOTSTRAP_KEY + BOOTSTRAP_OWNER.)
   - Confirm sshd picked up /etc/ssh/sshd_config.d/seadog.conf.
-  - Smoke test from a client:  ssh ${USER_NAME}@blue health
+  - Smoke test from a client:  ssh ${USER_NAME}@<pve-host> health
 EOF

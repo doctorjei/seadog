@@ -25,13 +25,13 @@ fn parses_annotated_example() {
     assert_eq!(
         cfg.allocation.ip_pool.range,
         [
-            Ipv4Addr::new(192, 168, 0, 192),
-            Ipv4Addr::new(192, 168, 0, 254)
+            Ipv4Addr::new(192, 168, 99, 192),
+            Ipv4Addr::new(192, 168, 99, 254)
         ]
     );
     assert_eq!(
         cfg.allocation.ip_pool.gateway,
-        Ipv4Addr::new(192, 168, 0, 1)
+        Ipv4Addr::new(192, 168, 99, 1)
     );
     assert_eq!(cfg.allocation.ip_pool.prefix, 24);
     assert_eq!(cfg.allocation.caps.max_lxc_per_owner, 8);
@@ -39,13 +39,13 @@ fn parses_annotated_example() {
 
     // Image allowlist: name -> {ref, modes}.
     let loom = cfg.images.get("loom").expect("loom present");
-    assert_eq!(loom.image_ref, "ghcr.io/doctorjei/droste:loom");
+    assert_eq!(loom.image_ref, "ghcr.io/doctorjei/droste-loom:latest");
     assert_eq!(loom.modes, vec![Mode::Lxc]);
-    let kani = cfg.images.get("kanibako").expect("kanibako present");
-    assert_eq!(kani.modes, vec![Mode::Lxc, Mode::Vm]);
+    let ci = cfg.images.get("ci").expect("ci present");
+    assert_eq!(ci.modes, vec![Mode::Lxc, Mode::Vm]);
 
     // Owner override.
-    let o = cfg.owners.get("kanibako").expect("owner override");
+    let o = cfg.owners.get("ci").expect("owner override");
     assert_eq!(o.max_lxc, Some(12));
     assert_eq!(o.max_vm, None);
 
@@ -78,7 +78,7 @@ fn defaults_applied_when_omitted() {
     // A near-empty config: only the required-non-empty images map.
     let yaml = r#"
 images:
-  loom: { ref: ghcr.io/doctorjei/droste:loom, modes: [lxc] }
+  loom: { ref: ghcr.io/doctorjei/droste-loom:latest, modes: [lxc] }
 "#;
     let cfg = Config::from_yaml_str(yaml).expect("parse sparse");
     cfg.validate().expect("sparse validates");
@@ -89,7 +89,7 @@ images:
     assert_eq!(cfg.allocation.vmid_range, [10000, 10999]);
     assert_eq!(
         cfg.allocation.ip_pool.range[0],
-        Ipv4Addr::new(192, 168, 0, 192)
+        Ipv4Addr::new(192, 168, 99, 192)
     );
     assert_eq!(cfg.allocation.caps.max_lxc_per_owner, 8);
     assert_eq!(cfg.lifecycle.default_ttl, Duration::from_secs(3600));
@@ -105,7 +105,7 @@ fn rejects_bad_vmid_range() {
 allocation:
   vmid_range: [10999, 10000]
 images:
-  loom: { ref: ghcr.io/doctorjei/droste:loom, modes: [lxc] }
+  loom: { ref: ghcr.io/doctorjei/droste-loom:latest, modes: [lxc] }
 "#;
     let cfg = Config::from_yaml_str(yaml).expect("parse");
     let err = cfg.validate().expect_err("inverted range must fail");
@@ -118,7 +118,7 @@ fn rejects_out_of_window_vmid_range() {
 allocation:
   vmid_range: [9000, 9999]
 images:
-  loom: { ref: ghcr.io/doctorjei/droste:loom, modes: [lxc] }
+  loom: { ref: ghcr.io/doctorjei/droste-loom:latest, modes: [lxc] }
 "#;
     let cfg = Config::from_yaml_str(yaml).expect("parse");
     assert!(matches!(cfg.validate(), Err(Error::ConfigValidation(_))));
@@ -138,9 +138,9 @@ fn rejects_malformed_ip_range() {
     let yaml = r#"
 allocation:
   ip_pool:
-    range: [192.168.0.254, 192.168.0.192]
+    range: [192.168.99.254, 192.168.99.192]
 images:
-  loom: { ref: ghcr.io/doctorjei/droste:loom, modes: [lxc] }
+  loom: { ref: ghcr.io/doctorjei/droste-loom:latest, modes: [lxc] }
 "#;
     let cfg = Config::from_yaml_str(yaml).expect("parse");
     assert!(matches!(cfg.validate(), Err(Error::ConfigValidation(_))));

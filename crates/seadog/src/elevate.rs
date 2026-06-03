@@ -261,11 +261,7 @@ mod tests {
 
     #[test]
     fn build_argv_skips_sudo_when_empty() {
-        let req = ElevateArgs::new(
-            "provision",
-            "kanibako",
-            vec!["--image".into(), "loom".into()],
-        );
+        let req = ElevateArgs::new("provision", "alice", vec!["--image".into(), "loom".into()]);
         let argv = build_argv_with("", "/tmp/fake-priv", &req);
         assert_eq!(
             argv,
@@ -273,7 +269,7 @@ mod tests {
                 "/tmp/fake-priv".to_string(),
                 "provision".to_string(),
                 "--owner".to_string(),
-                "kanibako".to_string(),
+                "alice".to_string(),
                 "--image".to_string(),
                 "loom".to_string(),
             ]
@@ -282,7 +278,7 @@ mod tests {
 
     #[test]
     fn build_argv_includes_sudo_when_set() {
-        let req = ElevateArgs::new("teardown", "jei", vec!["g-123".into()]);
+        let req = ElevateArgs::new("teardown", "alice", vec!["g-123".into()]);
         let argv = build_argv_with("mysudo", "/tmp/fake-priv", &req);
         assert_eq!(
             argv,
@@ -291,7 +287,7 @@ mod tests {
                 "/tmp/fake-priv".to_string(),
                 "teardown".to_string(),
                 "--owner".to_string(),
-                "jei".to_string(),
+                "alice".to_string(),
                 "g-123".to_string(),
             ]
         );
@@ -299,9 +295,9 @@ mod tests {
 
     #[test]
     fn elevate_args_carries_owner_and_argv() {
-        let req = ElevateArgs::new("teardown", "jei", vec!["g-123".into()]);
+        let req = ElevateArgs::new("teardown", "alice", vec!["g-123".into()]);
         assert_eq!(req.verb, "teardown");
-        assert_eq!(req.owner, "jei");
+        assert_eq!(req.owner, "alice");
         assert_eq!(req.args, vec!["g-123".to_string()]);
     }
 }

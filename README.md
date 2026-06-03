@@ -1,7 +1,7 @@
 # seadog
 
-**seadog** is an ephemeral test-environment provisioner for the Flamingo
-Proxmox cluster. You SSH to a locked-down `testenv` login shell, run one
+**seadog** is an ephemeral test-environment provisioner for a Proxmox
+cluster. You SSH to a locked-down `testenv` login shell, run one
 verb, and get back JSON. It hands you short-lived LXC containers and VMs
 that **reap themselves** when their lease expires — so a forgotten test
 box can't quietly live forever and exhaust the cluster.
@@ -22,39 +22,39 @@ box can't quietly live forever and exhaust the cluster.
 
 ```sh
 # Provision a 1-hour LXC from the `loom` image:
-ssh testenv@blue create --image loom --ttl 1h
+ssh testenv@<pve-host> create --image loom --ttl 1h
 
 # List your active envs / show one / extend a lease / tear one down:
-ssh testenv@blue ls
-ssh testenv@blue show g-1a2b3c
-ssh testenv@blue extend g-1a2b3c 30m
-ssh testenv@blue destroy g-1a2b3c
+ssh testenv@<pve-host> ls
+ssh testenv@<pve-host> show g-1a2b3c
+ssh testenv@<pve-host> extend g-1a2b3c 30m
+ssh testenv@<pve-host> destroy g-1a2b3c
 
 # Operator + introspection verbs:
-ssh testenv@blue health           # binary version, reaper heartbeat, counts
-ssh testenv@blue stats            # env counts by status / owner
-ssh testenv@blue history 24h      # terminal envs in a window
-ssh testenv@blue ack 10010        # acknowledge a vmid notification
+ssh testenv@<pve-host> health           # binary version, reaper heartbeat, counts
+ssh testenv@<pve-host> stats            # env counts by status / owner
+ssh testenv@<pve-host> history 24h      # terminal envs in a window
+ssh testenv@<pve-host> ack 10010        # acknowledge a vmid notification
 ```
 
-A thin client wrapper, `deploy/seadog-wrapper.sh`, is what kanibako
-shells out to — it just forwards args to `ssh testenv@$SEADOG_HOST`
-(default `blue`):
+A thin client wrapper, `deploy/seadog-wrapper.sh`, lets a caller shell out
+to seadog — it just forwards args to `ssh testenv@$SEADOG_HOST`:
 
 ```sh
-SEADOG_HOST=blue seadog-wrapper create --image stuffer --ttl 2h
+SEADOG_HOST=<pve-host> seadog-wrapper create --image stuffer --ttl 2h
 ```
 
 ### Image allowlist
 
 `create` never takes an OCI ref — only an allowlisted image **name** from
-`/etc/seadog/config.yaml`. The cluster ships three:
+`/etc/seadog/config.yaml`. The allowlist is operator-configurable; the
+example config ships three (configure your own):
 
 | image      | modes        |
 | ---------- | ------------ |
 | `loom`     | LXC          |
 | `stuffer`  | VM           |
-| `kanibako` | LXC or VM    |
+| `ci`       | LXC or VM    |
 
 The first allowed mode is the default when you omit `--mode`.
 
@@ -94,7 +94,7 @@ host with no runtime dependencies.
 
 ## Install
 
-Run the installer **on blue, as root** — it creates the `testenv` user
+Run the installer **on the Proxmox host, as root** — it creates the `testenv` user
 and `seadog` group, installs the binaries, sudoers/tmpfiles/systemd
 units, the sshd snippet, and an initial config:
 

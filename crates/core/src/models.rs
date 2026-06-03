@@ -111,7 +111,7 @@ pub struct Env {
     pub image: String,
     /// PVE guest name `seadog-<owner>-<shortproj>-<token>` (DNS-label).
     pub name: String,
-    /// Leased IPv4, as a string (e.g. `192.168.0.192`).
+    /// Leased IPv4, as a string (e.g. `192.168.99.192`).
     pub ip: String,
     /// Leased MAC address.
     pub mac: String,

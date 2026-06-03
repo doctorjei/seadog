@@ -16,7 +16,7 @@ use serde_json::Value;
 const CONFIG_YAML: &str = r#"
 images:
   loom:     { ref: "ghcr.io/x/droste:loom",     modes: [lxc] }
-  kanibako: { ref: "ghcr.io/x/kanibako:latest",  modes: [lxc, vm] }
+  ci:       { ref: "ghcr.io/x/ci:latest",        modes: [lxc, vm] }
 "#;
 
 struct Fixture {
@@ -114,7 +114,7 @@ fn mk_env(guid: &str, vmid: u32, owner: &str, status: EnvStatus, created_at: i64
         owner: owner.into(),
         image: "loom".into(),
         name: format!("seadog-{owner}-p-{guid}"),
-        ip: "192.168.0.200".into(),
+        ip: "192.168.99.200".into(),
         mac: format!("aa:bb:cc:00:00:{:02x}", vmid % 256),
         created_at,
         ttl_deadline: ttl,
@@ -337,7 +337,7 @@ fn create_shells_provision_and_writes_active_row() {
     // The verb's JSON result.
     let id = json["id"].as_str().expect("id present");
     assert!(!id.is_empty());
-    assert_eq!(json["ip"].as_str().unwrap(), "192.168.0.192");
+    assert_eq!(json["ip"].as_str().unwrap(), "192.168.99.192");
     let name = json["name"].as_str().unwrap();
     assert!(name.starts_with("seadog-alice-loom-"), "got: {name}");
     let vmid = json["vmid"].as_u64().unwrap();
@@ -359,7 +359,7 @@ fn create_shells_provision_and_writes_active_row() {
         .expect("provision was invoked");
     assert!(prov.contains("--owner alice"), "argv: {prov}");
     assert!(prov.contains(&format!("--vmid {vmid}")), "argv: {prov}");
-    assert!(prov.contains("--ip 192.168.0.192"), "argv: {prov}");
+    assert!(prov.contains("--ip 192.168.99.192"), "argv: {prov}");
     assert!(prov.contains(&format!("--name {name}")), "argv: {prov}");
     assert!(prov.contains(&format!("--guid {id}")), "argv: {prov}");
     // Resolved image *ref* (from the allowlist), not the bare name.

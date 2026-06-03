@@ -2,7 +2,7 @@
 //!
 //! [`Kento`] abstracts every operation the reaper/provisioner needs from
 //! `qm`/`pct`/`kento` so the business logic can be exercised against an
-//! in-memory [`FakeKento`] with **no real blue** in the loop. The
+//! in-memory [`FakeKento`] with **no real PVE host** in the loop. The
 //! shelling-out implementation, [`RealKento`], lives behind the
 //! `real-kento` cargo feature so the library builds and tests with zero
 //! external tools by default.
@@ -246,7 +246,7 @@ impl Kento for FakeKento {
 }
 
 // --- RealKento: behind the `real-kento` feature so the lib builds with
-//     zero external tools by default. Not exercised by tests (no blue),
+//     zero external tools by default. Not exercised by tests (no real PVE host),
 //     but it MUST compile under `--features real-kento`. ---
 #[cfg(feature = "real-kento")]
 pub use real::RealKento;
@@ -400,7 +400,7 @@ mod real {
             // onto it with `qm`/`pct set` so teardown can later triangulate.
             // Full templating lands in a later phase; here we only need the
             // safety-wrapped exec path to compile under `--features
-            // real-kento`. Not exercised by tests (no blue).
+            // real-kento`. Not exercised by tests (no real PVE host).
             let vmid = spec.vmid.to_string();
             let mode = match spec.mode {
                 Mode::Lxc => "lxc",
@@ -740,11 +740,11 @@ mod real {
         #[test]
         fn parse_resources_keeps_guests_skips_other_rows() {
             let json = r#"[
-                {"type":"node","node":"blue","status":"online"},
-                {"type":"storage","storage":"local","node":"blue"},
-                {"type":"qemu","vmid":10010,"node":"blue","name":"seadog-a"},
-                {"type":"lxc","vmid":10011,"node":"blue","name":"seadog-b"},
-                {"type":"qemu","vmid":105,"node":"blue","name":"prod"},
+                {"type":"node","node":"pve","status":"online"},
+                {"type":"storage","storage":"local","node":"pve"},
+                {"type":"qemu","vmid":10010,"node":"pve","name":"seadog-a"},
+                {"type":"lxc","vmid":10011,"node":"pve","name":"seadog-b"},
+                {"type":"qemu","vmid":105,"node":"pve","name":"prod"},
                 {"type":"pool","pool":"p"}
             ]"#;
             let entries = parse_resources(json).unwrap();
@@ -780,10 +780,10 @@ mod real {
             let text = "\
 boot: order=scsi0
 cores: 2
-description: seadog-guid%3Aguid-abc%0Aseadog-owner%3Ajei
+description: seadog-guid%3Aguid-abc%0Aseadog-owner%3Aalice
 machine: q35
 memory: 2048
-name: seadog-jei-proj-ab12
+name: seadog-alice-proj-ab12
 net0: virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,tag=10
 scsihw: virtio-scsi-pci
 bios: seabios
@@ -792,7 +792,7 @@ smbios1: uuid=...
 ";
             let g = parse_guest_config(10010, text);
             assert_eq!(g.vmid, 10010);
-            assert_eq!(g.name.as_deref(), Some("seadog-jei-proj-ab12"));
+            assert_eq!(g.name.as_deref(), Some("seadog-alice-proj-ab12"));
             assert_eq!(g.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
             // Description decoded so the markers triangulate.
             assert_eq!(
@@ -801,7 +801,7 @@ smbios1: uuid=...
             );
             assert_eq!(
                 extract_desc_owner(g.description.as_deref()).as_deref(),
-                Some("jei")
+                Some("alice")
             );
             // Fingerprint fields.
             assert_eq!(g.fingerprint.net_bridge.as_deref(), Some("vmbr0"));
@@ -921,11 +921,11 @@ mod tests {
             vmid: 10010,
             mode: Mode::Lxc,
             image_ref: "registry/loom:1".into(),
-            name: "seadog-jei-proj-ab12".into(),
+            name: "seadog-alice-proj-ab12".into(),
             mac: "aa:bb:cc:dd:ee:ff".into(),
-            ip: "192.168.0.200".into(),
+            ip: "192.168.99.200".into(),
             guid: "guid-abc".into(),
-            owner: "jei".into(),
+            owner: "alice".into(),
         };
         k.provision(&spec).unwrap();
         assert_eq!(k.provisions(), vec![spec.clone()]);
@@ -934,7 +934,7 @@ mod tests {
         let listed = k.list_guests((10000, 10999)).unwrap();
         assert_eq!(listed.len(), 1);
         let g = &listed[0];
-        assert_eq!(g.name.as_deref(), Some("seadog-jei-proj-ab12"));
+        assert_eq!(g.name.as_deref(), Some("seadog-alice-proj-ab12"));
         assert_eq!(g.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
         assert_eq!(
             extract_desc_guid(g.description.as_deref()),
@@ -942,7 +942,7 @@ mod tests {
         );
         assert_eq!(
             extract_desc_owner(g.description.as_deref()),
-            Some("jei".into())
+            Some("alice".into())
         );
     }
 

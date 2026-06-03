@@ -161,7 +161,7 @@ images:
 
     #[test]
     fn name_accepts_valid_seadog_label() {
-        assert!(validate_guest_name("seadog-jei-proj-ab12").is_ok());
+        assert!(validate_guest_name("seadog-alice-proj-ab12").is_ok());
         assert!(validate_guest_name("seadog-a").is_ok());
     }
 
@@ -172,19 +172,19 @@ images:
 
     #[test]
     fn name_rejects_uppercase() {
-        assert!(validate_guest_name("seadog-Jei").is_err());
+        assert!(validate_guest_name("seadog-Alice").is_err());
     }
 
     #[test]
     fn name_rejects_trailing_and_leading_hyphen() {
-        assert!(validate_guest_name("seadog-jei-").is_err());
+        assert!(validate_guest_name("seadog-alice-").is_err());
         // No seadog- prefix → leading hyphen / wrong family.
-        assert!(validate_guest_name("-seadog-jei").is_err());
+        assert!(validate_guest_name("-seadog-alice").is_err());
     }
 
     #[test]
     fn name_rejects_missing_prefix() {
-        assert!(validate_guest_name("notseadog-jei").is_err());
+        assert!(validate_guest_name("notseadog-alice").is_err());
         assert!(validate_guest_name("seadog").is_err());
     }
 

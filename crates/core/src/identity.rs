@@ -435,10 +435,10 @@ images:
             guid: guid.to_string(),
             vmid: 10010,
             mode: Mode::Vm,
-            owner: "jei".to_string(),
+            owner: "alice".to_string(),
             image: "loom".to_string(),
-            name: "seadog-jei-proj-ab12".to_string(),
-            ip: "192.168.0.200".to_string(),
+            name: "seadog-alice-proj-ab12".to_string(),
+            ip: "192.168.99.200".to_string(),
             mac: mac.to_string(),
             created_at: 1000,
             ttl_deadline: 5000,
@@ -450,7 +450,7 @@ images:
     fn full_signals(guid: &str, mac: &str) -> GuestSignals {
         GuestSignals {
             vmid: 10010,
-            name: Some("seadog-jei-proj-ab12".to_string()),
+            name: Some("seadog-alice-proj-ab12".to_string()),
             description: Some(format!("a test env\n{GUID_MARKER_PREFIX}{guid}\n")),
             mac: Some(mac.to_string()),
             fingerprint: Fingerprint::default(),
@@ -672,8 +672,8 @@ images:
 
     #[test]
     fn extract_desc_owner_parses_marker() {
-        let d = format!("line1\n  {OWNER_MARKER_PREFIX}jei  \n{GUID_MARKER_PREFIX}xyz");
-        assert_eq!(extract_desc_owner(Some(&d)), Some("jei".to_string()));
+        let d = format!("line1\n  {OWNER_MARKER_PREFIX}alice  \n{GUID_MARKER_PREFIX}xyz");
+        assert_eq!(extract_desc_owner(Some(&d)), Some("alice".to_string()));
         assert_eq!(extract_desc_owner(Some("nothing here")), None);
         assert_eq!(extract_desc_owner(None), None);
     }

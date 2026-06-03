@@ -7,7 +7,7 @@
 # as the failure-domain-diverse backstop to the fast in-process watcher
 # (`seadog-priv watch`, which is deliberately NOT a systemd unit).
 #
-# This unit runs as root (the operator is root on blue) with NO sudo:
+# This unit runs as root (the operator is root on the Proxmox host) with NO sudo:
 # `seadog-priv` self-guards on euid 0 and re-validates everything.
 
 [Unit]

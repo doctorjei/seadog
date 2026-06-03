@@ -10,20 +10,23 @@ cadence:
 allocation:
   vmid_range: [10000, 10999]    # inclusive; the scan + allocator range
   ip_pool:                      # static IPs at create, lowest-available, atomic lease
-    range: [192.168.0.192, 192.168.0.254]
-    gateway: 192.168.0.1
+    # EXAMPLE range — set to a free range on your network.
+    range: [192.168.99.192, 192.168.99.254]
+    gateway: 192.168.99.1
     prefix: 24
   caps:                         # global concurrency ceilings (per-owner overrides below)
     max_lxc_per_owner: 8
     max_vm_per_owner: 3
 
 images:                         # allowlist: name -> {ref, modes}; never a caller ref
-  loom:     { ref: ghcr.io/doctorjei/droste:loom,     modes: [lxc] }
-  stuffer:  { ref: ghcr.io/doctorjei/droste:stuffer,  modes: [vm]  }
-  kanibako: { ref: ghcr.io/doctorjei/kanibako:latest, modes: [lxc, vm] }  # first = default
+  # EXAMPLE allowlist — configure your own images. The droste refs below are
+  # the published droste test images; swap in whatever your cluster ships.
+  loom:     { ref: ghcr.io/doctorjei/droste-loom:latest,    modes: [lxc] }
+  stuffer:  { ref: ghcr.io/doctorjei/droste-stuffer:latest, modes: [vm]  }
+  ci:       { ref: ghcr.io/doctorjei/kanibako-lxc:latest,   modes: [lxc, vm] }  # first = default; example, set your own agent image (ref unconfirmed)
 
 owners:                         # identity (fingerprint->name) lives in authorized_keys;
-  kanibako: { max_lxc: 12 }     # this block is per-owner cap OVERRIDES only (optional)
+  ci: { max_lxc: 12 }           # this block is per-owner cap OVERRIDES only (optional)
 
 identity:                       # hardware-fingerprint tie-breaker (flag-only, never reaps)
   threshold: 0.6                # tune empirically; bias toward sensitivity
