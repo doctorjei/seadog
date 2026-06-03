@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Fake `pct` (Proxmox LXC tool) for the seadog pseudo-soak. Implements the
+# subcommands RealKento invokes for containers: config, set, destroy, exec
+# (start-sshd path). Plus a minimal `create` so the fake `kento` can realize
+# a CT through it. State is the shared JSON guest table; see _lib.sh.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=/dev/null
+. "${SCRIPT_DIR}/_lib.sh"
+
+sub="${1:-}"
+shift || true
+
+case "$sub" in
+  config)
+    quorum_guard
+    emit_guest_config "$1"
+    ;;
+  set)
+    quorum_guard
+    vmid="$1"
+    shift
+    if ! guest_exists "$vmid"; then
+      printf 'Configuration file for guest %s does not exist\n' "$vmid" >&2
+      exit 1
+    fi
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --hostname) set_guest_field "$vmid" name "$2"; shift 2 ;;
+        --description) set_guest_field "$vmid" description "$2"; shift 2 ;;
+        --tags) add_guest_tag "$vmid" "$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    ;;
+  create)
+    quorum_guard
+    vmid="$1"
+    shift
+    name=""
+    mac=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --hostname) name="$2"; shift 2 ;;
+        --net0) mac="$(printf '%s' "$2" | sed -n 's/.*hwaddr=\([0-9A-Fa-f:]\{17\}\).*/\1/p')"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    upsert_guest "$vmid" lxc "name=$name" "mac=$mac" bridge=vmbr0 model=veth machine= bios= scsihw= memory=1024 cores=2 disk_geometry=local:"$vmid"/vm-"$vmid"-disk-0.raw disk_size=$((8 * 1024 * 1024 * 1024))
+    ;;
+  destroy)
+    quorum_guard
+    vmid="$1"
+    if ! guest_exists "$vmid"; then
+      printf 'Configuration file for guest %s does not exist\n' "$vmid" >&2
+      exit 2
+    fi
+    remove_guest "$vmid"
+    printf 'destroyed CT %s\n' "$vmid"
+    ;;
+  exec)
+    quorum_guard
+    vmid="$1"
+    if ! guest_exists "$vmid"; then
+      printf 'CT %s does not exist\n' "$vmid" >&2
+      exit 2
+    fi
+    printf 'exec ok in CT %s\n' "$vmid"
+    ;;
+  *)
+    printf 'fake pct: unsupported subcommand %s\n' "$sub" >&2
+    exit 2
+    ;;
+esac

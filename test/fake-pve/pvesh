@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Fake `pvesh` (Proxmox REST CLI) for the seadog pseudo-soak. Implements the
+# one call RealKento::list_guests makes:
+#   pvesh get /cluster/resources --output-format json
+# emitting the same JSON array shape real pvesh produces (a node row plus a
+# qemu/lxc row per guest). State + helpers live in _lib.sh.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=/dev/null
+. "${SCRIPT_DIR}/_lib.sh"
+
+verb="${1:-}"
+path="${2:-}"
+
+case "$verb" in
+  get)
+    case "$path" in
+      /cluster/resources)
+        quorum_guard
+        emit_cluster_resources
+        ;;
+      *)
+        printf 'fake pvesh: unsupported path %s\n' "$path" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  *)
+    printf 'fake pvesh: unsupported verb %s\n' "$verb" >&2
+    exit 2
+    ;;
+esac
