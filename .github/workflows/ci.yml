@@ -17,7 +17,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Stable toolchain with fmt + clippy and the static-musl deploy target.
       - name: Install Rust toolchain
@@ -68,7 +68,7 @@ jobs:
 
       # The :edge-equivalent artifact: both static binaries.
       - name: Upload musl binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: seadog-musl-binaries
           path: |
@@ -86,7 +86,7 @@ jobs:
   pseudo-soak:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # No musl target needed — the soak builds debug binaries itself.
       - name: Install Rust toolchain
