@@ -5,12 +5,29 @@
 #
 # Usage:
 #   sudo ./deploy/install.sh [BUILD_DIR] [BOOTSTRAP_KEY] [BOOTSTRAP_OWNER]
+#   ./deploy/install.sh --version
+#   sudo ./deploy/install.sh --uninstall [--purge]
+#   ./deploy/install.sh --help
 #
+# Positional install args:
 #   BUILD_DIR        dir holding the two static-musl binaries
-#                    (default: target/x86_64-unknown-linux-musl/release)
+#                    (default: target/x86_64-unknown-linux-musl/release,
+#                    or — when run from an unpacked release tarball — the
+#                    dir alongside this deploy/ tree that holds the binaries)
 #   BOOTSTRAP_KEY    a public key line to authorize, e.g.
 #                    "ssh-ed25519 AAAA... alice@host"  (optional)
 #   BOOTSTRAP_OWNER  the trusted owner name for that key (optional)
+#
+# Flags:
+#   --version        print the version of the seadog binary that will be /
+#                    is installed, then exit (does NOT require root).
+#   --uninstall      reverse the non-data install steps (PRESERVES the
+#                    config, authorized_keys, DB, testenv user + seadog
+#                    group). Requires root.
+#   --purge          with --uninstall, ALSO remove the data + identity
+#                    (config, authorized_keys, DB, testenv user, seadog
+#                    group, /etc/shells line). Requires root.
+#   -h, --help       show this help and exit.
 #
 # Bootstrap key/owner may also come from $SEADOG_BOOTSTRAP_KEY and
 # $SEADOG_BOOTSTRAP_OWNER. They are appended to the root-owned
@@ -23,6 +40,7 @@ set -euo pipefail
 LIBDIR="/usr/lib/seadog"
 ETCDIR="/etc/seadog"
 VARDIR="/var/lib/seadog"
+RUNDIR="/run/seadog"
 CONFIG="${ETCDIR}/config.yaml"
 AUTHKEYS="${ETCDIR}/authorized_keys"
 DB="${VARDIR}/seadog.db"
@@ -31,16 +49,201 @@ GROUP_NAME="seadog"
 FRONTEND="${LIBDIR}/seadog"
 PRIV="${LIBDIR}/seadog-priv"
 
+# Drop-in / unit files we install (used by both install + uninstall).
+SUDOERS_FILE="/etc/sudoers.d/seadog"
+TMPFILES_FILE="/etc/tmpfiles.d/seadog.conf"
+SSHD_DROPIN="/etc/ssh/sshd_config.d/seadog.conf"
+SWEEPER_SERVICE="/etc/systemd/system/seadog-sweeper.service"
+SWEEPER_TIMER="/etc/systemd/system/seadog-sweeper-idle.timer"
+
+log() { printf 'seadog-install: %s\n' "$*"; }
+die() { printf 'seadog-install: ERROR: %s\n' "$*" >&2; exit 1; }
+
 # --- locate ourselves so relative repo paths resolve regardless of cwd ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-BUILD_DIR="${1:-${REPO_DIR}/target/x86_64-unknown-linux-musl/release}"
+usage() {
+  sed -n '3,35p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+# ====================================================================
+# Flag parsing. Recognized --flags are stripped here; anything left is
+# fed to the existing positional handling (BUILD_DIR/KEY/OWNER) so the
+# bare/positional install path stays byte-for-byte equivalent to before.
+# ====================================================================
+DO_VERSION=0
+DO_UNINSTALL=0
+DO_PURGE=0
+POSITIONAL=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --version) DO_VERSION=1; shift ;;
+    --uninstall) DO_UNINSTALL=1; shift ;;
+    --purge) DO_PURGE=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; while [ "$#" -gt 0 ]; do POSITIONAL+=("$1"); shift; done ;;
+    -*) die "unknown flag: $1 (try --help)" ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
+
+# --- resolve BUILD_DIR with run-from-unpacked-tarball auto-detection ---
+# An explicit positional BUILD_DIR always wins. Otherwise prefer the dev
+# layout (binaries under target/...); if that has no seadog binary but the
+# binaries sit directly beside this deploy/ tree (the unpacked release
+# tarball: seadog-<ver>-x86_64-musl/{seadog,seadog-priv,deploy/}), use
+# REPO_DIR.
+DEFAULT_BUILD_DIR="${REPO_DIR}/target/x86_64-unknown-linux-musl/release"
+if [ ! -x "${DEFAULT_BUILD_DIR}/seadog" ] && [ -x "${REPO_DIR}/seadog" ] && [ -x "${REPO_DIR}/seadog-priv" ]; then
+  DEFAULT_BUILD_DIR="${REPO_DIR}"
+fi
+BUILD_DIR="${1:-${DEFAULT_BUILD_DIR}}"
 BOOTSTRAP_KEY="${2:-${SEADOG_BOOTSTRAP_KEY:-}}"
 BOOTSTRAP_OWNER="${3:-${SEADOG_BOOTSTRAP_OWNER:-}}"
 
-log() { printf 'seadog-install: %s\n' "$*"; }
-die() { printf 'seadog-install: ERROR: %s\n' "$*" >&2; exit 1; }
+# ====================================================================
+# --version: print the version of the seadog build about to be / already
+# installed. Prefer the build-dir binaries (the ones this run would
+# install), else the installed ones. Does NOT require root.
+#
+# NB: the front-end `seadog` binary is the SSH login-shell entrypoint and
+# does NOT honor a clap --version flag (it treats argv as session input
+# and demands an owner). Its companion `seadog-priv` IS clap-derived,
+# carries the SAME crate version, and answers `--version` cleanly — so we
+# query that. We fall back to the front-end only if seadog-priv is missing.
+# ====================================================================
+if [ "${DO_VERSION}" -eq 1 ]; then
+  ver_bin=""
+  ver_src=""
+  if [ -x "${BUILD_DIR}/seadog-priv" ]; then
+    ver_bin="${BUILD_DIR}/seadog-priv"; ver_src="build dir ${BUILD_DIR}"
+  elif [ -x "${PRIV}" ]; then
+    ver_bin="${PRIV}"; ver_src="installed ${LIBDIR}"
+  elif [ -x "${BUILD_DIR}/seadog" ]; then
+    ver_bin="${BUILD_DIR}/seadog"; ver_src="build dir ${BUILD_DIR}"
+  elif [ -x "${FRONTEND}" ]; then
+    ver_bin="${FRONTEND}"; ver_src="installed ${LIBDIR}"
+  else
+    die "no seadog binary found (looked in ${BUILD_DIR} and ${LIBDIR})"
+  fi
+  if ver_out="$("${ver_bin}" --version 2>/dev/null)" && [ -n "${ver_out}" ]; then
+    log "version (${ver_src}): ${ver_out}"
+  else
+    die "found ${ver_bin} but it did not report a version (got: '${ver_out:-}')"
+  fi
+  exit 0
+fi
+
+# --purge alone is meaningless: it only augments --uninstall.
+if [ "${DO_PURGE}" -eq 1 ] && [ "${DO_UNINSTALL}" -eq 0 ]; then
+  die "--purge only applies with --uninstall; use: sudo $(basename "$0") --uninstall --purge"
+fi
+
+# ====================================================================
+# --uninstall [--purge]: guarded reversal of the install. Each step is
+# idempotent and never errors if the target is already absent.
+# ====================================================================
+if [ "${DO_UNINSTALL}" -eq 1 ]; then
+  [ "$(id -u)" -eq 0 ] || die "--uninstall must run as root"
+
+  # 1. systemd timer/service: disable + stop, then remove the unit files.
+  if systemctl list-unit-files seadog-sweeper-idle.timer >/dev/null 2>&1; then
+    systemctl disable --now seadog-sweeper-idle.timer >/dev/null 2>&1 || true
+  fi
+  systemctl stop seadog-sweeper.service >/dev/null 2>&1 || true
+  rm -f "${SWEEPER_TIMER}" "${SWEEPER_SERVICE}"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  log "removed seadog-sweeper timer + service (if present)"
+
+  # 2. sshd drop-in: remove, re-validate, best-effort reload.
+  if [ -e "${SSHD_DROPIN}" ]; then
+    rm -f "${SSHD_DROPIN}"
+    if sshd -t >/dev/null 2>&1; then
+      systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || log "could not reload sshd automatically — reload it manually"
+    else
+      log "WARNING: sshd -t failed after removing the snippet; check /etc/ssh/sshd_config.d"
+    fi
+    log "removed ${SSHD_DROPIN} + reloaded sshd"
+  else
+    log "${SSHD_DROPIN} already absent"
+  fi
+
+  # 3. sudoers drop-in.
+  rm -f "${SUDOERS_FILE}"
+  log "removed ${SUDOERS_FILE} (if present)"
+
+  # 4. tmpfiles + the runtime dir.
+  rm -f "${TMPFILES_FILE}"
+  rm -rf "${RUNDIR}"
+  log "removed ${TMPFILES_FILE} + ${RUNDIR} (if present)"
+
+  # 5. installed binaries (+ the lib dir if now empty).
+  rm -f "${FRONTEND}" "${PRIV}"
+  rmdir "${LIBDIR}" >/dev/null 2>&1 || true
+  log "removed installed binaries from ${LIBDIR}"
+
+  if [ "${DO_PURGE}" -eq 1 ]; then
+    # --- purge: also remove data + identity. ---
+    # Drop the /etc/shells line for the front-end (reverse of the add).
+    if [ -f /etc/shells ] && grep -qxF "${FRONTEND}" /etc/shells 2>/dev/null; then
+      grep -vxF "${FRONTEND}" /etc/shells > /etc/shells.seadog-tmp && mv /etc/shells.seadog-tmp /etc/shells
+      log "removed ${FRONTEND} from /etc/shells"
+    fi
+    # Point testenv's shell away from the (now-removed) front-end before
+    # deleting, so we never leave a dangling shell reference.
+    if id -u "${USER_NAME}" >/dev/null 2>&1; then
+      usermod -s /usr/sbin/nologin "${USER_NAME}" >/dev/null 2>&1 || true
+      # Do NOT --remove the home: /var/lib/seadog is shared/seadog-owned and
+      # removed explicitly below.
+      userdel "${USER_NAME}" >/dev/null 2>&1 || true
+      log "deleted user ${USER_NAME}"
+    fi
+    # Data + identity dirs.
+    rm -rf "${ETCDIR}" "${VARDIR}"
+    log "removed ${ETCDIR} + ${VARDIR} (config, authorized_keys, DB)"
+    # Group, only if it has no remaining members.
+    if getent group "${GROUP_NAME}" >/dev/null 2>&1; then
+      members="$(getent group "${GROUP_NAME}" | cut -d: -f4)"
+      if [ -z "${members}" ]; then
+        groupdel "${GROUP_NAME}" >/dev/null 2>&1 || true
+        log "deleted group ${GROUP_NAME}"
+      else
+        log "group ${GROUP_NAME} still has members (${members}); left in place"
+      fi
+    fi
+    cat <<EOF
+
+seadog PURGE complete. EVERYTHING was removed:
+  - systemd timer/service, sshd drop-in, sudoers, tmpfiles, /run/seadog
+  - installed binaries (${LIBDIR})
+  - config + authorized_keys (${ETCDIR})
+  - database (${VARDIR})
+  - user ${USER_NAME}, group ${GROUP_NAME} (if memberless), /etc/shells line
+EOF
+    exit 0
+  fi
+
+  cat <<EOF
+
+seadog uninstall complete (data preserved).
+
+  REMOVED:
+    - seadog-sweeper-idle.timer + seadog-sweeper.service
+    - ${SSHD_DROPIN}
+    - ${SUDOERS_FILE}
+    - ${TMPFILES_FILE} + ${RUNDIR}
+    - binaries (${FRONTEND}, ${PRIV})
+  PRESERVED:
+    - ${CONFIG} + ${AUTHKEYS} (${ETCDIR})
+    - ${DB} (${VARDIR})
+    - user ${USER_NAME}, group ${GROUP_NAME}, /etc/shells line
+
+To fully wipe data + identity too, run:  sudo $(basename "$0") --uninstall --purge
+EOF
+  exit 0
+fi
 
 [ "$(id -u)" -eq 0 ] || die "must run as root (on the Proxmox host)"
 
