@@ -94,16 +94,66 @@ host with no runtime dependencies.
 
 ## Install
 
-Run the installer **on the Proxmox host, as root** — it creates the `testenv` user
-and `seadog` group, installs the binaries, sudoers/tmpfiles/systemd
-units, the sshd snippet, and an initial config:
+Releases ship versioned `.deb`, `.rpm`, and tarball assets on the
+[Releases page](https://github.com/doctorjei/seadog/releases). Every method
+installs the same two static-musl binaries plus the sudoers/sshd/systemd/
+sysusers/tmpfiles plumbing, creates the `testenv` user + `seadog` group, and
+drops an initial `/etc/seadog/config.yaml`. **Review that config and
+authorize owners (below) before use.** Deeper detail — what each package
+creates, conffile behavior, uninstall vs. purge — is in [INSTALL.md](INSTALL.md).
+
+### Debian / Proxmox — `.deb` (recommended)
+
+Proxmox is Debian, so the `.deb` is the primary package:
+
+```sh
+sudo apt install ./seadog_<ver>-1_amd64.deb
+```
+
+(`dpkg -i` works too; `apt` additionally pulls the `systemd` dependency.)
+`/etc/seadog/config.yaml` is a conffile, so your edits survive upgrades.
+Remove with `sudo apt remove seadog` (keeps config + data) or
+`sudo apt purge seadog` (removes everything, including the user/group).
+
+### Fedora / RHEL — `.rpm`
+
+```sh
+sudo dnf install ./seadog-<ver>-1.x86_64.rpm
+```
+
+RPM has no remove/purge split, so `sudo dnf remove seadog` is a full
+teardown (the equivalent of `apt purge`).
+
+### Tarball + installer (any host / air-gapped)
+
+For hosts without apt/dnf, unpack the release tarball and run the bundled
+installer **on the Proxmox host, as root**:
+
+```sh
+tar -xzf seadog-<ver>-x86_64-musl.tar.gz
+sudo ./seadog-<ver>-x86_64-musl/deploy/install.sh
+```
+
+`install.sh --uninstall` reverses an install (keeping config + data);
+add `--purge` to wipe everything. `install.sh --version` prints the version.
+Or bootstrap in one line — downloads the latest release tarball, verifies
+its SHA256, and runs the installer:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/doctorjei/seadog/main/deploy/get-seadog.sh | bash
+```
+
+### From source
+
+Build the binaries (see [Build](#build)) and run the same installer:
 
 ```sh
 sudo ./deploy/install.sh
 ```
 
-See `deploy/install.sh` for the bootstrap-key arguments that authorize
-the first owner.
+`install.sh` also takes bootstrap-key arguments to authorize the first
+owner in one shot (`sudo ./deploy/install.sh [BUILD_DIR] <key-line> <owner>`);
+see its `--help`.
 
 ### Managing owners
 
