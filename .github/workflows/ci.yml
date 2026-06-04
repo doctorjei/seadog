@@ -107,3 +107,42 @@ jobs:
       # Uses sudo internally (available on the runner).
       - name: Run pseudo-soak
         run: test/pseudo-soak.sh
+
+  # Build the .rpm and install/remove it in a real Fedora container — the
+  # runtime parity check the .deb gets on the droste VM (Phase 6). Runs in a
+  # container because the dev/cluster hosts can't (Debian/Proxmox, and the
+  # kanibako dev box can't nest user namespaces). Validates the declarative
+  # sysusers/tmpfiles end-state + the %postun teardown; the systemctl/sshd
+  # steps need PID1 systemd and stay unexercised (the %post guards them).
+  rpm-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install musl linker
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # The .rpm assets point at the musl release dir, so build those first.
+      - name: Build release (static musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm --locked
+
+      # No --target: the asset source paths already point at the musl dir.
+      - name: Build .rpm
+        run: cargo generate-rpm -p crates/seadog
+
+      # docker is preinstalled on ubuntu-latest. Mount the workspace and run
+      # the install/verify/remove smoke inside a disposable Fedora container.
+      - name: Install + verify + remove in Fedora
+        run: |
+          rpm="$(ls target/generate-rpm/seadog-*.x86_64.rpm)"
+          docker run --rm -v "$PWD:/w" -w /w fedora:latest bash test/rpm-smoke.sh "$rpm"
