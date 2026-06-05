@@ -282,64 +282,7 @@ pub fn remove_owner(args: &RemoveOwnerArgs) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // `$SEADOG_AUTHKEYS` is process-global; serialize the tests that set it
-    // so they don't race. Each test still uses a unique temp dir.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// RAII guard: point `$SEADOG_AUTHKEYS` at a fresh temp file, restoring
-    /// the prior value (and holding the env lock) until dropped. Mirrors
-    /// `main`'s `test_support::TempEnv` save/restore discipline.
-    struct AuthkeysEnv {
-        dir: PathBuf,
-        path: PathBuf,
-        prev: Option<std::ffi::OsString>,
-        _guard: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl AuthkeysEnv {
-        fn new() -> Self {
-            let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-            let unique = format!(
-                "seadog-authkeys-test-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            );
-            let dir = std::env::temp_dir().join(unique);
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("authorized_keys");
-            let prev = std::env::var_os("SEADOG_AUTHKEYS");
-            std::env::set_var("SEADOG_AUTHKEYS", &path);
-            AuthkeysEnv {
-                dir,
-                path,
-                prev,
-                _guard: guard,
-            }
-        }
-
-        fn write(&self, contents: &str) {
-            std::fs::write(&self.path, contents).unwrap();
-        }
-
-        fn read(&self) -> String {
-            std::fs::read_to_string(&self.path).unwrap_or_default()
-        }
-    }
-
-    impl Drop for AuthkeysEnv {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var("SEADOG_AUTHKEYS", v),
-                None => std::env::remove_var("SEADOG_AUTHKEYS"),
-            }
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
+    use crate::test_support::AuthkeysEnv;
 
     const BLOB_A: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIBVL8h1uvNvR2v2c0Yk6Yz0mYy8w0cZk6Q1yK0a8mDcL";
     const BLOB_B: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIOtherKeyOtherKeyOtherKeyOtherKeyOtherKeyZ";

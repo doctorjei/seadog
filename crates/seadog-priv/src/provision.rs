@@ -239,7 +239,7 @@ pub fn run(args: &ProvisionArgs, kento: &dyn Kento, config: &Config) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::config;
+    use crate::test_support::{config, AuthkeysEnv};
     use seadog_core::identity::{extract_desc_guid, extract_desc_owner};
     use seadog_core::kento::FakeKento;
 
@@ -258,6 +258,7 @@ mod tests {
 
     #[test]
     fn valid_lxc_provisions_with_exact_params_and_starts_sshd() {
+        let _env = AuthkeysEnv::new();
         let cfg = config();
         let k = FakeKento::new();
         let out = run(&args(), &k, &cfg).unwrap();
@@ -296,6 +297,7 @@ mod tests {
 
     #[test]
     fn vm_path_does_not_start_sshd() {
+        let _env = AuthkeysEnv::new();
         let cfg = config();
         let k = FakeKento::new();
         let mut a = args();
@@ -309,52 +311,6 @@ mod tests {
         assert_eq!(out["mac"], "aa:bb:cc:dd:ee:ff");
     }
 
-    /// Point `$SEADOG_AUTHKEYS` at a fresh temp file seeded with a managed
-    /// owner line, restoring the prior value on drop. Serialized via a
-    /// process-global lock since the env var is shared.
-    struct OwnerKeysEnv {
-        dir: PathBuf,
-        prev: Option<std::ffi::OsString>,
-        _guard: std::sync::MutexGuard<'static, ()>,
-    }
-
-    static OWNERKEYS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    impl OwnerKeysEnv {
-        fn new(contents: &str) -> Self {
-            let guard = OWNERKEYS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-            let unique = format!(
-                "seadog-provision-test-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            );
-            let dir = std::env::temp_dir().join(unique);
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("authorized_keys");
-            std::fs::write(&path, contents).unwrap();
-            let prev = std::env::var_os("SEADOG_AUTHKEYS");
-            std::env::set_var("SEADOG_AUTHKEYS", &path);
-            OwnerKeysEnv {
-                dir,
-                prev,
-                _guard: guard,
-            }
-        }
-    }
-
-    impl Drop for OwnerKeysEnv {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var("SEADOG_AUTHKEYS", v),
-                None => std::env::remove_var("SEADOG_AUTHKEYS"),
-            }
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-
     const TEST_BLOB: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIBVL8h1uvNvR2v2c0Yk6Yz0mYy8w0cZk6Q1yK0a8mDcL";
 
     fn managed_line(owner: &str) -> String {
@@ -365,7 +321,7 @@ mod tests {
 
     #[test]
     fn injects_owner_key_and_user_for_lxc_and_cleans_up() {
-        let _env = OwnerKeysEnv::new(&format!("{}\n", managed_line("alice")));
+        let _env = AuthkeysEnv::seeded(&format!("{}\n", managed_line("alice")));
         let cfg = config();
         let k = FakeKento::new();
         // lxc path (loom ref is dual-mode in the fixture config).
@@ -388,7 +344,7 @@ mod tests {
 
     #[test]
     fn injects_owner_key_for_vm_too() {
-        let _env = OwnerKeysEnv::new(&format!("{}\n", managed_line("alice")));
+        let _env = AuthkeysEnv::seeded(&format!("{}\n", managed_line("alice")));
         let cfg = config();
         let k = FakeKento::new();
         let mut a = args();
@@ -407,7 +363,7 @@ mod tests {
     fn no_owner_key_provisions_fail_open_without_key() {
         // An authorized_keys with NO line for this owner → fail-open: the
         // create still proceeds, just without `--ssh-key`.
-        let _env = OwnerKeysEnv::new(&format!("{}\n", managed_line("someone-else")));
+        let _env = AuthkeysEnv::seeded(&format!("{}\n", managed_line("someone-else")));
         let cfg = config();
         let k = FakeKento::new();
         let out = run(&args(), &k, &cfg).unwrap();
@@ -422,6 +378,7 @@ mod tests {
 
     #[test]
     fn rejects_out_of_range_vmid() {
+        let _env = AuthkeysEnv::new();
         let cfg = config();
         let k = FakeKento::new();
         let mut a = args();
@@ -432,6 +389,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_name() {
+        let _env = AuthkeysEnv::new();
         let cfg = config();
         let k = FakeKento::new();
         let mut a = args();
@@ -442,6 +400,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_mac() {
+        let _env = AuthkeysEnv::new();
         let cfg = config();
         let k = FakeKento::new();
         let mut a = args();
@@ -455,6 +414,7 @@ mod tests {
 
     #[test]
     fn rejects_mode_image_does_not_allow() {
+        let _env = AuthkeysEnv::new();
         let cfg = config();
         let k = FakeKento::new();
         // vmonly only allows vm; ask for lxc with its ref.
@@ -467,6 +427,7 @@ mod tests {
 
     #[test]
     fn rejects_non_allowlisted_image_ref() {
+        let _env = AuthkeysEnv::new();
         let cfg = config();
         let k = FakeKento::new();
         let mut a = args();
@@ -479,6 +440,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_ip() {
+        let _env = AuthkeysEnv::new();
         let cfg = config();
         let k = FakeKento::new();
         let mut a = args();

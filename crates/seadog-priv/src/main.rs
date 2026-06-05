@@ -340,6 +340,77 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod test_support {
     use seadog_core::config::Config;
+    use std::path::PathBuf;
+
+    /// `$SEADOG_AUTHKEYS` is process-global; serialize every test that sets it
+    /// (across all verb modules) on this ONE lock so they don't race. Each
+    /// test still uses a unique temp dir.
+    pub static AUTHKEYS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: point `$SEADOG_AUTHKEYS` at a fresh per-test temp file,
+    /// restoring the prior value (and holding [`AUTHKEYS_ENV_LOCK`]) until
+    /// dropped. The file is NOT created until [`AuthkeysEnv::write`] /
+    /// [`AuthkeysEnv::seeded`] — owners tests rely on it being absent until
+    /// then. Mirrors `TempEnv`'s save/restore discipline; unifies the two
+    /// former per-module guards (owners' `AuthkeysEnv` + provision's
+    /// `OwnerKeysEnv`) so they share a single lock and can't race.
+    pub struct AuthkeysEnv {
+        dir: PathBuf,
+        pub path: PathBuf,
+        prev: Option<std::ffi::OsString>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl AuthkeysEnv {
+        pub fn new() -> Self {
+            let guard = AUTHKEYS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let unique = format!(
+                "seadog-authkeys-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let dir = std::env::temp_dir().join(unique);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("authorized_keys");
+            let prev = std::env::var_os("SEADOG_AUTHKEYS");
+            std::env::set_var("SEADOG_AUTHKEYS", &path);
+            AuthkeysEnv {
+                dir,
+                path,
+                prev,
+                _guard: guard,
+            }
+        }
+
+        /// `new()` plus seeding the file with `contents` (convenience for the
+        /// provision tests that need a pre-existing managed owner line).
+        pub fn seeded(contents: &str) -> Self {
+            let env = Self::new();
+            env.write(contents);
+            env
+        }
+
+        pub fn write(&self, contents: &str) {
+            std::fs::write(&self.path, contents).unwrap();
+        }
+
+        pub fn read(&self) -> String {
+            std::fs::read_to_string(&self.path).unwrap_or_default()
+        }
+    }
+
+    impl Drop for AuthkeysEnv {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("SEADOG_AUTHKEYS", v),
+                None => std::env::remove_var("SEADOG_AUTHKEYS"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
 
     /// A config whose allowlist has a dual-mode `loom` and a vm-only
     /// `vmonly`, with the default `[10000, 10999]` vmid range.
