@@ -64,9 +64,23 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
         CREATE INDEX IF NOT EXISTS idx_envs_status ON envs(status);
         CREATE INDEX IF NOT EXISTS idx_envs_vmid   ON envs(vmid);
 
+        -- `notify_state.guid` is NOT always an env guid, so this table has
+        -- NO foreign key to `envs`: foreign in-range heads-ups key on
+        -- "vmid-<N>" (see reap.rs/notify.rs) and the sweeper-degraded class
+        -- keys on its own synthetic "sweeper" token. An FK with
+        -- `PRAGMA foreign_keys = ON` would reject those inserts (the
+        -- referenced env row doesn't exist), silently breaking notify dedup
+        -- for everything that isn't an env. The env-keyed rows that DO
+        -- correspond to an env are cleaned up explicitly in `prune_terminal`
+        -- (the cascade the dropped FK used to provide).
+        --
+        -- Known follow-up (out of scope, low priority): foreign/sweeper rows
+        -- now persist until explicitly cleared. A future enhancement should
+        -- clear a "vmid-<N>" state once that vmid is no longer a foreign
+        -- in-range guest, so a later DIFFERENT guest reusing that vmid
+        -- re-notifies instead of being suppressed by the stale row.
         CREATE TABLE IF NOT EXISTS notify_state (
-            guid            TEXT    PRIMARY KEY
-                            REFERENCES envs(guid) ON DELETE CASCADE,
+            guid            TEXT    PRIMARY KEY,
             last_severity   TEXT    NOT NULL,
             last_emitted_at INTEGER NOT NULL,
             acked           INTEGER NOT NULL
@@ -249,14 +263,30 @@ pub fn mark_vanished(conn: &Connection, guid: &str) -> Result<(), Error> {
 /// Prune **terminal** env rows (`Reaped`/`Vanished`) whose `created_at`
 /// is older than `now_unix - retention_secs`. Live envs are NEVER pruned
 /// no matter how overdue — only history ages out. Returns the number of
-/// rows removed. (Phase 1b addition: retention policy lives in `notify`/
+/// ENV rows removed. (Phase 1b addition: retention policy lives in `notify`/
 /// `reap`, but the SQL belongs here next to the other env CRUD.)
+///
+/// `notify_state` no longer has an FK to `envs` (see the schema comment), so
+/// the old `ON DELETE CASCADE` that auto-removed an env's notify_state row is
+/// gone. We replicate it explicitly here: BEFORE deleting the env rows, drop
+/// the env-keyed notify_state rows for exactly the envs about to be pruned
+/// (same cutoff). Non-env keys ("vmid-<N>", "sweeper") are left untouched.
 pub fn prune_terminal(
     conn: &Connection,
     now_unix: i64,
     retention_secs: i64,
 ) -> Result<usize, Error> {
     let cutoff = now_unix - retention_secs;
+    // Replace the dropped FK cascade: clear notify_state for exactly the
+    // terminal envs we're about to prune (env-keyed rows only).
+    conn.execute(
+        "DELETE FROM notify_state \
+         WHERE guid IN ( \
+             SELECT guid FROM envs \
+             WHERE status IN ('reaped', 'vanished') AND created_at < ?1 \
+         )",
+        params![cutoff],
+    )?;
     let n = conn.execute(
         "DELETE FROM envs \
          WHERE status IN ('reaped', 'vanished') AND created_at < ?1",
@@ -325,4 +355,128 @@ pub fn read_heartbeat(conn: &Connection) -> Result<Option<i64>, Error> {
         )
         .optional()?;
     Ok(ts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::notify::{decide, Event};
+
+    fn env(guid: &str, status: EnvStatus, created_at: i64) -> Env {
+        Env {
+            guid: guid.into(),
+            vmid: 10010,
+            mode: Mode::Vm,
+            owner: "alice".into(),
+            image: "loom".into(),
+            name: format!("seadog-alice-p-{guid}"),
+            ip: "192.168.99.200".into(),
+            mac: "aa:bb:cc:dd:ee:ff".into(),
+            created_at,
+            ttl_deadline: created_at + 100,
+            soft_deadline: created_at + 50,
+            status,
+        }
+    }
+
+    fn notify_config() -> Config {
+        let yaml = r#"
+images:
+  loom:
+    ref: "r/loom:1"
+    modes: [vm]
+"#;
+        Config::from_yaml_str(yaml).unwrap()
+    }
+
+    /// The core regression: `notify_state` keys that are NOT env guids (a
+    /// foreign heads-up keys on "vmid-<N>") must persist. Pre-fix the
+    /// `REFERENCES envs(guid)` FK rejected the INSERT under
+    /// `PRAGMA foreign_keys = ON`, the error was swallowed by `route()`, and
+    /// the dedup state never stuck → re-notify every tick.
+    #[test]
+    fn put_get_notify_state_for_non_env_key_persists() {
+        let conn = open_in_memory().unwrap();
+        let s = NotifyState {
+            guid: "vmid-10001".into(),
+            last_severity: "info".into(),
+            last_emitted_at: 1000,
+            acked: false,
+        };
+        put_notify_state(&conn, &s).unwrap();
+        let got = get_notify_state(&conn, "vmid-10001").unwrap();
+        assert_eq!(got, Some(s));
+    }
+
+    /// Dedup across ticks, wired through the DB exactly the way `route()`
+    /// does: emit once, persist, reload, then suppress. This is what
+    /// silently failed before the FK was dropped.
+    #[test]
+    fn foreign_headsup_dedups_across_ticks_through_db() {
+        let conn = open_in_memory().unwrap();
+        let cfg = notify_config();
+        let ev = Event::ForeignHeadsUp {
+            guid_or_vmid: "vmid-10001".into(),
+            detail: "foreign".into(),
+        };
+
+        // First tick: no prior → emit, persist the new state.
+        let prior = get_notify_state(&conn, "vmid-10001").unwrap();
+        let first = decide(&ev, prior.as_ref(), &cfg, 1000);
+        assert!(first.emit, "first foreign heads-up must emit");
+        put_notify_state(&conn, &first.new_state).unwrap();
+
+        // Second tick: reload the persisted state → suppress.
+        let prior = get_notify_state(&conn, "vmid-10001").unwrap();
+        assert!(prior.is_some(), "state must have persisted across ticks");
+        let second = decide(&ev, prior.as_ref(), &cfg, 2000);
+        assert!(!second.emit, "second tick must be suppressed by dedup");
+    }
+
+    /// `prune_terminal` must clear the env-keyed notify_state row for a
+    /// pruned env (replacing the dropped FK cascade) while leaving a foreign
+    /// "vmid-<N>" row untouched.
+    #[test]
+    fn prune_terminal_clears_env_notify_state_but_keeps_foreign() {
+        let conn = open_in_memory().unwrap();
+        let now = 100_000_000i64;
+        let retention = 7 * 24 * 3600i64;
+
+        // A terminal env older than retention + its env-keyed notify_state.
+        insert_env(&conn, &env("g1", EnvStatus::Reaped, now - retention - 10)).unwrap();
+        put_notify_state(
+            &conn,
+            &NotifyState {
+                guid: "g1".into(),
+                last_severity: "notice".into(),
+                last_emitted_at: now - retention - 10,
+                acked: false,
+            },
+        )
+        .unwrap();
+        // A foreign heads-up row keyed on a vmid token.
+        put_notify_state(
+            &conn,
+            &NotifyState {
+                guid: "vmid-9999".into(),
+                last_severity: "info".into(),
+                last_emitted_at: now,
+                acked: false,
+            },
+        )
+        .unwrap();
+
+        let removed = prune_terminal(&conn, now, retention).unwrap();
+        assert_eq!(removed, 1, "one env row pruned");
+
+        assert!(
+            get_notify_state(&conn, "g1").unwrap().is_none(),
+            "env-keyed notify_state must be cleared with its env"
+        );
+        assert!(
+            get_notify_state(&conn, "vmid-9999").unwrap().is_some(),
+            "foreign notify_state must survive prune"
+        );
+    }
 }
