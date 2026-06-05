@@ -1,11 +1,24 @@
 //! SQLite persistence layer.
 //!
 //! [`open`] creates the DB file on cold start, switches it to WAL mode,
-//! and runs idempotent migrations. The schema is three tables: `envs`
+//! and runs schema migrations. The schema is three tables: `envs`
 //! (the [`Env`] record, keyed by `guid` — DB-authoritative for
 //! `ttl_deadline`), `notify_state` (per-env escalation state), and a
 //! single-row `heartbeat` KV for the reaper dead-man's-switch. SQL is
 //! inline; no ORM.
+//!
+//! ## Schema migrations (`PRAGMA user_version` framework)
+//!
+//! Schema evolution is driven by SQLite's `PRAGMA user_version`, NOT by
+//! re-running `CREATE TABLE IF NOT EXISTS` (which is a silent no-op on an
+//! already-deployed table, so any later schema change would never reach
+//! upgraded installs). [`create_baseline`] freezes the version-1 schema;
+//! [`run_migrations`] stamps a fresh or pre-framework DB to
+//! [`BASELINE_VERSION`] and then applies each entry of [`MIGRATIONS`]
+//! whose `version` exceeds the DB's current `user_version`, in ascending
+//! order, each inside its own transaction. [`MIGRATIONS`] is EMPTY by
+//! design today (every deployed DB is already at the baseline schema);
+//! the next schema change appends a `version 2` migration there.
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -42,8 +55,32 @@ fn init(conn: Connection) -> Result<Connection, Error> {
     Ok(conn)
 }
 
-/// Run schema migrations. Idempotent (`IF NOT EXISTS`).
-fn migrate(conn: &Connection) -> Result<(), Error> {
+/// A single forward schema migration. `up` must be idempotent-safe to
+/// run inside its own transaction; it transforms the schema from
+/// version `version - 1` to `version`.
+struct Migration {
+    version: i64,
+    up: fn(&Connection) -> Result<(), Error>,
+}
+
+/// Schema version produced by `create_baseline`. Frozen.
+const BASELINE_VERSION: i64 = 1;
+
+/// Ordered forward migrations beyond the baseline. EMPTY by design:
+/// every deployed DB is already at the current (baseline) schema, so
+/// there is nothing to migrate yet. The NEXT schema change adds one
+/// entry here (version 2, ascending) — and only then does the engine
+/// have work to do. See the migration-engine tests for a worked example.
+const MIGRATIONS: &[Migration] = &[];
+
+/// The version-1 baseline schema.
+///
+/// FROZEN at schema version 1 — this block must never be edited again.
+/// `CREATE TABLE IF NOT EXISTS` only ever creates the schema on a fresh
+/// DB; it is intentionally a no-op on a DB that already has these tables.
+/// All future schema changes go through [`MIGRATIONS`] / [`run_migrations`],
+/// NOT by editing this function.
+fn create_baseline(conn: &Connection) -> Result<(), Error> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS envs (
@@ -93,6 +130,69 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
         "#,
     )?;
     Ok(())
+}
+
+/// Bring the DB's schema up to date via the `PRAGMA user_version`
+/// framework. Idempotent: re-running it is a no-op once the DB is current.
+///
+/// Steps: (1) ensure the baseline tables exist (covers fresh DBs); (2)
+/// read `user_version` — a brand-new DB and any pre-framework DB both read
+/// `0` and are baseline-shaped, so stamp those to `BASELINE_VERSION`; (3)
+/// validate the registry is strictly ascending and entirely above the
+/// baseline (a mis-ordered registry is a programming bug → fail loudly);
+/// (4) apply each migration whose `version` exceeds the current version,
+/// in order, inside its own transaction, advancing `user_version` only
+/// after the migration's transaction commits.
+fn run_migrations(conn: &Connection, migrations: &[Migration]) -> Result<(), Error> {
+    create_baseline(conn)?;
+
+    let mut current_version: i64 =
+        conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?;
+
+    // A fresh DB (and any pre-framework DB, which is baseline-shaped) reads
+    // 0; stamp it to the baseline so the engine has a real floor to work from.
+    if current_version == 0 {
+        conn.pragma_update(None, "user_version", BASELINE_VERSION)?;
+        current_version = BASELINE_VERSION;
+    }
+
+    // Guard the registry ordering BEFORE applying anything: strictly
+    // ascending by version and every version above the baseline. A
+    // violation is a programming bug in the registry, not a runtime
+    // condition — fail loudly.
+    let mut prev = BASELINE_VERSION;
+    for m in migrations {
+        if m.version <= prev {
+            return Err(Error::Store(format!(
+                "migration registry not strictly ascending above baseline \
+                 {BASELINE_VERSION}: version {} follows {prev}",
+                m.version
+            )));
+        }
+        prev = m.version;
+    }
+
+    for m in migrations {
+        if m.version <= current_version {
+            continue;
+        }
+        // Each migration runs inside its own transaction so a failure
+        // can't half-apply: commit on Ok, the guard drops → rollback on Err.
+        let tx = conn.unchecked_transaction()?;
+        (m.up)(conn)?;
+        tx.commit()?;
+        // Stamp the new version only AFTER the migration committed, so a
+        // rolled-back migration leaves `user_version` unchanged.
+        conn.pragma_update(None, "user_version", m.version)?;
+        current_version = m.version;
+    }
+    Ok(())
+}
+
+/// Run schema migrations against the production registry. Thin wrapper so
+/// the `init` call site stays stable while the engine evolves.
+fn migrate(conn: &Connection) -> Result<(), Error> {
+    run_migrations(conn, MIGRATIONS)
 }
 
 // --- env CRUD ---
@@ -478,5 +578,198 @@ images:
             get_notify_state(&conn, "vmid-9999").unwrap().is_some(),
             "foreign notify_state must survive prune"
         );
+    }
+
+    // --- migration engine ---
+    //
+    // These live in-module (not in tests/) because they exercise private
+    // items — `Migration`, `run_migrations`, `BASELINE_VERSION` — which the
+    // integration test crate can't see. Keeping them here is cleaner than
+    // widening the public API just for tests.
+
+    fn user_version(conn: &Connection) -> i64 {
+        conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap()
+    }
+
+    /// TEST-ONLY worked migration (the historical 0.1.0→0.5.0 `notify_state`
+    /// FK-drop delta). SQLite can't drop a column-level FK in place, so we do
+    /// the table-rebuild dance. `PRAGMA foreign_keys` enforcement can only be
+    /// toggled OUTSIDE a transaction (toggling it inside is a silent no-op),
+    /// so this migration manages its own pragma state: it turns FK
+    /// enforcement off on the connection, rebuilds the table without the FK,
+    /// then turns it back on. The engine's per-migration transaction still
+    /// wraps the rebuild DDL for atomicity.
+    fn drop_notify_fk(conn: &Connection) -> Result<(), Error> {
+        conn.pragma_update(None, "foreign_keys", "OFF")?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE notify_state_new (
+                guid            TEXT    PRIMARY KEY,
+                last_severity   TEXT    NOT NULL,
+                last_emitted_at INTEGER NOT NULL,
+                acked           INTEGER NOT NULL
+            );
+            INSERT INTO notify_state_new (guid, last_severity, last_emitted_at, acked)
+                SELECT guid, last_severity, last_emitted_at, acked FROM notify_state;
+            DROP TABLE notify_state;
+            ALTER TABLE notify_state_new RENAME TO notify_state;
+            "#,
+        )?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(())
+    }
+
+    /// Seed a bare DB at the OLD (pre-framework) schema: `envs` plus a
+    /// `notify_state` that still carries the dropped FK, and `user_version`
+    /// left at 0. Does NOT go through `create_baseline`.
+    fn open_old_schema() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE envs (
+                guid          TEXT    PRIMARY KEY,
+                vmid          INTEGER NOT NULL,
+                mode          TEXT    NOT NULL,
+                owner         TEXT    NOT NULL,
+                image         TEXT    NOT NULL,
+                name          TEXT    NOT NULL,
+                ip            TEXT    NOT NULL,
+                mac           TEXT    NOT NULL,
+                created_at    INTEGER NOT NULL,
+                ttl_deadline  INTEGER NOT NULL,
+                soft_deadline INTEGER NOT NULL,
+                status        TEXT    NOT NULL
+            );
+            CREATE TABLE notify_state (
+                guid            TEXT    PRIMARY KEY REFERENCES envs(guid) ON DELETE CASCADE,
+                last_severity   TEXT    NOT NULL,
+                last_emitted_at INTEGER NOT NULL,
+                acked           INTEGER NOT NULL
+            );
+            CREATE TABLE heartbeat (
+                id            INTEGER PRIMARY KEY CHECK (id = 0),
+                last_sweep_at INTEGER NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+        assert_eq!(user_version(&conn), 0, "old schema starts unstamped");
+        conn
+    }
+
+    fn test_registry() -> &'static [Migration] {
+        &[Migration {
+            version: 2,
+            up: drop_notify_fk,
+        }]
+    }
+
+    /// Fresh DB through the normal open path is stamped to the baseline and
+    /// has all three tables.
+    #[test]
+    fn baseline_stamps_user_version() {
+        let conn = open_in_memory().unwrap();
+        assert_eq!(user_version(&conn), BASELINE_VERSION);
+        for t in ["envs", "notify_state", "heartbeat"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [t],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "table {t} missing");
+        }
+    }
+
+    /// The worked 0.1.0→0.5.0 case: a DB seeded at the old FK-bearing schema
+    /// is migrated forward, the version advances, and the FK is gone.
+    #[test]
+    fn migration_engine_applies_ordered_and_advances_version() {
+        let conn = open_old_schema();
+
+        // Sanity: under the old FK + foreign_keys=ON, a non-env guid is
+        // rejected. (Proves the FK is really there before we migrate.)
+        let pre = conn.execute(
+            "INSERT INTO notify_state (guid, last_severity, last_emitted_at, acked) \
+             VALUES ('vmid-10001', 'info', 1000, 0)",
+            [],
+        );
+        assert!(pre.is_err(), "old FK should reject a non-env guid");
+
+        run_migrations(&conn, test_registry()).unwrap();
+
+        // (a) version advanced to the migration's target.
+        assert_eq!(user_version(&conn), 2);
+
+        // (b) the FK is gone: no foreign keys reported on the rebuilt table.
+        let fk_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_foreign_key_list('notify_state')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fk_count, 0, "FK must be gone after migration");
+
+        // (b, negative control) with foreign_keys ON, inserting a guid that
+        // is NOT in `envs` now SUCCEEDS (it would fail under the old FK).
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute(
+            "INSERT INTO notify_state (guid, last_severity, last_emitted_at, acked) \
+             VALUES ('vmid-10001', 'info', 1000, 0)",
+            [],
+        )
+        .expect("non-env guid must insert after FK drop");
+    }
+
+    /// Re-running the same registry is a no-op: version stays, FK stays gone.
+    #[test]
+    fn migration_is_idempotent() {
+        let conn = open_old_schema();
+        run_migrations(&conn, test_registry()).unwrap();
+        assert_eq!(user_version(&conn), 2);
+
+        // Second run does nothing and does not error.
+        run_migrations(&conn, test_registry()).unwrap();
+        assert_eq!(user_version(&conn), 2);
+
+        let fk_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_foreign_key_list('notify_state')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fk_count, 0, "FK still gone after second run");
+    }
+
+    /// A mis-ordered or below-baseline registry is a programming bug → Err,
+    /// caught before any migration is applied.
+    #[test]
+    fn registry_ordering_guard() {
+        let conn = open_in_memory().unwrap();
+
+        // Not strictly ascending.
+        let misordered = &[
+            Migration {
+                version: 3,
+                up: |_| Ok(()),
+            },
+            Migration {
+                version: 2,
+                up: |_| Ok(()),
+            },
+        ];
+        assert!(run_migrations(&conn, misordered).is_err());
+
+        // At/below the baseline.
+        let below = &[Migration {
+            version: BASELINE_VERSION,
+            up: |_| Ok(()),
+        }];
+        assert!(run_migrations(&conn, below).is_err());
     }
 }
