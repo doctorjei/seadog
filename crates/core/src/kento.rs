@@ -94,6 +94,15 @@ pub struct ProvisionSpec {
     /// Resolved owner (trusted from the front-end; written into the desc
     /// marker so teardown can verify ownership against live PVE).
     pub owner: String,
+    /// Path to a root-owned file of the OWNER's authorized ssh pubkey line(s)
+    /// (one `ssh-…` per line) to inject into the guest so the owner can log
+    /// in. `None` → no key injection (`--ssh-key` omitted); the create still
+    /// proceeds. The helper materializes this from its OWN authorized_keys by
+    /// owner name and removes it after provision — it is never long-lived.
+    pub ssh_key_file: Option<std::path::PathBuf>,
+    /// The login user the injected key authorizes (`--ssh-key-user`). Ignored
+    /// when `ssh_key_file` is `None`.
+    pub ssh_key_user: String,
 }
 
 /// What [`Kento::provision`] reports back: the **effective** MAC the guest
@@ -325,13 +334,39 @@ mod real {
     /// The shelling-out [`Kento`]: runs `qm`/`pct`/`kento` as argv
     /// vectors (never a shell string), with a cleared environment, a
     /// pinned PATH, and a per-op hard timeout.
-    #[derive(Debug, Default)]
-    pub struct RealKento;
+    #[derive(Debug)]
+    pub struct RealKento {
+        /// The program name/path used to invoke `kento`. Bare `"kento"`
+        /// (resolved via [`SAFE_PATH`]) unless the config pins an absolute
+        /// `kento_path`.
+        kento_bin: String,
+    }
+
+    impl Default for RealKento {
+        fn default() -> Self {
+            RealKento {
+                kento_bin: "kento".to_string(),
+            }
+        }
+    }
 
     impl RealKento {
-        /// Construct a `RealKento`.
+        /// Construct a `RealKento` invoking the bare `"kento"` (resolved via
+        /// the pinned PATH).
         pub fn new() -> Self {
-            RealKento
+            Self::default()
+        }
+
+        /// Construct a `RealKento` honoring `config.kento_path`: when set, the
+        /// `kento` binary is invoked by that absolute path; otherwise the bare
+        /// `"kento"` name is used (resolved via [`SAFE_PATH`]).
+        pub fn from_config(config: &crate::config::Config) -> Self {
+            match &config.kento_path {
+                Some(p) if !p.trim().is_empty() => RealKento {
+                    kento_bin: p.clone(),
+                },
+                _ => Self::default(),
+            }
         }
 
         /// Run `program argv…` to completion under the safety harness,
@@ -436,7 +471,7 @@ mod real {
             // state is cleaned alongside the PVE guest. `-f` forces a running
             // instance. The name is the one teardown read from live PVE.
             let mode = mode.as_str();
-            self.run("kento", &[mode, "destroy", "-f", name])
+            self.run(&self.kento_bin, &[mode, "destroy", "-f", name])
                 .map(|_| ())
         }
 
@@ -471,6 +506,22 @@ mod real {
                 "--ssh-host-keys",
                 "--start",
             ];
+            // Inject the OWNER's pubkey(s) so they can SSH into their env.
+            // `--config-mode auto` lets kento pick injection (lxc) vs
+            // cloud-init (vm). Omitted entirely when no key was materialized
+            // (fail-open: the create still proceeds).
+            let ssh_key_file = spec
+                .ssh_key_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned());
+            if let Some(key_file) = &ssh_key_file {
+                argv.push("--ssh-key");
+                argv.push(key_file);
+                argv.push("--ssh-key-user");
+                argv.push(&spec.ssh_key_user);
+                argv.push("--config-mode");
+                argv.push("auto");
+            }
             // VM-only MAC: LXC rejects --mac (kento auto-assigns it).
             if spec.mode == Mode::Vm {
                 argv.push("--mac");
@@ -478,7 +529,7 @@ mod real {
             }
             // The image ref is the final positional argument.
             argv.push(&spec.image_ref);
-            self.run("kento", &argv)?;
+            self.run(&self.kento_bin, &argv)?;
 
             // Stamp the seadog description marker block (qm/pct set). --name
             // already set the guest name at create.
@@ -986,6 +1037,8 @@ mod tests {
             bridge: "vmbr0".into(),
             guid: "guid-abc".into(),
             owner: "alice".into(),
+            ssh_key_file: None,
+            ssh_key_user: "root".into(),
         }
     }
 
@@ -1019,6 +1072,30 @@ mod tests {
         // Teardown by the realized name removes it.
         k.teardown(&spec.name, Mode::Lxc).unwrap();
         assert!(k.list_guests((10000, 10999)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mac_persists_for_vm_and_is_empty_sentinel_for_lxc() {
+        // Regression: a VM env persists its (non-empty) minted MAC, while an
+        // LXC env persists the `""` sentinel (the front-end maps the LXC's
+        // `None` outcome → "" on the DB row). LXC MAC is unobservable by
+        // design (empty "" sentinel), VMs keep their real minted/pinned MAC.
+        let k = FakeKento::new();
+
+        // VM: the realized guest carries the minted MAC; outcome is Some.
+        let vm = sample_spec(Mode::Vm);
+        let vm_out = k.provision(&vm).unwrap();
+        assert_eq!(vm_out.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+        assert!(!vm_out.mac.unwrap().is_empty());
+
+        // LXC: the MAC is unobservable, so the outcome is None — which the
+        // front-end records as the empty "" sentinel (never a fictional MAC).
+        let lxc = sample_spec(Mode::Lxc);
+        let lxc_out = k.provision(&lxc).unwrap();
+        assert_eq!(lxc_out.mac, None);
+        // The "" the front-end would record never equals a real live MAC.
+        let recorded_lxc_mac = lxc_out.mac.unwrap_or_default();
+        assert_eq!(recorded_lxc_mac, "");
     }
 
     #[test]

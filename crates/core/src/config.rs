@@ -32,6 +32,15 @@ pub struct Config {
     /// Allowlist: image name -> {ref, modes}. Never empty (validated).
     #[serde(default)]
     pub images: BTreeMap<String, Image>,
+    /// The login user injected ssh keys authorize for, when an image entry
+    /// does not pin its own `user`. Defaults to `"root"` (fail-open).
+    #[serde(default = "default_user")]
+    pub default_user: String,
+    /// Absolute path to the `kento` binary. `None` → spawn the bare `"kento"`
+    /// name (resolved via the helper's pinned PATH). Set when kento is not on
+    /// the default PATH (e.g. a pipx install under `/root/.local/bin`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kento_path: Option<String>,
     /// Per-owner cap overrides (optional).
     #[serde(default)]
     pub owners: BTreeMap<String, OwnerOverride>,
@@ -146,6 +155,10 @@ pub struct Image {
     /// Allowed modes; the first is the default for `create` without
     /// `--mode`.
     pub modes: Vec<Mode>,
+    /// Optional login user the owner's ssh key is authorized for in guests
+    /// of this image. When unset, the top-level `default_user` applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 /// Per-owner cap override block (all fields optional).
@@ -347,7 +360,42 @@ impl Config {
             )));
         }
 
+        // `kento_path`, when set, must be a non-empty path. The user fields
+        // are free-form (no constraint) and intentionally fail-open.
+        if let Some(p) = &self.kento_path {
+            if p.trim().is_empty() {
+                return Err(Error::ConfigValidation(
+                    "kento_path, when set, must not be empty".to_string(),
+                ));
+            }
+        }
+
         Ok(())
+    }
+
+    /// Resolve the login user the owner's ssh key should authorize for when
+    /// creating a guest from image *name*: the image entry's `user` if it
+    /// pins one, else the top-level `default_user` (itself `"root"` by
+    /// default). Never errors — an unknown image name falls back to
+    /// `default_user`, so this is fail-open by construction.
+    pub fn login_user_for_image(&self, name: &str) -> String {
+        self.images
+            .get(name)
+            .and_then(|img| img.user.clone())
+            .unwrap_or_else(|| self.default_user.clone())
+    }
+
+    /// Like [`Config::login_user_for_image`] but keyed on the resolved OCI
+    /// *ref* (what `seadog-priv provision` carries, since it never trusts a
+    /// bare image name from the front-end). Matches the first image entry
+    /// whose `ref` equals `image_ref` and returns its pinned `user`, else the
+    /// top-level `default_user`. Fail-open: an unmatched ref → `default_user`.
+    pub fn login_user_for_ref(&self, image_ref: &str) -> String {
+        self.images
+            .values()
+            .find(|img| img.image_ref == image_ref)
+            .and_then(|img| img.user.clone())
+            .unwrap_or_else(|| self.default_user.clone())
     }
 }
 
@@ -357,6 +405,9 @@ impl Config {
 
 fn default_true() -> bool {
     true
+}
+fn default_user() -> String {
+    "root".to_string()
 }
 fn secs_60() -> Duration {
     Duration::from_secs(60)

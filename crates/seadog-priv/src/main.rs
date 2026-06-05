@@ -238,7 +238,7 @@ fn emit_err(e: &anyhow::Error) {
 
 #[cfg(feature = "real-kento")]
 fn run_with_real_backend(verb: &Verb, config: &Config) -> Result<Value> {
-    let kento = seadog_core::kento::RealKento::new();
+    let kento = seadog_core::kento::RealKento::from_config(config);
     dispatch(verb, &kento, config)
 }
 

@@ -38,12 +38,25 @@ fn parses_annotated_example() {
     assert_eq!(cfg.allocation.caps.max_lxc_per_owner, 8);
     assert_eq!(cfg.allocation.caps.max_vm_per_owner, 3);
 
-    // Image allowlist: name -> {ref, modes}.
+    // Image allowlist: name -> {ref, modes[, user]}.
     let loom = cfg.images.get("loom").expect("loom present");
     assert_eq!(loom.image_ref, "ghcr.io/doctorjei/droste-loom:latest");
     assert_eq!(loom.modes, vec![Mode::Lxc]);
+    assert_eq!(loom.user.as_deref(), Some("droste"));
     let ci = cfg.images.get("ci").expect("ci present");
     assert_eq!(ci.modes, vec![Mode::Lxc, Mode::Vm]);
+    assert_eq!(ci.user.as_deref(), Some("agent"));
+
+    // Login-user resolution: per-image `user` wins; the top-level default is
+    // "root"; `kento_path` is commented out → None.
+    assert_eq!(cfg.default_user, "root");
+    assert_eq!(cfg.kento_path, None);
+    assert_eq!(cfg.login_user_for_image("loom"), "droste");
+    assert_eq!(cfg.login_user_for_image("ci"), "agent");
+    assert_eq!(
+        cfg.login_user_for_ref("ghcr.io/doctorjei/droste-loom:latest"),
+        "droste"
+    );
 
     // Owner override.
     let o = cfg.owners.get("ci").expect("owner override");
@@ -99,6 +112,64 @@ images:
     assert_eq!(cfg.retention.terminal, Duration::from_secs(7 * 24 * 3600));
     assert!(cfg.notify.journald);
     assert_eq!(cfg.identity.threshold, 0.6);
+}
+
+#[test]
+fn default_user_defaults_to_root_and_resolver_falls_back() {
+    // No `default_user`, no per-image `user`: both default to "root".
+    let yaml = r#"
+images:
+  loom: { ref: ghcr.io/doctorjei/droste-loom:latest, modes: [lxc] }
+"#;
+    let cfg = Config::from_yaml_str(yaml).expect("parse");
+    cfg.validate().expect("validates");
+    assert_eq!(cfg.default_user, "root");
+    assert_eq!(cfg.images.get("loom").unwrap().user, None);
+    // Image with no `user` falls back to default_user ("root").
+    assert_eq!(cfg.login_user_for_image("loom"), "root");
+    // Ultimate fallback: an unknown image name → default_user ("root").
+    assert_eq!(cfg.login_user_for_image("nope"), "root");
+    assert_eq!(cfg.login_user_for_ref("unmatched/ref:1"), "root");
+}
+
+#[test]
+fn per_image_user_overrides_custom_default_user() {
+    let yaml = r#"
+default_user: agent
+images:
+  loom:    { ref: r/loom:1, modes: [lxc], user: droste }
+  bare:    { ref: r/bare:1, modes: [vm] }
+"#;
+    let cfg = Config::from_yaml_str(yaml).expect("parse");
+    cfg.validate().expect("validates");
+    assert_eq!(cfg.default_user, "agent");
+    // image.user wins.
+    assert_eq!(cfg.login_user_for_image("loom"), "droste");
+    // image without user falls back to the (custom) default_user.
+    assert_eq!(cfg.login_user_for_image("bare"), "agent");
+    assert_eq!(cfg.login_user_for_ref("r/bare:1"), "agent");
+}
+
+#[test]
+fn kento_path_parses_and_validates() {
+    // Default: absent → None.
+    let none = Config::from_yaml_str("images:\n  loom: { ref: r/loom:1, modes: [lxc] }\n").unwrap();
+    assert_eq!(none.kento_path, None);
+
+    // Set to an absolute path → Some, validates.
+    let some = Config::from_yaml_str(
+        "kento_path: /usr/local/bin/kento\nimages:\n  loom: { ref: r/loom:1, modes: [lxc] }\n",
+    )
+    .unwrap();
+    assert_eq!(some.kento_path.as_deref(), Some("/usr/local/bin/kento"));
+    some.validate().expect("non-empty kento_path validates");
+
+    // Empty kento_path is rejected by the validator (lenient otherwise).
+    let empty = Config::from_yaml_str(
+        "kento_path: \"\"\nimages:\n  loom: { ref: r/loom:1, modes: [lxc] }\n",
+    )
+    .unwrap();
+    assert!(matches!(empty.validate(), Err(Error::ConfigValidation(_))));
 }
 
 #[test]

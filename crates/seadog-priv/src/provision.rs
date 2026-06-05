@@ -17,10 +17,13 @@
 //! - `--image-ref` is an **allowlisted** ref for the requested mode — a
 //!   compromised front-end cannot smuggle an arbitrary OCI ref past this.
 
+use std::io::Write as _;
 use std::net::Ipv4Addr;
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
 use regex::Regex;
 use serde_json::{json, Value};
@@ -30,7 +33,54 @@ use seadog_core::kento::{Kento, ProvisionSpec};
 use seadog_core::models::Mode;
 use seadog_core::validate::{validate_guest_name, validate_vmid};
 
+use crate::owners::owner_key_bodies;
 use crate::parse_mode;
+
+/// An RAII-cleaned temp file holding the owner's authorized pubkey line(s),
+/// created mode `0600` and removed on drop (success OR error path). Never
+/// logs its path or contents.
+struct OwnerKeyFile {
+    path: PathBuf,
+}
+
+impl OwnerKeyFile {
+    /// Materialize `bodies` (one `ssh-…` line each) into a fresh `0600` file
+    /// in `dir` (a root-only directory — the authorized_keys parent). The
+    /// file is created with `O_CREAT|O_EXCL` so it cannot clobber/leak into
+    /// an attacker-planted path, and `0600` so only root can read the key.
+    fn create(dir: &Path, bodies: &[String]) -> Result<Self> {
+        let name = format!(
+            ".seadog-ownerkey.{}.{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let path = dir.join(name);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            // Deliberately omit the path from the error to avoid leaking it.
+            .context("creating owner-key temp file")?;
+        for body in bodies {
+            f.write_all(body.as_bytes()).context("writing owner key")?;
+            f.write_all(b"\n").context("writing owner key")?;
+        }
+        f.flush().ok();
+        Ok(OwnerKeyFile { path })
+    }
+}
+
+impl Drop for OwnerKeyFile {
+    fn drop(&mut self) {
+        // Best-effort removal on every path (success + error). Never log the
+        // path or contents.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
 
 /// `provision --owner <name> --guid <uuid> --vmid <u32> --ip <ipv4>
 /// --mac <mac> --name <label> --mode <lxc|vm> --image-ref <ref>`.
@@ -116,6 +166,27 @@ pub fn run(args: &ProvisionArgs, kento: &dyn Kento, config: &Config) -> Result<V
     }
     validate_image_ref(&args.image_ref, mode, config)?;
 
+    // Resolve the login user the owner's key will authorize: the image
+    // entry's pinned `user` (matched by the resolved ref) else the
+    // top-level `default_user` (itself `"root"`). Never errors (fail-open).
+    let ssh_key_user = config.login_user_for_ref(&args.image_ref);
+
+    // Re-derive the OWNER's authorized pubkey(s) from the helper's OWN
+    // authorized_keys by owner name (never key material from the front-end).
+    // If the owner has no key (shouldn't happen — validated upstream), we
+    // proceed WITHOUT `--ssh-key` (fail-open) rather than fail the create.
+    // The temp file (mode 0600, root-owned, RAII-removed on every path) is
+    // bound to `_owner_key` so it lives until after `kento.provision` returns.
+    let key_bodies = owner_key_bodies(&args.owner).unwrap_or_default();
+    // `.ok()` → fail-open: a temp-file creation failure never blocks a create,
+    // and the error (which omits the path) is dropped rather than logged.
+    let _owner_key = if key_bodies.is_empty() {
+        None
+    } else {
+        OwnerKeyFile::create(&crate::owners::authkeys_dir(), &key_bodies).ok()
+    };
+    let ssh_key_file = _owner_key.as_ref().map(|f| f.path.clone());
+
     // Create the guest with exactly the allocated params + markers. The
     // bridge + IP prefix/gateway come from the helper's own config (kento
     // owns networking; we pass `--network bridge=<bridge> --ip <ip>/<prefix>
@@ -132,6 +203,8 @@ pub fn run(args: &ProvisionArgs, kento: &dyn Kento, config: &Config) -> Result<V
         bridge: config.allocation.bridge.clone(),
         guid: args.guid.clone(),
         owner: args.owner.clone(),
+        ssh_key_file,
+        ssh_key_user,
     };
     // `--mac` is VM-only. For a VM the effective MAC is the minted one; for
     // an LXC the MAC is unobservable via `pct config`, so the outcome MAC is
@@ -234,6 +307,117 @@ mod tests {
         assert_eq!(k.provisions().len(), 1);
         // VM: --mac is honored, so the effective MAC is the one we passed.
         assert_eq!(out["mac"], "aa:bb:cc:dd:ee:ff");
+    }
+
+    /// Point `$SEADOG_AUTHKEYS` at a fresh temp file seeded with a managed
+    /// owner line, restoring the prior value on drop. Serialized via a
+    /// process-global lock since the env var is shared.
+    struct OwnerKeysEnv {
+        dir: PathBuf,
+        prev: Option<std::ffi::OsString>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    static OWNERKEYS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl OwnerKeysEnv {
+        fn new(contents: &str) -> Self {
+            let guard = OWNERKEYS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let unique = format!(
+                "seadog-provision-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let dir = std::env::temp_dir().join(unique);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("authorized_keys");
+            std::fs::write(&path, contents).unwrap();
+            let prev = std::env::var_os("SEADOG_AUTHKEYS");
+            std::env::set_var("SEADOG_AUTHKEYS", &path);
+            OwnerKeysEnv {
+                dir,
+                prev,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for OwnerKeysEnv {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("SEADOG_AUTHKEYS", v),
+                None => std::env::remove_var("SEADOG_AUTHKEYS"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    const TEST_BLOB: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIBVL8h1uvNvR2v2c0Yk6Yz0mYy8w0cZk6Q1yK0a8mDcL";
+
+    fn managed_line(owner: &str) -> String {
+        format!(
+            "command=\"/usr/lib/seadog/seadog --owner {owner}\",restrict ssh-ed25519 {TEST_BLOB} {owner}@host"
+        )
+    }
+
+    #[test]
+    fn injects_owner_key_and_user_for_lxc_and_cleans_up() {
+        let _env = OwnerKeysEnv::new(&format!("{}\n", managed_line("alice")));
+        let cfg = config();
+        let k = FakeKento::new();
+        // lxc path (loom ref is dual-mode in the fixture config).
+        let out = run(&args(), &k, &cfg).unwrap();
+        assert_eq!(out["ok"], true);
+
+        let provs = k.provisions();
+        assert_eq!(provs.len(), 1);
+        let p = &provs[0];
+        // The owner's key was materialized and passed (argv `--ssh-key`).
+        let key_path = p.ssh_key_file.clone().expect("ssh_key_file passed");
+        // Default login user (no per-image `user` in the fixture) is "root".
+        assert_eq!(p.ssh_key_user, "root");
+        // Cleanup: the temp keyfile is removed after provision returns.
+        assert!(
+            !key_path.exists(),
+            "owner-key temp file must be cleaned up after provision"
+        );
+    }
+
+    #[test]
+    fn injects_owner_key_for_vm_too() {
+        let _env = OwnerKeysEnv::new(&format!("{}\n", managed_line("alice")));
+        let cfg = config();
+        let k = FakeKento::new();
+        let mut a = args();
+        a.mode = "vm".into();
+        a.image_ref = "registry.example.com/vmonly:2.0".into();
+        run(&a, &k, &cfg).unwrap();
+
+        let provs = k.provisions();
+        let p = &provs[0];
+        assert!(p.ssh_key_file.is_some(), "vm path must also inject the key");
+        assert!(!p.ssh_key_file.clone().unwrap().exists(), "cleaned up");
+        assert_eq!(p.ssh_key_user, "root");
+    }
+
+    #[test]
+    fn no_owner_key_provisions_fail_open_without_key() {
+        // An authorized_keys with NO line for this owner → fail-open: the
+        // create still proceeds, just without `--ssh-key`.
+        let _env = OwnerKeysEnv::new(&format!("{}\n", managed_line("someone-else")));
+        let cfg = config();
+        let k = FakeKento::new();
+        let out = run(&args(), &k, &cfg).unwrap();
+        assert_eq!(out["ok"], true);
+        let provs = k.provisions();
+        assert_eq!(provs.len(), 1);
+        assert!(
+            provs[0].ssh_key_file.is_none(),
+            "no owner key → no --ssh-key (fail-open)"
+        );
     }
 
     #[test]

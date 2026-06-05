@@ -41,6 +41,15 @@ fn authkeys_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_AUTHKEYS))
 }
 
+/// The directory the authorized_keys file lives in (root-owned in prod;
+/// a per-test temp dir under `$SEADOG_AUTHKEYS`). Used as the root-only
+/// scratch dir for the owner-key temp file `provision` injects. Falls back
+/// to the path itself if it somehow has no parent.
+pub fn authkeys_dir() -> PathBuf {
+    let p = authkeys_path();
+    p.parent().map(Path::to_path_buf).unwrap_or(p)
+}
+
 /// Read the authorized_keys file, treating a missing file as empty.
 fn read_authkeys(path: &Path) -> Result<String> {
     match std::fs::read_to_string(path) {
@@ -108,6 +117,36 @@ fn chown_root(path: &Path) -> std::io::Result<()> {
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+/// Return every authorized ssh **public-key body** (`<keytype> <blob>
+/// [comment]`, no forced-command options) mapped to `owner` in the
+/// root-owned authorized_keys file, in file order.
+///
+/// This re-derives the owner's key(s) from the helper's OWN
+/// authorized_keys by owner *name* — it never accepts key material from the
+/// front-end (the trust boundary). A missing file or an owner with no
+/// managed lines yields an empty vec. Reuses the same parser
+/// (`authkeys::parse_owner_line` / `key_body_of_line`) that backs
+/// `add-owner`/`list-owners`/`remove-owner`.
+pub fn owner_key_bodies(owner: &str) -> Result<Vec<String>> {
+    let path = authkeys_path();
+    let current = read_authkeys(&path)?;
+    let mut out = Vec::new();
+    for line in current.lines() {
+        match authkeys::parse_owner_line(line) {
+            Some(entry) if entry.owner == owner => {
+                // Pull the bare `<keytype> <blob> [comment]` body back out of
+                // the managed line (dropping the `command="…",restrict`
+                // options) so kento receives a plain authorized_keys body.
+                if let Some(body) = authkeys::key_body_of_line(line) {
+                    out.push(body.trim().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 /// `add-owner --owner <name> --key "<keytype> <blob> [comment]"`.

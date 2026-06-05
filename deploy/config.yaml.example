@@ -19,12 +19,24 @@ allocation:
     max_lxc_per_owner: 8
     max_vm_per_owner: 3
 
-images:                         # allowlist: name -> {ref, modes}; never a caller ref
+# Login user the OWNER's injected SSH key authorizes inside a provisioned
+# guest (used for `--ssh-key-user`). Fail-open default: "root". A per-image
+# `user:` (below) overrides this for that image.
+default_user: root
+
+# Absolute path to the `kento` binary. Leave commented to invoke the bare
+# `kento` name (resolved via the helper's pinned PATH). Set this if kento is
+# NOT on the default PATH — e.g. a pipx install at /root/.local/bin/kento.
+# kento_path: /usr/local/bin/kento  # set if kento isn't on the default PATH, e.g. a pipx install at /root/.local/bin/kento
+
+images:                         # allowlist: name -> {ref, modes[, user]}; never a caller ref
   # EXAMPLE allowlist — configure your own images. The droste refs below are
   # the published droste test images; swap in whatever your cluster ships.
-  loom:     { ref: ghcr.io/doctorjei/droste-loom:latest,    modes: [lxc] }
-  stuffer:  { ref: ghcr.io/doctorjei/droste-stuffer:latest, modes: [vm]  }
-  ci:       { ref: ghcr.io/doctorjei/kanibako-lxc:latest,   modes: [lxc, vm] }  # first = default; example, set your own agent image (ref unconfirmed)
+  # `user:` (optional) pins the login user the owner's SSH key authorizes for
+  # that image; when omitted, `default_user` (above) applies.
+  loom:     { ref: ghcr.io/doctorjei/droste-loom:latest,    modes: [lxc], user: droste }
+  stuffer:  { ref: ghcr.io/doctorjei/droste-stuffer:latest, modes: [vm],  user: droste }
+  ci:       { ref: ghcr.io/doctorjei/kanibako-lxc:latest,   modes: [lxc, vm], user: agent }  # first = default; example, set your own agent image (ref unconfirmed)
 
 owners:                         # identity (fingerprint->name) lives in authorized_keys;
   ci: { max_lxc: 12 }           # this block is per-owner cap OVERRIDES only (optional)
