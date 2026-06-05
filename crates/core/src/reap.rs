@@ -107,6 +107,35 @@ pub fn sweep(
                 }
             }
             Classification::Anomaly { detail, .. } => {
+                // Create-window suppression: a just-born guest can carry a
+                // GUID marker before set-meta has fully landed its DB row,
+                // so `classify` transiently sees a marker/DB mismatch and
+                // returns `Anomaly`. The age floor (same gate the reap path
+                // uses for the non-atomic create window at
+                // `handle_reap_candidate`) is the discriminator: when there
+                // IS a DB row AND the guest is younger than `age_floor`, it
+                // is still inside that window and will reconcile on the next
+                // sweep once set-meta lands. Suppress it entirely — no
+                // `warning`/`notify_state` row is persisted, so these
+                // transient mismatches don't accumulate as stale unacked
+                // alerts. We deliberately do NOT increment `outcome.flagged`
+                // here: a suppressed create-window anomaly is transient and
+                // expected, not a flagged anomaly; the sweep loop continues
+                // normally either way.
+                //
+                // We only suppress when a DB row exists (it carries
+                // `created_at`, the only source of age here). A
+                // marker-bearing guest with NO db row in range cannot have
+                // its age computed and is treated as a genuine anomaly worth
+                // flagging. An OLD guest (age >= age_floor) is likewise a
+                // genuine anomaly and flagged exactly as before — this is
+                // also why the gate can't mask a real vmid-reuse anomaly on
+                // an aged guest.
+                if let Some(env) = db_row.as_ref() {
+                    if now_unix - env.created_at < age_floor {
+                        continue;
+                    }
+                }
                 outcome.flagged += 1;
                 let guid = db_row
                     .map(|e| e.guid)
@@ -477,6 +506,73 @@ images:
             store::get_env(&conn, "g1").unwrap().unwrap().status,
             EnvStatus::Active
         );
+    }
+
+    #[test]
+    fn young_create_window_anomaly_is_suppressed_not_flagged() {
+        // A just-born guest (age < age_floor, 5m default) carries its GUID
+        // marker but its DB row's GUID hasn't matched yet (set-meta still
+        // landing) → classify returns a VmidReuse-style Anomaly. Inside the
+        // create window this must be suppressed: no flag, no persisted
+        // notify_state row (so stale unacked warnings can't accumulate).
+        let c = config();
+        let conn = store::open_in_memory().unwrap();
+        let now = 1_000_000i64;
+        // Created 1 minute ago (< 5m age floor). Not expired (deadline far
+        // out) — we only care about the anomaly path here.
+        insert_active(&conn, "g1", 10010, now - 60, now + 3600);
+        // Live guest carries a marker, but the desc-GUID and MAC don't match
+        // the row → Anomaly (the create-window mismatch shape).
+        let mut s = signals_for(&conn, "g1", 10010);
+        s.description = Some(format!("{GUID_MARKER_PREFIX}not-yet-set"));
+        s.mac = Some("ff:ff:ff:ff:ff:ff".into());
+        let k = FakeKento::new();
+        k.set_guests(vec![s]);
+
+        let out = sweep(&k, &conn, &c, now).unwrap();
+        assert_eq!(
+            out.flagged, 0,
+            "create-window anomaly inside age floor must not be flagged"
+        );
+        assert!(k.teardowns().is_empty());
+        // No notify_state row persisted for the env guid.
+        assert!(
+            store::get_notify_state(&conn, "g1").unwrap().is_none(),
+            "no warning notify_state row must be persisted in the create window"
+        );
+        // Row untouched.
+        assert_eq!(
+            store::get_env(&conn, "g1").unwrap().unwrap().status,
+            EnvStatus::Active
+        );
+    }
+
+    #[test]
+    fn old_create_window_style_anomaly_is_flagged_and_persisted() {
+        // Same marker/DB mismatch shape, but the guest is OLD (age >=
+        // age_floor) → a genuine anomaly. It must be flagged AND a warning
+        // notify_state row persisted (regression guard: the age-floor gate
+        // must not over-suppress real anomalies).
+        let c = config();
+        let conn = store::open_in_memory().unwrap();
+        let now = 1_000_000i64;
+        // Created 1 hour ago (>> 5m age floor).
+        insert_active(&conn, "g1", 10010, now - 3600, now + 3600);
+        let mut s = signals_for(&conn, "g1", 10010);
+        s.description = Some(format!("{GUID_MARKER_PREFIX}wrong-guid"));
+        s.mac = Some("ff:ff:ff:ff:ff:ff".into());
+        let k = FakeKento::new();
+        k.set_guests(vec![s]);
+
+        let out = sweep(&k, &conn, &c, now).unwrap();
+        assert_eq!(out.flagged, 1, "an aged anomaly must still be flagged");
+        assert!(k.teardowns().is_empty(), "anomaly is never reaped");
+        // A warning notify_state row IS persisted, keyed by the env guid.
+        let st = store::get_notify_state(&conn, "g1")
+            .unwrap()
+            .expect("aged anomaly must persist a notify_state row");
+        assert_eq!(st.last_severity, "warning");
+        assert!(!st.acked);
     }
 
     #[test]
