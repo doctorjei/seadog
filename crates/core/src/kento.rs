@@ -73,6 +73,12 @@ pub struct InstanceSignals {
     pub image: String,
     /// kento-reported status text (informational).
     pub status: String,
+    /// Backend mode kento reports (`inspect.mode`: `lxc`/`vm`/`pve-lxc`/
+    /// `pve-vm`), collapsed to the backend-neutral [`Mode`] (lxc-family →
+    /// [`Mode::Lxc`], vm-family → [`Mode::Vm`]). Lets reap recover an orphan's
+    /// mode precisely instead of guessing from the status text. Defaults to
+    /// [`Mode::Lxc`] when kento reports nothing recognizable.
+    pub mode: Mode,
     /// Backend vmid when kento exposes one (PVE backends only);
     /// informational, never an identity key.
     pub vmid: Option<u32>,
@@ -117,6 +123,13 @@ pub struct ProvisionSpec {
     /// The login user the injected key authorizes (`--ssh-key-user`). Ignored
     /// when `ssh_key_file` is `None`.
     pub ssh_key_user: String,
+    /// Whether nesting is permitted for this instance — mode-agnostic (VM→VM
+    /// nesting / nested virt, container→container nesting). Resolved by the
+    /// front-end from the served image entry's `allow_nesting` and
+    /// re-validated by the helper against the allowlist; pushed as
+    /// `--allow-nesting` to `kento <mode> create` (UNCONDITIONAL on mode)
+    /// when true, omitted when false.
+    pub allow_nesting: bool,
 }
 
 /// What [`Kento::provision`] reports back, read from kento's `inspect
@@ -156,6 +169,9 @@ struct FakeState {
     teardowns: Vec<(String, Mode)>,
     /// Provision calls recorded so tests can assert exact params.
     provisions: Vec<ProvisionSpec>,
+    /// `allow_nesting` recorded per provision call, in order — mirrors
+    /// `provisions` so tests can assert the boundary value reached the spec.
+    provision_allow_nesting: Vec<bool>,
     /// When set, every op returns this quorum-loss message.
     quorum_lost: Option<String>,
     /// Optional per-name teardown failures (non-quorum), to test errors.
@@ -196,6 +212,13 @@ impl FakeKento {
     /// The provision calls recorded so far, in order.
     pub fn provisions(&self) -> Vec<ProvisionSpec> {
         self.inner.lock().unwrap().provisions.clone()
+    }
+
+    /// The `allow_nesting` flag recorded per provision call, in order —
+    /// parallel to [`FakeKento::provisions`]. Lets tests assert the
+    /// boundary-crossing nesting value reached the spec.
+    pub fn provision_allow_nesting(&self) -> Vec<bool> {
+        self.inner.lock().unwrap().provision_allow_nesting.clone()
     }
 }
 
@@ -266,10 +289,14 @@ impl Kento for FakeKento {
             ssh_host_key_fps: fps.clone(),
             image: spec.image_ref.clone(),
             status: "running".to_string(),
+            // The realized instance carries the spec's mode (kento reports
+            // it via inspect.mode).
+            mode: spec.mode,
             // FakeKento has no PVE backend → no vmid.
             vmid: None,
         });
         st.provisions.push(spec.clone());
+        st.provision_allow_nesting.push(spec.allow_nesting);
         Ok(ProvisionOutcome {
             mac: Some(effective_mac),
             ssh_host_key_fps: fps,
@@ -512,6 +539,14 @@ mod real {
                 argv.push("--mac");
                 argv.push(&spec.mac);
             }
+            // Nesting: push `--allow-nesting` UNCONDITIONALLY on mode (unlike
+            // the VM-only `--mac` block) — it is mode-agnostic (VM→VM nesting /
+            // nested virt, container→container nesting). The helper already
+            // re-validated `allow_nesting` against the allowlist; when false we
+            // omit it and kento's own default applies.
+            if spec.allow_nesting {
+                argv.push("--allow-nesting");
+            }
             // The image ref is the final positional argument.
             argv.push(&spec.image_ref);
             self.run(&argv)?;
@@ -583,14 +618,10 @@ mod real {
     ///   `.ssh_host_key_fingerprints` `{type: fp}` dict, sorted for a stable
     ///   order (the map is unordered in JSON).
     /// - `image` ← `.image`; `status` ← `.status`.
+    /// - `mode` ← `.mode` (`lxc`/`vm`/`pve-lxc`/`pve-vm`): lxc-family →
+    ///   [`Mode::Lxc`], vm-family → [`Mode::Vm`]; absent/unrecognized →
+    ///   [`Mode::Lxc`]. reap uses this to recover an orphan's mode precisely.
     /// - `vmid` ← `.vmid` (present only on PVE backends; informational).
-    ///
-    /// NOTE: kento's inspect also carries `.mode` (lxc/vm/pve-lxc/pve-vm),
-    /// which would let reap recover an orphan's [`Mode`] precisely instead of
-    /// the `mode_from_status` heuristic. `InstanceSignals` is frozen from P3
-    /// (no `mode` field), so this is **deferred** — follow-up: add
-    /// `InstanceSignals.mode` and thread `.mode` through here to retire the
-    /// `mode_from_status` TODO in reap.
     pub fn parse_kento_inspect(json: &str) -> Result<InstanceSignals, String> {
         let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
         let obj = value
@@ -608,6 +639,14 @@ mod real {
         let image = str_field("image").unwrap_or_default();
         let status = str_field("status").unwrap_or_default();
         let mac = str_field("mac");
+
+        // mode ← `.mode` (lxc/vm/pve-lxc/pve-vm). Collapse the backend family
+        // to the neutral Mode: anything in the vm family → Vm, everything else
+        // (incl. absent/unrecognized) → Lxc.
+        let mode = match str_field("mode").as_deref() {
+            Some("vm") | Some("pve-vm") => Mode::Vm,
+            _ => Mode::Lxc,
+        };
 
         // vmid is emitted as a JSON number (int) on PVE backends, absent
         // otherwise. Be lenient about a stringified vmid too.
@@ -665,6 +704,7 @@ mod real {
             ssh_host_key_fps,
             image,
             status,
+            mode,
             vmid,
         })
     }
@@ -744,6 +784,7 @@ foreign-thing              lxc      some/other:img     running  0
             assert_eq!(s.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
             assert_eq!(s.image, "registry/loom:1");
             assert_eq!(s.status, "running");
+            assert_eq!(s.mode, Mode::Lxc, "pve-lxc collapses to Lxc");
             assert_eq!(s.vmid, Some(10010));
             // Flattened + sorted fingerprint values (map order not trusted).
             assert_eq!(
@@ -785,6 +826,7 @@ foreign-thing              lxc      some/other:img     running  0
             assert!(s.ssh_host_key_fps.is_empty());
             assert_eq!(s.vmid, None, "non-PVE backend ⇒ no vmid");
             assert_eq!(s.status, "stopped");
+            assert_eq!(s.mode, Mode::Lxc, "lxc mode ⇒ Lxc");
         }
 
         #[test]
@@ -809,6 +851,20 @@ foreign-thing              lxc      some/other:img     running  0
             let s = parse_kento_inspect(json).unwrap();
             assert_eq!(s.guid, None);
             assert_eq!(s.owner, None);
+            assert_eq!(s.mode, Mode::Vm, "vm mode ⇒ Vm");
+        }
+
+        #[test]
+        fn parse_inspect_mode_absent_or_unrecognized_defaults_lxc() {
+            // No `.mode` at all, and an unrecognized backend label, both fall
+            // back to the safe Lxc default.
+            let absent = r#"{"name":"n","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(parse_kento_inspect(absent).unwrap().mode, Mode::Lxc);
+            let weird = r#"{"name":"n","mode":"podman","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(parse_kento_inspect(weird).unwrap().mode, Mode::Lxc);
+            // pve-vm collapses to the vm family.
+            let pve_vm = r#"{"name":"n","mode":"pve-vm","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(parse_kento_inspect(pve_vm).unwrap().mode, Mode::Vm);
         }
 
         #[test]
@@ -858,6 +914,7 @@ foreign-thing              lxc      some/other:img     running  0
             assert_eq!(s.guid.as_deref(), Some("g-bob"));
             assert_eq!(s.owner.as_deref(), Some("bob"));
             assert_eq!(s.mac.as_deref(), Some("12:34:56:78:9a:bc"));
+            assert_eq!(s.mode, Mode::Vm);
             assert_eq!(s.vmid, Some(10011));
             assert_eq!(
                 s.ssh_host_key_fps,
@@ -918,6 +975,7 @@ mod tests {
             owner: "alice".into(),
             ssh_key_file: None,
             ssh_key_user: "root".into(),
+            allow_nesting: false,
         }
     }
 
@@ -940,11 +998,29 @@ mod tests {
         assert_eq!(i.mac, outcome.mac);
         assert!(!i.ssh_host_key_fps.is_empty());
         assert_eq!(i.ssh_host_key_fps, outcome.ssh_host_key_fps);
+        assert_eq!(i.mode, Mode::Lxc, "realized instance carries the spec mode");
         assert_eq!(outcome.vmid, None);
 
         // Teardown by the realized name removes it.
         k.teardown(&spec.name, Mode::Lxc).unwrap();
         assert!(k.list_instances().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fake_provision_records_allow_nesting() {
+        // The boundary-crossing nesting flag is recorded per provision so a
+        // test can assert it reached the spec. Default false; set true here.
+        let k = FakeKento::new();
+        let mut spec = sample_spec(Mode::Lxc);
+        spec.allow_nesting = true;
+        k.provision(&spec).unwrap();
+        assert_eq!(k.provision_allow_nesting(), vec![true]);
+        assert!(k.provisions()[0].allow_nesting);
+
+        // A second, non-nesting provision appends a `false`, in order.
+        let plain = sample_spec(Mode::Vm);
+        k.provision(&plain).unwrap();
+        assert_eq!(k.provision_allow_nesting(), vec![true, false]);
     }
 
     #[test]

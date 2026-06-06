@@ -27,7 +27,7 @@ use rusqlite::Connection;
 use crate::config::Config;
 use crate::identity::{classify, Classification};
 use crate::kento::{InstanceSignals, Kento};
-use crate::models::{Env, EnvStatus, Mode};
+use crate::models::{Env, EnvStatus};
 use crate::notify::{decide, emit, Event};
 use crate::{store, Error};
 
@@ -192,10 +192,9 @@ fn readopt_orphan(
     let env = Env {
         guid: guid.to_string(),
         vmid: sig.vmid,
-        // kento `InstanceSignals` has no explicit mode; the status text does
-        // not encode it cleanly. Default to Lxc here.
-        // TODO(P4): mode from kento inspect.mode.
-        mode: mode_from_status(&sig.status),
+        // kento reports the backend mode via inspect.mode, surfaced on the
+        // signals — use it directly (no status-text heuristic).
+        mode: sig.mode,
         owner: owner.unwrap_or_else(|| "unknown".to_string()),
         image: sig.image.clone(),
         name: sig.name.clone(),
@@ -239,20 +238,6 @@ fn readopt_orphan(
             ),
         },
     );
-}
-
-/// Best-effort mode guess for a re-adopted orphan from the kento status
-/// text. kento doesn't currently surface the mode cleanly in
-/// `InstanceSignals`, so a status string that mentions `vm` maps to a VM and
-/// everything else defaults to LXC.
-// TODO(P4): mode from kento inspect.mode (drop this heuristic).
-fn mode_from_status(status: &str) -> Mode {
-    let s = status.to_ascii_lowercase();
-    if s.contains("vm") || s.contains("qemu") {
-        Mode::Vm
-    } else {
-        Mode::Lxc
-    }
 }
 
 /// Decide + act on one `ReapEligible` instance: enforce age-floor +
@@ -439,6 +424,7 @@ images:
             ssh_host_key_fps: env.ssh_host_key_fps.clone(),
             image: env.image.clone(),
             status: "running vm".to_string(),
+            mode: env.mode,
             vmid: env.vmid,
         }
     }
@@ -516,6 +502,7 @@ images:
             ssh_host_key_fps: Vec::new(),
             image: "loom".into(),
             status: "running lxc".into(),
+            mode: Mode::Lxc,
             vmid: None,
         };
         let k = FakeKento::new();
@@ -623,6 +610,7 @@ images:
             ssh_host_key_fps: vec!["SHA256:hk".into()],
             image: "loom".into(),
             status: "running lxc".into(),
+            mode: Mode::Lxc,
             vmid: None,
         };
         let k = FakeKento::new();
@@ -641,12 +629,12 @@ images:
         assert_eq!(env.status, EnvStatus::Active);
         assert_eq!(env.owner, "bob");
         assert_eq!(env.name, "seadog-bob-p-orph");
-        assert_eq!(env.mode, Mode::Lxc, "non-vm status defaults to LXC");
         assert_eq!(env.created_at, now);
         assert_eq!(
             env.ttl_deadline,
             now + c.lifecycle.default_ttl.as_secs() as i64
         );
+        assert_eq!(env.mode, Mode::Lxc, "re-adopt uses sig.mode (Lxc)");
         assert_eq!(env.mac, "02:aa:bb:cc:dd:ee");
         assert_eq!(env.ip, "");
     }
@@ -664,6 +652,7 @@ images:
             ssh_host_key_fps: Vec::new(),
             image: "loom".into(),
             status: "running vm".into(),
+            mode: Mode::Vm,
             vmid: Some(123),
         };
         let k = FakeKento::new();
@@ -672,7 +661,7 @@ images:
         sweep(&k, &conn, &c, now).unwrap();
         let env = store::get_env(&conn, "orph2").unwrap().unwrap();
         assert_eq!(env.owner, "unknown");
-        assert_eq!(env.mode, Mode::Vm, "vm status maps to VM mode");
+        assert_eq!(env.mode, Mode::Vm, "re-adopt uses sig.mode (Vm)");
         assert_eq!(env.vmid, Some(123));
         assert_eq!(env.mac, "");
     }
@@ -691,6 +680,7 @@ images:
             ssh_host_key_fps: Vec::new(),
             image: "other".into(),
             status: "running".into(),
+            mode: Mode::Lxc,
             vmid: None,
         };
         let k = FakeKento::new();

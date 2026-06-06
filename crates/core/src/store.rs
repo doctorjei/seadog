@@ -408,6 +408,29 @@ pub fn set_mac(conn: &Connection, guid: &str, mac: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Record the realized provision signals on an env row in one UPDATE: the
+/// effective `mac`, the kento-reported `ssh_host_key_fps` (comma-joined via
+/// [`join_fps`]), and the backend `vmid` (`None` → NULL). The front-end calls
+/// this once after `provision` returns the [`ProvisionOutcome`](crate::kento::ProvisionOutcome),
+/// replacing the older single-field `set_mac` post-elevate write. Mirrors
+/// [`set_mac`]'s missing-row behavior: `NotFound` if the `guid` has no row.
+pub fn set_provision_signals(
+    conn: &Connection,
+    guid: &str,
+    mac: &str,
+    ssh_host_key_fps: &[String],
+    vmid: Option<u32>,
+) -> Result<(), Error> {
+    let n = conn.execute(
+        "UPDATE envs SET mac = ?1, ssh_host_key_fps = ?2, vmid = ?3 WHERE guid = ?4",
+        params![mac, join_fps(ssh_host_key_fps), vmid, guid],
+    )?;
+    if n == 0 {
+        return Err(Error::NotFound(format!("env guid '{guid}'")));
+    }
+    Ok(())
+}
+
 /// Transition an env to `Vanished` (guest disappeared from PVE).
 pub fn mark_vanished(conn: &Connection, guid: &str) -> Result<(), Error> {
     set_status(conn, guid, EnvStatus::Vanished)
@@ -632,6 +655,38 @@ images:
             get_notify_state(&conn, "vmid-9999").unwrap().is_some(),
             "foreign notify_state must survive prune"
         );
+    }
+
+    /// `set_provision_signals` updates mac + fps + vmid in one shot, and
+    /// errors when no row matches the guid.
+    #[test]
+    fn set_provision_signals_roundtrips_and_errors_on_missing() {
+        let conn = open_in_memory().unwrap();
+        // Seed a row with no fps and a placeholder mac/vmid.
+        let mut e = env("ps", EnvStatus::Active, 5000);
+        e.mac = String::new();
+        e.ssh_host_key_fps = Vec::new();
+        e.vmid = None;
+        insert_env(&conn, &e).unwrap();
+
+        let fps = vec!["SHA256:a".to_string(), "SHA256:b".to_string()];
+        set_provision_signals(&conn, "ps", "aa:bb:cc:dd:ee:ff", &fps, Some(10042)).unwrap();
+
+        let got = get_env(&conn, "ps").unwrap().unwrap();
+        assert_eq!(got.mac, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(got.ssh_host_key_fps, fps);
+        assert_eq!(got.vmid, Some(10042));
+
+        // A None vmid writes NULL (reads back None); empty fps → empty Vec.
+        set_provision_signals(&conn, "ps", "", &[], None).unwrap();
+        let got = get_env(&conn, "ps").unwrap().unwrap();
+        assert_eq!(got.mac, "");
+        assert!(got.ssh_host_key_fps.is_empty());
+        assert_eq!(got.vmid, None);
+
+        // Missing guid → NotFound (mirrors set_mac).
+        let err = set_provision_signals(&conn, "nope", "x", &fps, Some(1)).unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
     }
 
     // --- migration engine ---

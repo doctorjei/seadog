@@ -191,6 +191,37 @@ images:
 }
 
 #[test]
+fn nesting_ok_for_ref_revalidates_against_allowlist() {
+    // The same OCI ref listed under two aliases with DIFFERENT allow_nesting,
+    // plus a third entry that omits allow_nesting (⇒ false). The helper
+    // re-validates a requested value by (ref, allow_nesting) pair.
+    let yaml = r#"
+images:
+  plain:  { ref: r/stuff:1, modes: [vm], allow_nesting: false }
+  nested: { ref: r/nested:1, modes: [vm], allow_nesting: true }
+  bare:   { ref: r/bare:1, modes: [lxc] }
+"#;
+    let cfg = Config::from_yaml_str(yaml).expect("parse");
+    cfg.validate().expect("validates");
+
+    // allow_nesting: true entry — only `requested == true` matches its ref.
+    assert!(cfg.nesting_ok_for_ref("r/nested:1", true));
+    assert!(!cfg.nesting_ok_for_ref("r/nested:1", false));
+
+    // allow_nesting: false entry — only `requested == false` matches.
+    assert!(cfg.nesting_ok_for_ref("r/stuff:1", false));
+    assert!(!cfg.nesting_ok_for_ref("r/stuff:1", true));
+
+    // Omitted allow_nesting defaults to false: only false matches.
+    assert!(cfg.nesting_ok_for_ref("r/bare:1", false));
+    assert!(!cfg.nesting_ok_for_ref("r/bare:1", true));
+
+    // A ref that matches no entry never validates, for either request.
+    assert!(!cfg.nesting_ok_for_ref("r/unmatched:1", true));
+    assert!(!cfg.nesting_ok_for_ref("r/unmatched:1", false));
+}
+
+#[test]
 fn rejects_empty_images() {
     // images omitted entirely -> defaults to an empty map -> invalid.
     let yaml = "reaper_enabled: true\n";

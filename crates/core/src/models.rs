@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 /// Serializes lowercase (`"lxc"` / `"vm"`) so the YAML `modes:` lists in
 /// the image allowlist and the SQLite `mode` column share one
 /// representation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Proxmox LXC container (`pct`).
+    #[default]
     Lxc,
     /// Full virtual machine (`qm`).
     Vm,

@@ -188,6 +188,7 @@ mod tests {
             ssh_host_key_fps: vec!["SHA256:host-ed25519".to_string()],
             image: "loom".to_string(),
             status: "running".to_string(),
+            mode: Mode::Vm,
             vmid: Some(10010),
         }
     }

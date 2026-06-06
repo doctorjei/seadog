@@ -169,6 +169,14 @@ pub struct Image {
     /// of this image. When unset, the top-level `default_user` applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Whether nesting is permitted for guests served from this catalog
+    /// entry — mode-agnostic (VM→VM nesting / nested virt, container→
+    /// container nesting). `None`/absent ⇒ false (kento's default applies).
+    /// Selected per-alias by the front-end and re-validated against the
+    /// allowlist via [`Config::nesting_ok_for_ref`] (the same OCI ref may be
+    /// listed under two aliases with different `allow_nesting`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_nesting: Option<bool>,
 }
 
 /// Per-owner cap override block (all fields optional).
@@ -338,6 +346,21 @@ impl Config {
             .find(|img| img.image_ref == image_ref)
             .and_then(|img| img.user.clone())
             .unwrap_or_else(|| self.default_user.clone())
+    }
+
+    /// Re-validate a requested `allow_nesting` value across the privilege
+    /// boundary: the front-end resolves nesting from the served *alias* but
+    /// passes only the OCI *ref* to `seadog-priv`, and the same ref may be
+    /// listed under two aliases with different `allow_nesting`. So the helper
+    /// cannot trust the requested value alone — it confirms SOME image entry
+    /// exists whose `ref` equals `image_ref` AND whose effective
+    /// `allow_nesting` (absent ⇒ false) equals `requested`. Returns true iff
+    /// such an entry exists. This is the gate `provision` checks before
+    /// setting `ProvisionSpec.allow_nesting`.
+    pub fn nesting_ok_for_ref(&self, image_ref: &str, requested: bool) -> bool {
+        self.images.values().any(|img| {
+            img.image_ref == image_ref && img.allow_nesting.unwrap_or(false) == requested
+        })
     }
 }
 
