@@ -279,7 +279,7 @@ impl Kento for FakeKento {
 }
 
 // --- RealKento: behind the `real-kento` feature so the lib builds with
-//     zero external tools by default. Not exercised by tests (no real PVE host),
+//     zero external tools by default. Not exercised by tests (no real host),
 //     but it MUST compile under `--features real-kento`. ---
 #[cfg(feature = "real-kento")]
 pub use real::RealKento;
@@ -292,21 +292,27 @@ mod real {
     use wait_timeout::ChildExt;
 
     use super::*;
-    use crate::identity::Fingerprint;
 
-    /// Per-op hard timeout. `qm`/`pct` are Perl and can wedge on a sick
-    /// cluster; we kill on expiry rather than block the sweep forever.
+    /// Per-op hard timeout. `kento` (Python) shells out to lxc/qemu/pct/qm
+    /// underneath and can wedge on a sick cluster; we kill on expiry rather
+    /// than block the sweep forever.
     const OP_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// Fixed PATH set before exec. `qm`/`pct` honor `PATH`/`PERL5LIB`, so
-    /// we `env_clear()` and pin a known-good search path to avoid
-    /// hijacking via the ambient environment. `kento` installs to
-    /// `/usr/local/bin` (while `qm`/`pct`/`pvesh` live in `/usr/sbin`/
-    /// `/usr/bin`), so the pinned path mirrors root's standard PATH and
-    /// includes the `/usr/local` bins — all root-owned system dirs.
+    /// Fixed PATH set before exec. We `env_clear()` and pin a known-good
+    /// search path to avoid hijacking via the ambient environment. `kento`
+    /// installs to `/usr/local/bin`, so the pinned path mirrors root's
+    /// standard PATH and includes the `/usr/local` bins — all root-owned
+    /// system dirs. (kento itself reaches the backend tools — pct/qm/lxc/
+    /// qemu — so seadog only ever spawns `kento`.)
     const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
     /// Substrings that mark a pmxcfs quorum-loss / read-only condition.
+    /// kento runs on PVE backends (pve-lxc/pve-vm), where a corosym
+    /// partition still drops pmxcfs to read-only and surfaces the same
+    /// kernel/cluster wording through the failing `kento` invocation, so we
+    /// keep mapping these to [`Error::QuorumLost`] (the sweep stops cleanly
+    /// instead of spinning). On non-PVE backends these markers simply never
+    /// appear, so the check is harmless there.
     const QUORUM_MARKERS: &[&str] = &[
         "no quorum",
         "cluster not ready",
@@ -314,9 +320,10 @@ mod real {
         "permission denied - not part of cluster",
     ];
 
-    /// The shelling-out [`Kento`]: runs `qm`/`pct`/`kento` as argv
-    /// vectors (never a shell string), with a cleared environment, a
-    /// pinned PATH, and a per-op hard timeout.
+    /// The shelling-out [`Kento`]: runs `kento` as an argv vector (never a
+    /// shell string), with a cleared environment, a pinned PATH, and a
+    /// per-op hard timeout. No `pvesh`/`qm`/`pct` — every backend op goes
+    /// through `kento`.
     #[derive(Debug)]
     pub struct RealKento {
         /// The program name/path used to invoke `kento`. Bare `"kento"`
@@ -352,10 +359,11 @@ mod real {
             }
         }
 
-        /// Run `program argv…` to completion under the safety harness,
+        /// Run `kento argv…` to completion under the safety harness,
         /// returning stdout. Maps a quorum-loss signature to
         /// [`Error::QuorumLost`] and a timeout to [`Error::Kento`].
-        fn run(&self, program: &str, argv: &[&str]) -> Result<String, Error> {
+        fn run(&self, argv: &[&str]) -> Result<String, Error> {
+            let program = &self.kento_bin;
             let mut cmd = Command::new(program);
             cmd.args(argv)
                 .env_clear()
@@ -412,38 +420,27 @@ mod real {
     }
 
     impl Kento for RealKento {
-        fn list_guests(&self, vmid_range: (u32, u32)) -> Result<Vec<GuestSignals>, Error> {
-            // Strategy (proven against the fake-PVE harness):
-            //   1. `pvesh get /cluster/resources --output-format json` gives
-            //      the authoritative vmid + type (qemu|lxc) list for the
-            //      whole cluster. A quorum-loss surfaces here.
-            //   2. For each in-range guest, read its full config via
-            //      `qm config <vmid>` (VM) / `pct config <vmid>` (LXC) and
-            //      parse it into the `GuestSignals` the sweeper triangulates
-            //      on (name, description marker block, net0 MAC, fingerprint
-            //      hardware fields).
-            // The parsing is split into pure functions
-            // (`parse_resources` / `parse_guest_config`) so it is unit-tested
-            // on sample strings with no real command in the loop.
-            let resources_json = self.run(
-                "pvesh",
-                &["get", "/cluster/resources", "--output-format", "json"],
-            )?;
-            let (lo, hi) = vmid_range;
-            let entries = parse_resources(&resources_json)
-                .map_err(|e| Error::Kento(format!("parsing /cluster/resources: {e}")))?;
+        fn list_instances(&self) -> Result<Vec<InstanceSignals>, Error> {
+            // Strategy (kento-only — no pvesh/qm/pct):
+            //   1. `kento list` enumerates the kento-managed instances as a
+            //      columnar table (NAME col first). A quorum-loss surfaces
+            //      here. `kento` only sees its own instances, so the live set
+            //      IS the kento list — no vmid-range scan.
+            //   2. For each NAME, `kento inspect <name> --json` emits a stable
+            //      dict we parse into the `InstanceSignals` the sweeper
+            //      classifies on (guid/owner from the injected env, mac,
+            //      host-key fps, image, status, vmid).
+            // Parsing is split into pure functions (`parse_kento_list` /
+            // `parse_kento_inspect`) so they are unit-tested on sample output
+            // with no real command in the loop.
+            let list_out = self.run(&["list"])?;
+            let names = parse_kento_list(&list_out);
 
-            let mut out = Vec::new();
-            for entry in entries {
-                if entry.vmid < lo || entry.vmid > hi {
-                    continue;
-                }
-                let vmid_s = entry.vmid.to_string();
-                let config_text = match entry.mode {
-                    Mode::Lxc => self.run("pct", &["config", &vmid_s])?,
-                    Mode::Vm => self.run("qm", &["config", &vmid_s])?,
-                };
-                let signals = parse_guest_config(entry.vmid, &config_text);
+            let mut out = Vec::with_capacity(names.len());
+            for name in names {
+                let json = self.run(&["inspect", &name, "--json"])?;
+                let signals = parse_kento_inspect(&json)
+                    .map_err(|e| Error::Kento(format!("parsing inspect {name}: {e}")))?;
                 out.push(signals);
             }
             Ok(out)
@@ -451,33 +448,33 @@ mod real {
 
         fn teardown(&self, name: &str, mode: Mode) -> Result<(), Error> {
             // `kento` destroys BY INSTANCE NAME (not vmid), so its overlay
-            // state is cleaned alongside the PVE guest. `-f` forces a running
-            // instance. The name is the one teardown read from live PVE.
+            // state is cleaned alongside the backend guest. `-f` forces a
+            // running instance. The name is the one teardown read from the
+            // live `kento list`.
             let mode = mode.as_str();
-            self.run(&self.kento_bin, &[mode, "destroy", "-f", name])
-                .map(|_| ())
+            self.run(&[mode, "destroy", "-f", name]).map(|_| ())
         }
 
         fn provision(&self, spec: &ProvisionSpec) -> Result<ProvisionOutcome, Error> {
             // kento OWNS networking/ssh/start: one `kento <mode> create`
-            // attaches the bridge, assigns the IP/gateway, injects ssh host
-            // keys, and starts the guest. `--mac` is VM-ONLY (LXC auto-
-            // assigns and does not expose the MAC via `pct config`), so we
-            // only pass it for a VM; for an LXC the read-back yields no MAC.
-            // Then we stamp the seadog markers
-            // (name is already set by --name; description via qm/pct set) so
-            // teardown can later triangulate. Not exercised by tests (no real
-            // PVE host) but MUST compile under `--features real-kento`.
+            // attaches the bridge, assigns the IP/gateway, generates ssh host
+            // keys, injects the owner key, and starts the guest. The seadog
+            // identity anchor rides as injected env (`--env SEADOG_GUID=… --env
+            // SEADOG_OWNER=…`) — create-time-immutable, replacing the old PVE
+            // description marker. `--vmid` is omitted entirely (kento auto-
+            // assigns where the backend has one). `--mac` is VM-ONLY (kento
+            // rejects it for LXC). Then we read the realized signals back via
+            // `kento inspect --json`. Not exercised by tests (no real host) but
+            // MUST compile under `--features real-kento`.
             let mode = spec.mode.as_str();
-            let vmid = spec.vmid.to_string();
             let network = format!("bridge={}", spec.bridge);
             let ip_cidr = format!("{}/{}", spec.ip, spec.prefix);
+            let guid_env = format!("SEADOG_GUID={}", spec.guid);
+            let owner_env = format!("SEADOG_OWNER={}", spec.owner);
 
             let mut argv: Vec<&str> = vec![
                 mode,
                 "create",
-                "--vmid",
-                &vmid,
                 "--name",
                 &spec.name,
                 "--network",
@@ -488,6 +485,10 @@ mod real {
                 &spec.gateway,
                 "--ssh-host-keys",
                 "--start",
+                "--env",
+                &guid_env,
+                "--env",
+                &owner_env,
             ];
             // Inject the OWNER's pubkey(s) so they can SSH into their env.
             // `--config-mode auto` lets kento pick injection (lxc) vs
@@ -505,472 +506,369 @@ mod real {
                 argv.push("--config-mode");
                 argv.push("auto");
             }
-            // VM-only MAC: LXC rejects --mac (kento auto-assigns it).
+            // VM-only MAC: kento rejects --mac for LXC (it auto-assigns one).
+            // kento still reports the realized MAC for BOTH modes via inspect.
             if spec.mode == Mode::Vm {
                 argv.push("--mac");
                 argv.push(&spec.mac);
             }
             // The image ref is the final positional argument.
             argv.push(&spec.image_ref);
-            self.run(&self.kento_bin, &argv)?;
+            self.run(&argv)?;
 
-            // Stamp the seadog description marker block (qm/pct set). --name
-            // already set the guest name at create.
-            let desc = spec.description_marker();
-            match spec.mode {
-                Mode::Lxc => self.run("pct", &["set", &vmid, "--description", &desc])?,
-                Mode::Vm => self.run("qm", &["set", &vmid, "--description", &desc])?,
-            };
-
-            // Effective MAC: `Some` the minted MAC for a VM. For an LXC the
-            // MAC is unobservable via `pct config` (kento LXC), so the
-            // read-back parser yields `None` — and we record exactly that
-            // (no fabricated fallback). The front-end maps `None` → `""`.
-            let effective_mac = match spec.mode {
-                Mode::Vm => Some(spec.mac.clone()),
-                Mode::Lxc => {
-                    let cfg = self.run("pct", &["config", &vmid])?;
-                    parse_guest_config(spec.vmid, &cfg).mac
-                }
-            };
-            Ok(ProvisionOutcome { mac: effective_mac })
-        }
-
-        fn set_meta(&self, vmid: u32, mode: Mode, meta: &MetaUpdate) -> Result<(), Error> {
-            let vmid = vmid.to_string();
-            let mut args: Vec<String> = vec!["set".to_string(), vmid];
-            if let Some(desc) = &meta.description {
-                args.push("--description".to_string());
-                args.push(desc.clone());
-            }
-            if let Some(ttl) = meta.ttl_deadline {
-                // Carried in a tag so it survives PVE round-tripping.
-                args.push("--tags".to_string());
-                args.push(format!("seadog-ttl-{ttl}"));
-            }
-            if args.len() == 2 {
-                // Nothing to set.
-                return Ok(());
-            }
-            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-            match mode {
-                Mode::Lxc => self.run("pct", &argv).map(|_| ()),
-                Mode::Vm => self.run("qm", &argv).map(|_| ()),
-            }
-        }
-
-        fn start_sshd(&self, vmid: u32) -> Result<(), Error> {
-            let vmid = vmid.to_string();
-            // Narrow exec: start the in-CT sshd only. LXC-only by contract.
-            self.run("pct", &["exec", &vmid, "--", "systemctl", "start", "ssh"])
-                .map(|_| ())
+            // Read the realized signals back. kento now reports the MAC for
+            // both LXC and VM, the host-key fps it generated, and the vmid on
+            // PVE backends — exactly the fields the front-end records.
+            let json = self.run(&["inspect", &spec.name, "--json"])?;
+            let signals = parse_kento_inspect(&json)
+                .map_err(|e| Error::Kento(format!("parsing inspect {}: {e}", spec.name)))?;
+            Ok(ProvisionOutcome {
+                mac: signals.mac,
+                ssh_host_key_fps: signals.ssh_host_key_fps,
+                vmid: signals.vmid,
+            })
         }
     }
 
     // --- Pure parsers (no exec): unit-testable on sample strings. ---
 
-    /// One in-range guest the resource enumeration found: its vmid and
-    /// whether it is a VM (`qemu`) or a container (`lxc`), which selects
-    /// `qm config` vs `pct config` for the per-guest read.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct ResourceEntry {
-        /// Proxmox guest id.
-        pub vmid: u32,
-        /// LXC or VM, mapped from the resource `type` field.
-        pub mode: Mode,
-    }
-
-    /// Parse the JSON `pvesh get /cluster/resources --output-format json`
-    /// emits into the (vmid, mode) list seadog needs. Only `type` ∈
-    /// {`qemu`, `lxc`} rows that carry a `vmid` are kept; storage/node rows
-    /// and any other type are skipped. Robust to extra fields PVE adds.
-    pub fn parse_resources(json: &str) -> Result<Vec<ResourceEntry>, String> {
-        let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
-        let arr = value
-            .as_array()
-            .ok_or_else(|| "expected a top-level JSON array".to_string())?;
+    /// Parse the NAME column out of `kento list`'s columnar output.
+    ///
+    /// `kento list` prints a header row (`NAME  TYPE  IMAGE  STATUS  UPPER
+    /// SIZE`), a separator row of dashes, then one space-padded row per
+    /// instance — NAME is the first column. When there are no instances it
+    /// prints a single `(no instances found)` line. seadog names never
+    /// contain whitespace (`seadog-<owner>-<shortproj>-<token>`, a DNS
+    /// label), so the first whitespace-delimited token of each data row is
+    /// the instance name. We skip the header, the dash separator, and the
+    /// empty-set sentinel.
+    pub fn parse_kento_list(text: &str) -> Vec<String> {
         let mut out = Vec::new();
-        for item in arr {
-            let ty = match item.get("type").and_then(|v| v.as_str()) {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Empty-set sentinel.
+            if trimmed == "(no instances found)" {
+                continue;
+            }
+            let first = match trimmed.split_whitespace().next() {
                 Some(t) => t,
                 None => continue,
             };
-            let mode = match ty {
-                "qemu" => Mode::Vm,
-                "lxc" => Mode::Lxc,
-                // node / storage / sdn / pool rows have no vmid we care about.
-                _ => continue,
-            };
-            // `vmid` is a number in the API output.
-            let vmid = match item.get("vmid").and_then(|v| v.as_u64()) {
-                Some(n) => n as u32,
-                None => continue,
-            };
-            out.push(ResourceEntry { vmid, mode });
-        }
-        Ok(out)
-    }
-
-    /// Parse the `key: value` text `qm config <vmid>` / `pct config <vmid>`
-    /// emit into [`GuestSignals`]. The two tools share enough of this format
-    /// that one parser handles both:
-    ///
-    /// - **name**: `name:` (VM) or `hostname:` (CT).
-    /// - **description**: `description:` — PVE URL-encodes newlines as `%0A`
-    ///   when set via `--description`, so we percent-decode it back so the
-    ///   `seadog-guid:`/`seadog-owner:` marker lines re-appear on their own
-    ///   lines for [`crate::identity::extract_desc_guid`] etc.
-    /// - **mac**: from `net0:` — the `hwaddr=<mac>` (CT) or the
-    ///   `<model>=<mac>` leading token (VM).
-    /// - **fingerprint**: bridge/vlan/model from `net0:`; disk geometry+size
-    ///   from `scsi0:`/`rootfs:`; machine/bios/scsihw/memory/cores from their
-    ///   own keys. Absent fields stay `None` (never read as a match).
-    pub fn parse_guest_config(vmid: u32, text: &str) -> GuestSignals {
-        let mut name = None;
-        let mut hostname = None;
-        let mut description = None;
-        let mut net0 = None;
-        let mut scsi0 = None;
-        let mut rootfs = None;
-        let mut fp = Fingerprint::default();
-
-        for line in text.lines() {
-            let line = line.trim_end();
-            let (key, val) = match line.split_once(':') {
-                Some((k, v)) => (k.trim(), v.trim()),
-                None => continue,
-            };
-            match key {
-                "name" => name = nonempty(val),
-                "hostname" => hostname = nonempty(val),
-                "description" => description = nonempty(val).map(|v| pve_unescape(&v)),
-                "net0" => net0 = nonempty(val),
-                "scsi0" | "virtio0" | "sata0" | "ide0" => {
-                    if scsi0.is_none() {
-                        scsi0 = nonempty(val);
-                    }
-                }
-                "rootfs" => rootfs = nonempty(val),
-                "machine" => fp.machine_type = nonempty(val),
-                "bios" => fp.bios = nonempty(val),
-                "scsihw" => fp.scsihw = nonempty(val),
-                "memory" => fp.memory = val.trim().parse::<u64>().ok(),
-                "cores" => fp.cores = val.trim().parse::<u32>().ok(),
-                _ => {}
-            }
-        }
-
-        // Fill the network fingerprint + MAC from net0.
-        let mut mac = None;
-        if let Some(n) = &net0 {
-            let parsed = parse_net0(n);
-            mac = parsed.mac;
-            fp.net_bridge = parsed.bridge;
-            fp.net_vlan = parsed.vlan;
-            fp.net_model = parsed.model;
-        }
-
-        // Disk geometry + size from the first disk-ish key we saw (VM) or
-        // the rootfs (CT).
-        if let Some(disk) = scsi0.as_ref().or(rootfs.as_ref()) {
-            let parsed = parse_disk(disk);
-            fp.disk_geometry = parsed.geometry;
-            fp.disk_size = parsed.size_bytes;
-        }
-
-        GuestSignals {
-            vmid,
-            name: name.or(hostname),
-            description,
-            mac,
-            fingerprint: fp,
-        }
-    }
-
-    /// `Some(trimmed)` unless the value is empty.
-    fn nonempty(v: &str) -> Option<String> {
-        let v = v.trim();
-        if v.is_empty() {
-            None
-        } else {
-            Some(v.to_string())
-        }
-    }
-
-    /// Decode the small set of percent-escapes PVE applies to a
-    /// `--description` body (notably `%0A` for newline) so the marker lines
-    /// split back out. Unknown/short escapes are left verbatim.
-    fn pve_unescape(s: &str) -> String {
-        let bytes = s.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%' && i + 2 < bytes.len() {
-                let hex = &s[i + 1..i + 3];
-                if let Ok(b) = u8::from_str_radix(hex, 16) {
-                    out.push(b);
-                    i += 3;
-                    continue;
-                }
-            }
-            out.push(bytes[i]);
-            i += 1;
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    }
-
-    /// The pieces we pull out of a `net0:` line.
-    struct Net0 {
-        mac: Option<String>,
-        bridge: Option<String>,
-        vlan: Option<u32>,
-        model: Option<String>,
-    }
-
-    /// Parse a PVE `net0:` value. Two shapes:
-    /// - VM: `virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,tag=10`
-    /// - CT: `name=eth0,bridge=vmbr0,hwaddr=AA:BB:..,ip=...,tag=10,type=veth`
-    fn parse_net0(val: &str) -> Net0 {
-        let mut mac = None;
-        let mut bridge = None;
-        let mut vlan = None;
-        let mut model = None;
-        for part in val.split(',') {
-            let part = part.trim();
-            let (k, v) = match part.split_once('=') {
-                Some((k, v)) => (k.trim(), v.trim()),
-                None => continue,
-            };
-            match k {
-                "bridge" => bridge = nonempty(v),
-                "tag" => vlan = v.parse::<u32>().ok(),
-                "hwaddr" => mac = normalize_mac(v),
-                // VM model token: `<model>=<mac>` (e.g. `virtio=AA:..`).
-                "virtio" | "e1000" | "rtl8139" | "vmxnet3" | "i82551" | "i82557b" => {
-                    model = nonempty(k);
-                    if mac.is_none() {
-                        mac = normalize_mac(v);
-                    }
-                }
-                // CT NIC model is the `type=` (veth); record it as the model
-                // only if we have not already learned a VM model token.
-                "type" if model.is_none() => model = nonempty(v),
-                _ => {}
-            }
-        }
-        Net0 {
-            mac,
-            bridge,
-            vlan,
-            model,
-        }
-    }
-
-    /// Lowercase a MAC if it looks like one, else `None`.
-    fn normalize_mac(v: &str) -> Option<String> {
-        let v = v.trim();
-        if v.split(':').count() == 6 && v.chars().all(|c| c.is_ascii_hexdigit() || c == ':') {
-            Some(v.to_ascii_lowercase())
-        } else {
-            None
-        }
-    }
-
-    /// What we read off a disk line.
-    struct Disk {
-        geometry: Option<String>,
-        size_bytes: Option<u64>,
-    }
-
-    /// Parse a disk line like
-    /// `local-lvm:vm-10010-disk-0,size=20G` (VM) or
-    /// `local:10010/vm-10010-disk-0.raw,size=8G` (CT rootfs). The volume id
-    /// (the first comma-field) is the geometry signature; `size=` is decoded
-    /// to bytes.
-    fn parse_disk(val: &str) -> Disk {
-        let mut geometry = None;
-        let mut size_bytes = None;
-        for (i, part) in val.split(',').enumerate() {
-            let part = part.trim();
-            if i == 0 {
-                geometry = nonempty(part);
+            // Header row: first column is the literal "NAME".
+            if first == "NAME" {
                 continue;
             }
-            if let Some(sz) = part.strip_prefix("size=") {
-                size_bytes = parse_size(sz);
+            // Separator row: all dashes.
+            if first.chars().all(|c| c == '-') {
+                continue;
             }
+            out.push(first.to_string());
         }
-        Disk {
-            geometry,
-            size_bytes,
-        }
+        out
     }
 
-    /// Decode a PVE size string (`512`, `8G`, `20480M`, `1T`, `100K`) to
-    /// bytes. A bare number is bytes.
-    fn parse_size(s: &str) -> Option<u64> {
-        let s = s.trim();
-        if s.is_empty() {
-            return None;
-        }
-        let (num, mult): (&str, u64) = match s.chars().last() {
-            Some('K') | Some('k') => (&s[..s.len() - 1], 1024),
-            Some('M') | Some('m') => (&s[..s.len() - 1], 1024 * 1024),
-            Some('G') | Some('g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
-            Some('T') | Some('t') => (&s[..s.len() - 1], 1024 * 1024 * 1024 * 1024),
-            _ => (s, 1),
+    /// Parse `kento inspect <name> --json` into [`InstanceSignals`].
+    ///
+    /// kento emits a stable dict (`json.dumps(data, indent=2)`); fields that
+    /// are unset are simply absent (kento never emits an empty `mac`/`vmid`),
+    /// so absence maps cleanly to `None`/empty. Mapping:
+    /// - `guid` / `owner` ← the `environment[]` `KEY=VALUE` lines, keyed on
+    ///   `SEADOG_GUID` / `SEADOG_OWNER`. Absent `SEADOG_GUID` ⇒ `None` ⇒ the
+    ///   instance is **foreign** (no seadog anchor).
+    /// - `mac` ← `.mac` (absent ⇒ `None`).
+    /// - `ssh_host_key_fps` ← the values of the
+    ///   `.ssh_host_key_fingerprints` `{type: fp}` dict, sorted for a stable
+    ///   order (the map is unordered in JSON).
+    /// - `image` ← `.image`; `status` ← `.status`.
+    /// - `vmid` ← `.vmid` (present only on PVE backends; informational).
+    ///
+    /// NOTE: kento's inspect also carries `.mode` (lxc/vm/pve-lxc/pve-vm),
+    /// which would let reap recover an orphan's [`Mode`] precisely instead of
+    /// the `mode_from_status` heuristic. `InstanceSignals` is frozen from P3
+    /// (no `mode` field), so this is **deferred** — follow-up: add
+    /// `InstanceSignals.mode` and thread `.mode` through here to retire the
+    /// `mode_from_status` TODO in reap.
+    pub fn parse_kento_inspect(json: &str) -> Result<InstanceSignals, String> {
+        let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| "expected a top-level JSON object".to_string())?;
+
+        let str_field = |key: &str| -> Option<String> {
+            obj.get(key)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
         };
-        num.trim().parse::<u64>().ok().map(|n| n * mult)
+
+        let name = str_field("name").unwrap_or_default();
+        let image = str_field("image").unwrap_or_default();
+        let status = str_field("status").unwrap_or_default();
+        let mac = str_field("mac");
+
+        // vmid is emitted as a JSON number (int) on PVE backends, absent
+        // otherwise. Be lenient about a stringified vmid too.
+        let vmid = obj.get("vmid").and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                .map(|n| n as u32)
+        });
+
+        // environment[] is a list of "KEY=VALUE" strings (absent when no env
+        // was injected). Pull SEADOG_GUID / SEADOG_OWNER out of it.
+        let mut guid = None;
+        let mut owner = None;
+        if let Some(env) = obj.get("environment").and_then(|v| v.as_array()) {
+            for item in env {
+                let entry = match item.as_str() {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let (key, val) = match entry.split_once('=') {
+                    Some((k, v)) => (k, v),
+                    None => continue,
+                };
+                match key {
+                    "SEADOG_GUID" if !val.is_empty() => guid = Some(val.to_string()),
+                    "SEADOG_OWNER" if !val.is_empty() => owner = Some(val.to_string()),
+                    _ => {}
+                }
+            }
+        }
+
+        // ssh_host_key_fingerprints is a {type: fingerprint} map. Flatten its
+        // values; sort for a deterministic order (JSON object order is not
+        // guaranteed) so identity comparison and tests are stable.
+        let mut ssh_host_key_fps = Vec::new();
+        if let Some(fps) = obj
+            .get("ssh_host_key_fingerprints")
+            .and_then(|v| v.as_object())
+        {
+            for v in fps.values() {
+                if let Some(s) = v.as_str() {
+                    if !s.is_empty() {
+                        ssh_host_key_fps.push(s.to_string());
+                    }
+                }
+            }
+            ssh_host_key_fps.sort();
+        }
+
+        Ok(InstanceSignals {
+            name,
+            guid,
+            owner,
+            mac,
+            ssh_host_key_fps,
+            image,
+            status,
+            vmid,
+        })
     }
 
     #[cfg(test)]
     mod parser_tests {
         use super::*;
-        use crate::identity::{extract_desc_guid, extract_desc_owner};
 
         #[test]
-        fn parse_resources_keeps_guests_skips_other_rows() {
-            let json = r#"[
-                {"type":"node","node":"pve","status":"online"},
-                {"type":"storage","storage":"local","node":"pve"},
-                {"type":"qemu","vmid":10010,"node":"pve","name":"seadog-a"},
-                {"type":"lxc","vmid":10011,"node":"pve","name":"seadog-b"},
-                {"type":"qemu","vmid":105,"node":"pve","name":"prod"},
-                {"type":"pool","pool":"p"}
-            ]"#;
-            let entries = parse_resources(json).unwrap();
+        fn parse_list_extracts_name_column_skips_header_and_separator() {
+            // The exact shape `kento list` prints: header, dash separator,
+            // then space-padded rows. NAME is the first column.
+            let text = "\
+NAME                       TYPE     IMAGE              STATUS   UPPER SIZE
+-------------------------  -------  -----------------  -------  ----------
+seadog-alice-proj-ab12     pve-lxc  registry/loom:1    running  1.2M
+seadog-bob-proj-cd34       vm       registry/stuff:2   stopped  512K
+foreign-thing              lxc      some/other:img     running  0
+";
+            let names = parse_kento_list(text);
             assert_eq!(
-                entries,
+                names,
                 vec![
-                    ResourceEntry {
-                        vmid: 10010,
-                        mode: Mode::Vm
-                    },
-                    ResourceEntry {
-                        vmid: 10011,
-                        mode: Mode::Lxc
-                    },
-                    ResourceEntry {
-                        vmid: 105,
-                        mode: Mode::Vm
-                    },
+                    "seadog-alice-proj-ab12".to_string(),
+                    "seadog-bob-proj-cd34".to_string(),
+                    "foreign-thing".to_string(),
                 ]
             );
         }
 
         #[test]
-        fn parse_resources_rejects_non_array() {
-            assert!(parse_resources("{}").is_err());
-            assert!(parse_resources("not json").is_err());
+        fn parse_list_empty_set_sentinel_yields_no_names() {
+            assert!(parse_kento_list("(no instances found)\n").is_empty());
+            assert!(parse_kento_list("").is_empty());
+            // Header + separator with no data rows.
+            let text = "NAME  TYPE\n----  ----\n";
+            assert!(parse_kento_list(text).is_empty());
         }
 
         #[test]
-        fn parse_vm_config_populates_signals_and_fingerprint() {
-            // A `qm config` dump, with the description percent-encoded the way
-            // PVE round-trips a `--description` set with embedded newlines.
-            let text = "\
-boot: order=scsi0
-cores: 2
-description: seadog-guid%3Aguid-abc%0Aseadog-owner%3Aalice
-machine: q35
-memory: 2048
-name: seadog-alice-proj-ab12
-net0: virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,tag=10
-scsihw: virtio-scsi-pci
-bios: seabios
-scsi0: local-lvm:vm-10010-disk-0,size=20G
-smbios1: uuid=...
-";
-            let g = parse_guest_config(10010, text);
-            assert_eq!(g.vmid, 10010);
-            assert_eq!(g.name.as_deref(), Some("seadog-alice-proj-ab12"));
-            assert_eq!(g.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
-            // Description decoded so the markers triangulate.
+        fn parse_inspect_ours_maps_guid_owner_mac_fps() {
+            // A kento instance seadog provisioned: SEADOG_GUID/SEADOG_OWNER in
+            // environment[], a realized mac, a vmid (PVE backend), and two
+            // host-key fingerprints.
+            let json = r#"{
+                "name": "seadog-alice-proj-ab12",
+                "image": "registry/loom:1",
+                "mode": "pve-lxc",
+                "type": "LXC",
+                "status": "running",
+                "directory": "/var/lib/kento/lxc/10010",
+                "state_directory": "/var/lib/kento/lxc/10010",
+                "config_mode": "injection",
+                "vmid": 10010,
+                "network": "bridge=vmbr0",
+                "mac": "aa:bb:cc:dd:ee:ff",
+                "ssh_user": "root",
+                "environment": [
+                    "SEADOG_GUID=guid-abc",
+                    "SEADOG_OWNER=alice",
+                    "TERM=xterm"
+                ],
+                "layer_count": 3,
+                "created": "2026-06-06 12:00:00",
+                "ssh_host_key_fingerprints": {
+                    "ecdsa": "SHA256:bbb",
+                    "ed25519": "SHA256:aaa",
+                    "rsa": "SHA256:ccc"
+                },
+                "qemu_args": [],
+                "pve_args": []
+            }"#;
+            let s = parse_kento_inspect(json).unwrap();
+            assert_eq!(s.name, "seadog-alice-proj-ab12");
+            assert_eq!(s.guid.as_deref(), Some("guid-abc"));
+            assert_eq!(s.owner.as_deref(), Some("alice"));
+            assert_eq!(s.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+            assert_eq!(s.image, "registry/loom:1");
+            assert_eq!(s.status, "running");
+            assert_eq!(s.vmid, Some(10010));
+            // Flattened + sorted fingerprint values (map order not trusted).
             assert_eq!(
-                extract_desc_guid(g.description.as_deref()).as_deref(),
-                Some("guid-abc")
+                s.ssh_host_key_fps,
+                vec![
+                    "SHA256:aaa".to_string(),
+                    "SHA256:bbb".to_string(),
+                    "SHA256:ccc".to_string(),
+                ]
             );
-            assert_eq!(
-                extract_desc_owner(g.description.as_deref()).as_deref(),
-                Some("alice")
-            );
-            // Fingerprint fields.
-            assert_eq!(g.fingerprint.net_bridge.as_deref(), Some("vmbr0"));
-            assert_eq!(g.fingerprint.net_vlan, Some(10));
-            assert_eq!(g.fingerprint.net_model.as_deref(), Some("virtio"));
-            assert_eq!(g.fingerprint.machine_type.as_deref(), Some("q35"));
-            assert_eq!(g.fingerprint.bios.as_deref(), Some("seabios"));
-            assert_eq!(g.fingerprint.scsihw.as_deref(), Some("virtio-scsi-pci"));
-            assert_eq!(g.fingerprint.memory, Some(2048));
-            assert_eq!(g.fingerprint.cores, Some(2));
-            assert_eq!(
-                g.fingerprint.disk_geometry.as_deref(),
-                Some("local-lvm:vm-10010-disk-0")
-            );
-            assert_eq!(g.fingerprint.disk_size, Some(20 * 1024 * 1024 * 1024));
         }
 
         #[test]
-        fn parse_ct_config_uses_hostname_and_hwaddr() {
-            // A `pct config` dump: hostname (not name), net0 with hwaddr,
-            // rootfs (not scsi0).
-            let text = "\
-arch: amd64
-cores: 2
-description: seadog-guid%3Ag-ct%0Aseadog-owner%3Aalice
-hostname: seadog-alice-proj-cd34
-memory: 1024
-net0: name=eth0,bridge=vmbr0,hwaddr=12:34:56:78:9A:BC,ip=dhcp,tag=20,type=veth
-rootfs: local:10011/vm-10011-disk-0.raw,size=8G
-";
-            let g = parse_guest_config(10011, text);
-            assert_eq!(g.name.as_deref(), Some("seadog-alice-proj-cd34"));
-            assert_eq!(g.mac.as_deref(), Some("12:34:56:78:9a:bc"));
+        fn parse_inspect_foreign_has_no_guid() {
+            // A kento instance NOT created by seadog: no SEADOG_GUID env ⇒
+            // guid None ⇒ classified Foreign. Also no mac, no vmid (a non-PVE
+            // backend), and no host keys.
+            let json = r#"{
+                "name": "someones-box",
+                "image": "docker.io/library/alpine:3",
+                "mode": "lxc",
+                "type": "LXC",
+                "status": "stopped",
+                "directory": "/var/lib/kento/lxc/someones-box",
+                "state_directory": "/var/lib/kento/lxc/someones-box",
+                "ssh_user": "root",
+                "environment": ["FOO=bar"],
+                "layer_count": 1,
+                "created": "2026-06-06 09:00:00",
+                "ssh_host_key_fingerprints": {},
+                "qemu_args": [],
+                "pve_args": []
+            }"#;
+            let s = parse_kento_inspect(json).unwrap();
+            assert_eq!(s.name, "someones-box");
+            assert_eq!(s.guid, None, "no SEADOG_GUID ⇒ foreign");
+            assert_eq!(s.owner, None);
+            assert_eq!(s.mac, None, "absent mac ⇒ None");
+            assert!(s.ssh_host_key_fps.is_empty());
+            assert_eq!(s.vmid, None, "non-PVE backend ⇒ no vmid");
+            assert_eq!(s.status, "stopped");
+        }
+
+        #[test]
+        fn parse_inspect_no_environment_key_is_foreign() {
+            // Some instances may carry no environment[] key at all (no env
+            // ever injected). That must read as foreign, not error.
+            let json = r#"{
+                "name": "bare",
+                "image": "img:1",
+                "mode": "vm",
+                "type": "VM",
+                "status": "running",
+                "directory": "/d",
+                "state_directory": "/d",
+                "ssh_user": "root",
+                "layer_count": 0,
+                "created": "2026-06-06 09:00:00",
+                "ssh_host_key_fingerprints": {},
+                "qemu_args": [],
+                "pve_args": []
+            }"#;
+            let s = parse_kento_inspect(json).unwrap();
+            assert_eq!(s.guid, None);
+            assert_eq!(s.owner, None);
+        }
+
+        #[test]
+        fn parse_inspect_empty_mac_is_none() {
+            // Defensive: even if kento ever emitted an empty-string mac, it
+            // must map to None (the confirming-when-present contract), not
+            // Some("").
+            let json = r#"{
+                "name": "n",
+                "image": "i",
+                "mode": "vm",
+                "type": "VM",
+                "status": "running",
+                "directory": "/d",
+                "state_directory": "/d",
+                "mac": "",
+                "environment": ["SEADOG_GUID=g1", "SEADOG_OWNER="],
+                "ssh_host_key_fingerprints": {"ed25519": "SHA256:only"}
+            }"#;
+            let s = parse_kento_inspect(json).unwrap();
+            assert_eq!(s.mac, None, "empty mac ⇒ None");
+            assert_eq!(s.guid.as_deref(), Some("g1"));
+            assert_eq!(s.owner, None, "empty SEADOG_OWNER value ⇒ None");
+            assert_eq!(s.ssh_host_key_fps, vec!["SHA256:only".to_string()]);
+        }
+
+        #[test]
+        fn parse_inspect_vm_carries_passed_mac() {
+            // A VM seadog created with --mac: kento reports it back.
+            let json = r#"{
+                "name": "seadog-bob-proj-cd34",
+                "image": "registry/stuff:2",
+                "mode": "vm",
+                "type": "VM",
+                "status": "running",
+                "directory": "/d",
+                "state_directory": "/d",
+                "vmid": 10011,
+                "mac": "12:34:56:78:9a:bc",
+                "environment": ["SEADOG_OWNER=bob", "SEADOG_GUID=g-bob"],
+                "ssh_host_key_fingerprints": {
+                    "rsa": "SHA256:r",
+                    "ed25519": "SHA256:e"
+                }
+            }"#;
+            let s = parse_kento_inspect(json).unwrap();
+            assert_eq!(s.guid.as_deref(), Some("g-bob"));
+            assert_eq!(s.owner.as_deref(), Some("bob"));
+            assert_eq!(s.mac.as_deref(), Some("12:34:56:78:9a:bc"));
+            assert_eq!(s.vmid, Some(10011));
             assert_eq!(
-                extract_desc_owner(g.description.as_deref()).as_deref(),
-                Some("alice")
+                s.ssh_host_key_fps,
+                vec!["SHA256:e".to_string(), "SHA256:r".to_string()]
             );
-            assert_eq!(g.fingerprint.net_bridge.as_deref(), Some("vmbr0"));
-            assert_eq!(g.fingerprint.net_vlan, Some(20));
-            assert_eq!(g.fingerprint.memory, Some(1024));
-            assert_eq!(
-                g.fingerprint.disk_geometry.as_deref(),
-                Some("local:10011/vm-10011-disk-0.raw")
-            );
-            assert_eq!(g.fingerprint.disk_size, Some(8 * 1024 * 1024 * 1024));
         }
 
         #[test]
-        fn parse_config_absent_fields_stay_none() {
-            // A bare config with no markers, no net, no disk: everything
-            // optional must be None so absence never reads as a match.
-            let text = "cores: 1\nmemory: 512\n";
-            let g = parse_guest_config(10010, text);
-            assert_eq!(g.name, None);
-            assert_eq!(g.description, None);
-            assert_eq!(g.mac, None);
-            assert_eq!(g.fingerprint.net_bridge, None);
-            assert_eq!(g.fingerprint.disk_size, None);
-            assert_eq!(g.fingerprint.memory, Some(512));
-            assert_eq!(g.fingerprint.cores, Some(1));
-        }
-
-        #[test]
-        fn parse_size_handles_units_and_bytes() {
-            assert_eq!(parse_size("512"), Some(512));
-            assert_eq!(parse_size("8G"), Some(8 * 1024 * 1024 * 1024));
-            assert_eq!(parse_size("20480M"), Some(20480 * 1024 * 1024));
-            assert_eq!(parse_size("1T"), Some(1024u64.pow(4)));
-            assert_eq!(parse_size(""), None);
-            assert_eq!(parse_size("notasize"), None);
-        }
-
-        #[test]
-        fn unparseable_description_without_markers_is_kept_verbatim() {
-            let text = "description: just a plain note\nname: seadog-x\n";
-            let g = parse_guest_config(10010, text);
-            assert_eq!(g.description.as_deref(), Some("just a plain note"));
-            assert_eq!(extract_desc_guid(g.description.as_deref()), None);
+        fn parse_inspect_rejects_non_object() {
+            assert!(parse_kento_inspect("[]").is_err());
+            assert!(parse_kento_inspect("not json").is_err());
         }
     }
 }
