@@ -359,7 +359,7 @@ mod tests {
         // One expired+unanimous env.
         insert_active(&conn, "g1", 10010, now - 3600, now - 100);
         let k = FakeKento::new();
-        k.set_guests(vec![signals_for(&conn, "g1", 10010)]);
+        k.set_instances(vec![signals_for(&conn, "g1", 10010)]);
 
         let summary = run_loop(&conn, &k, &cfg, || now, Some(10), never_sleep).unwrap();
         // First tick reaps it; the post-sweep active count is then zero ⇒
@@ -414,7 +414,7 @@ mod tests {
         let now = 1_000_000i64;
         insert_active(&conn, "g1", 10010, now - 3600, now + 10_000);
         let k = FakeKento::new();
-        k.set_guests(vec![signals_for(&conn, "g1", 10010)]);
+        k.set_instances(vec![signals_for(&conn, "g1", 10010)]);
 
         let sleeps = Cell::new(0u32);
         let summary = run_loop(

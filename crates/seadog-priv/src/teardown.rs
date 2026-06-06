@@ -1,126 +1,115 @@
 //! `seadog-priv teardown` — **the critical security gate.**
 //!
-//! Root never blindly trusts the DB for a destroy. Before tearing anything
-//! down, the helper re-triangulates the live guest at `--vmid` against
-//! **live PVE** (`Kento::list_guests`) and destroys ONLY when every check
-//! passes:
+//! Root never blindly trusts the front-end for a destroy. Teardown is
+//! **GUID-driven**: the front-end passes the instance `--guid`, `--owner`
+//! and `--mode`; the helper re-validates against its OWN sources before
+//! destroying anything:
 //!
-//! 1. **In range** — the vmid is inside `config.allocation.vmid_range`.
-//! 2. **Seadog-marked** — the live guest has the `seadog-` name prefix
-//!    AND a GUID marker in its description.
-//! 3. **Instance keys match** — the live desc-GUID equals `--guid`, and
-//!    the live MAC… (the GUID is the strong key; the MAC is corroborating
-//!    — both must agree with what the front-end passed for the destroy).
-//! 4. **Owned by `--owner`** — the live guest's `seadog-owner:` marker
-//!    equals the requesting owner.
+//! 1. **DB row exists** — `store::get_env(guid)` returns a row (refuse if
+//!    not: we never destroy something with no lease record).
+//! 2. **Owner matches** — the row's recorded `owner` equals `--owner` (the
+//!    owner the front-end resolved from the caller's key). Refuse on
+//!    mismatch — one owner cannot tear down another's env.
+//! 3. **Live instance carries the guid** — `kento.list_instances()` is
+//!    scanned for the instance whose injected `SEADOG_GUID` equals `--guid`.
+//!    Its **own name** (read from the live list, never caller-supplied) must
+//!    equal the DB row's name; refuse on mismatch.
+//! 4. **Destroy by that live name** — `kento.teardown(name, mode)`.
 //!
-//! Any failure → a typed refusal, NO destroy — *even when explicitly
-//! asked*. `teardown --vmid 105` (a production VM) is impossible: 105 is
-//! out of range, so step 1 refuses it.
+//! If NO live instance carries the guid, the env is already gone →
+//! **idempotent success** (no destroy needed). Any of: no DB row, owner
+//! mismatch, or live-name ≠ row-name → a typed refusal, NO destroy.
 
 use anyhow::{bail, Result};
 use clap::Args;
 use serde_json::{json, Value};
 
 use seadog_core::config::Config;
-use seadog_core::identity::{extract_desc_guid, extract_desc_owner, GuestSignals, NAME_PREFIX};
 use seadog_core::kento::Kento;
+use seadog_core::store;
 
 use crate::parse_mode;
+use seadog_priv::sweep::open_db;
 
-/// `teardown --owner <name> --guid <uuid> --vmid <u32> --mode <lxc|vm>`.
+/// `teardown --owner <name> --guid <uuid> --mode <lxc|vm>`.
 #[derive(Debug, Args)]
 pub struct TeardownArgs {
-    /// Requesting owner — must match the guest's recorded owner.
+    /// Requesting owner — must match the env row's recorded owner.
     #[arg(long)]
     pub owner: String,
-    /// Instance GUID — must match the guest's desc-GUID marker.
+    /// Instance GUID — must match a DB row AND a live instance's anchor.
     #[arg(long)]
     pub guid: String,
-    /// Target vmid — must be in range and resolve to a live seadog guest.
-    #[arg(long)]
-    pub vmid: u32,
     /// `lxc` or `vm`.
     #[arg(long)]
     pub mode: String,
 }
 
-/// Run `teardown` against live PVE. Refuses (typed error, no destroy) on
-/// any triangulation failure; destroys only on unanimous agreement.
-pub fn run(args: &TeardownArgs, kento: &dyn Kento, config: &Config) -> Result<Value> {
+/// Run `teardown`. Re-validates owner against the DB row, then confirms a
+/// live kento instance carries the guid and matches the row's name before
+/// destroying. Idempotent when the instance is already gone.
+pub fn run(args: &TeardownArgs, kento: &dyn Kento, _config: &Config) -> Result<Value> {
     let mode = parse_mode(&args.mode)?;
-    let [lo, hi] = config.allocation.vmid_range;
 
-    // (1) In range. A production vmid (e.g. 105) fails here — full stop,
-    //     we never even look it up.
-    if args.vmid < lo || args.vmid > hi {
+    // (1) DB row must exist. The helper opens its OWN store (same env-driven
+    //     path the reaper uses); it never trusts a relayed row.
+    let conn = open_db()?;
+    let row = store::get_env(&conn, &args.guid)
+        .map_err(anyhow::Error::from)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "refusing teardown: no env row for guid {} (unknown lease)",
+                args.guid
+            )
+        })?;
+
+    // (2) Owner must match the row. The front-end resolves owner from the
+    //     caller's key, but root re-checks it against the DB row of record.
+    if row.owner != args.owner {
         bail!(
-            "refusing teardown: vmid {} is outside the seadog range [{lo}, {hi}]",
-            args.vmid
-        );
-    }
-
-    // Re-enumerate LIVE PVE (never the DB) and find the guest at this vmid.
-    let live = kento.list_guests((lo, hi)).map_err(anyhow::Error::from)?;
-    let guest: &GuestSignals = live.iter().find(|g| g.vmid == args.vmid).ok_or_else(|| {
-        anyhow::anyhow!(
-            "refusing teardown: no live guest at vmid {} in PVE",
-            args.vmid
-        )
-    })?;
-
-    // (2) Seadog-marked: BOTH the seadog- name prefix AND a desc-GUID.
-    let has_name = guest
-        .name
-        .as_deref()
-        .is_some_and(|n| n.starts_with(NAME_PREFIX));
-    let desc_guid = extract_desc_guid(guest.description.as_deref());
-    if !has_name || desc_guid.is_none() {
-        bail!(
-            "refusing teardown: vmid {} is not a seadog-marked guest (name_prefix={has_name}, desc_guid={})",
-            args.vmid,
-            desc_guid.is_some()
-        );
-    }
-    let desc_guid = desc_guid.unwrap();
-
-    // (3) Instance keys match the passed --guid. The GUID is the strong
-    //     key; we require it to match exactly.
-    if desc_guid != args.guid {
-        bail!(
-            "refusing teardown: vmid {} desc-GUID does not match the requested guid (guid/MAC mismatch)",
-            args.vmid
-        );
-    }
-
-    // (4) Owned by --owner, per the guest's own owner marker.
-    let owner = extract_desc_owner(guest.description.as_deref());
-    match owner.as_deref() {
-        Some(o) if o == args.owner => {}
-        _ => bail!(
-            "refusing teardown: vmid {} is not owned by '{}' (owner mismatch)",
-            args.vmid,
+            "refusing teardown: env {} is not owned by '{}' (owner mismatch)",
+            args.guid,
             args.owner
-        ),
+        );
     }
 
-    // ALL checks passed → destroy. kento removes BY NAME (cleaning its
-    // overlay state too); use the name read from LIVE PVE during
-    // triangulation, never a caller-supplied one. The guest passed the
-    // `seadog-` name-prefix check above, so the name is present.
-    let live_name = guest.name.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "refusing teardown: vmid {} has no live name to destroy by",
-            args.vmid
-        )
-    })?;
+    // (3) Find the LIVE instance carrying this guid. kento only knows kento
+    //     instances; the live set IS the scan.
+    let live = kento.list_instances().map_err(anyhow::Error::from)?;
+    let instance = live
+        .into_iter()
+        .find(|i| i.guid.as_deref() == Some(args.guid.as_str()));
+
+    let Some(instance) = instance else {
+        // No live instance carries the guid → it's already gone. Idempotent
+        // success: nothing to destroy.
+        return Ok(json!({
+            "ok": true,
+            "mode": mode.as_str(),
+            "guid": args.guid,
+            "owner": args.owner,
+            "status": "already-gone",
+        }));
+    };
+
+    // The live instance's OWN name must match the DB row's name. Destroy by
+    // that live name (never a caller-supplied one).
+    if instance.name != row.name {
+        bail!(
+            "refusing teardown: live instance for guid {} has name '{}' but the row records '{}' (name mismatch)",
+            args.guid,
+            instance.name,
+            row.name
+        );
+    }
+
+    // (4) ALL checks passed → destroy by the live instance name.
     kento
-        .teardown(live_name, mode)
+        .teardown(&instance.name, mode)
         .map_err(anyhow::Error::from)?;
 
     Ok(json!({
         "ok": true,
-        "vmid": args.vmid,
         "mode": mode.as_str(),
         "guid": args.guid,
         "owner": args.owner,
@@ -131,103 +120,144 @@ pub fn run(args: &TeardownArgs, kento: &dyn Kento, config: &Config) -> Result<Va
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::config;
-    use seadog_core::identity::{GUID_MARKER_PREFIX, OWNER_MARKER_PREFIX};
-    use seadog_core::kento::FakeKento;
+    use crate::test_support::DB_ENV_LOCK;
+    use seadog_core::kento::{FakeKento, InstanceSignals};
     use seadog_core::models::Mode;
+    use seadog_priv::fixtures::{config, insert_active, signals_for};
 
     const GUID: &str = "11111111-1111-4111-8111-111111111111";
 
-    /// A well-formed live seadog guest (as provision would have left it).
-    fn seadog_guest(vmid: u32, guid: &str, owner: &str) -> GuestSignals {
-        GuestSignals {
-            vmid,
-            name: Some("seadog-alice-proj-ab12".into()),
-            description: Some(format!(
-                "{GUID_MARKER_PREFIX}{guid}\n{OWNER_MARKER_PREFIX}{owner}"
-            )),
-            mac: Some("aa:bb:cc:dd:ee:ff".into()),
-            fingerprint: Default::default(),
-        }
-    }
-
-    fn args(vmid: u32, guid: &str, owner: &str) -> TeardownArgs {
+    fn args(guid: &str, owner: &str) -> TeardownArgs {
         TeardownArgs {
             owner: owner.into(),
             guid: guid.into(),
-            vmid,
-            mode: "lxc".into(),
+            mode: "vm".into(),
+        }
+    }
+
+    /// Open an isolated temp DB the teardown path will see via `$SEADOG_DB`,
+    /// returning the connection plus a guard that restores the env on drop.
+    fn isolated_db() -> (rusqlite::Connection, DbEnvGuard) {
+        let unique = format!(
+            "seadog-teardown-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("seadog.db");
+        let prev = std::env::var_os("SEADOG_DB");
+        std::env::set_var("SEADOG_DB", &db);
+        let conn = store::open(&db).unwrap();
+        (conn, DbEnvGuard { dir, prev })
+    }
+
+    /// RAII: restore `$SEADOG_DB` and remove the temp dir on drop. Tests that
+    /// touch `$SEADOG_DB` serialize on this lock so they can't race.
+    struct DbEnvGuard {
+        dir: std::path::PathBuf,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl Drop for DbEnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("SEADOG_DB", v),
+                None => std::env::remove_var("SEADOG_DB"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
     #[test]
-    fn matching_seadog_guest_is_destroyed() {
+    fn matching_owner_and_live_instance_is_destroyed() {
+        let _lock = DB_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let cfg = config();
+        let (conn, _g) = isolated_db();
+        let now = 1_000_000i64;
+        insert_active(&conn, GUID, 10010, now - 3600, now + 10_000);
         let k = FakeKento::new();
-        k.set_guests(vec![seadog_guest(10010, GUID, "alice")]);
-        let out = run(&args(10010, GUID, "alice"), &k, &cfg).unwrap();
+        k.set_instances(vec![signals_for(&conn, GUID, 10010)]);
+
+        let out = run(&args(GUID, "alice"), &k, &cfg).unwrap();
         assert_eq!(out["ok"], true);
+        assert_eq!(out["status"], "reaped");
         assert_eq!(
             k.teardowns(),
-            vec![("seadog-alice-proj-ab12".to_string(), Mode::Lxc)]
+            vec![(format!("seadog-alice-p-{GUID}"), Mode::Vm)]
         );
     }
 
     #[test]
-    fn out_of_range_vmid_is_refused_without_lookup() {
+    fn no_db_row_is_refused() {
+        let _lock = DB_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let cfg = config();
+        let (conn, _g) = isolated_db();
+        // Live instance exists, but no DB row backs the guid.
         let k = FakeKento::new();
-        // A production VM at 105: must be impossible to destroy.
-        assert!(run(&args(105, GUID, "alice"), &k, &cfg).is_err());
-        assert!(k.teardowns().is_empty());
-    }
-
-    #[test]
-    fn unmarked_foreign_in_range_guest_is_refused() {
-        let cfg = config();
-        let k = FakeKento::new();
-        // A foreign guest squatting in-range: no seadog- name, no marker.
-        k.set_guests(vec![GuestSignals {
-            vmid: 10010,
-            name: Some("someones-prod-db".into()),
-            description: Some("not ours".into()),
-            mac: Some("11:22:33:44:55:66".into()),
-            fingerprint: Default::default(),
+        k.set_instances(vec![InstanceSignals {
+            name: format!("seadog-alice-p-{GUID}"),
+            guid: Some(GUID.into()),
+            owner: Some("alice".into()),
+            mac: Some("aa:bb:cc:dd:ee:ff".into()),
+            ssh_host_key_fps: Vec::new(),
+            image: "loom".into(),
+            status: "running".into(),
+            mode: Mode::Vm,
+            vmid: Some(10010),
         }]);
-        assert!(run(&args(10010, GUID, "alice"), &k, &cfg).is_err());
+        let _ = &conn;
+        assert!(run(&args(GUID, "alice"), &k, &cfg).is_err());
         assert!(k.teardowns().is_empty());
     }
 
     #[test]
-    fn guid_mismatch_is_refused() {
+    fn another_owners_env_is_refused() {
+        let _lock = DB_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let cfg = config();
+        let (conn, _g) = isolated_db();
+        let now = 1_000_000i64;
+        // Row owned by alice; bob asks to tear it down.
+        insert_active(&conn, GUID, 10010, now - 3600, now + 10_000);
         let k = FakeKento::new();
-        // Live guest carries a DIFFERENT guid than the destroy request.
-        k.set_guests(vec![seadog_guest(
-            10010,
-            "99999999-9999-4999-8999-999999999999",
-            "alice",
-        )]);
-        assert!(run(&args(10010, GUID, "alice"), &k, &cfg).is_err());
+        k.set_instances(vec![signals_for(&conn, GUID, 10010)]);
+
+        assert!(run(&args(GUID, "bob"), &k, &cfg).is_err());
         assert!(k.teardowns().is_empty());
     }
 
     #[test]
-    fn another_owners_guest_is_refused() {
+    fn live_name_mismatch_is_refused() {
+        let _lock = DB_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let cfg = config();
+        let (conn, _g) = isolated_db();
+        let now = 1_000_000i64;
+        insert_active(&conn, GUID, 10010, now - 3600, now + 10_000);
+        // Live instance carries the right guid/owner but a DIFFERENT name.
+        let mut sig = signals_for(&conn, GUID, 10010);
+        sig.name = "seadog-alice-impostor".into();
         let k = FakeKento::new();
-        // Same guid, but the guest is owned by someone else.
-        k.set_guests(vec![seadog_guest(10010, GUID, "bob")]);
-        assert!(run(&args(10010, GUID, "alice"), &k, &cfg).is_err());
+        k.set_instances(vec![sig]);
+
+        assert!(run(&args(GUID, "alice"), &k, &cfg).is_err());
         assert!(k.teardowns().is_empty());
     }
 
     #[test]
-    fn no_live_guest_at_vmid_is_refused() {
+    fn no_live_instance_is_idempotent_success() {
+        let _lock = DB_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let cfg = config();
+        let (conn, _g) = isolated_db();
+        let now = 1_000_000i64;
+        // Row exists, owner matches, but nothing live carries the guid.
+        insert_active(&conn, GUID, 10010, now - 3600, now + 10_000);
         let k = FakeKento::new();
-        // In-range vmid, but nothing live there.
-        assert!(run(&args(10010, GUID, "alice"), &k, &cfg).is_err());
+
+        let out = run(&args(GUID, "alice"), &k, &cfg).unwrap();
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["status"], "already-gone");
         assert!(k.teardowns().is_empty());
     }
 }

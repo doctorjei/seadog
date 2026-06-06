@@ -6,12 +6,12 @@
 use rusqlite::Connection;
 
 use seadog_core::config::Config;
-use seadog_core::identity::{Fingerprint, GuestSignals, GUID_MARKER_PREFIX, OWNER_MARKER_PREFIX};
+use seadog_core::kento::InstanceSignals;
 use seadog_core::models::{Env, EnvStatus, Mode};
 use seadog_core::store;
 
 /// A config whose allowlist has a dual-mode `loom` and a vm-only `vmonly`,
-/// with the default `[10000, 10999]` vmid range and a small herd cap.
+/// with a small herd cap.
 pub fn config() -> Config {
     let yaml = r#"
 lifecycle:
@@ -46,13 +46,14 @@ pub fn insert_with_status(
 ) {
     let env = Env {
         guid: guid.into(),
-        vmid,
+        vmid: Some(vmid),
         mode: Mode::Vm,
         owner: "alice".into(),
         image: "loom".into(),
         name: format!("seadog-alice-p-{guid}"),
         ip: "192.168.99.200".into(),
         mac: format!("aa:bb:cc:00:00:{:02x}", vmid % 256),
+        ssh_host_key_fps: vec![format!("SHA256:fp-{guid}")],
         created_at,
         ttl_deadline: ttl,
         soft_deadline: ttl - 600,
@@ -61,39 +62,46 @@ pub fn insert_with_status(
     store::insert_env(conn, &env).unwrap();
 }
 
-/// Live-PVE signals for an inserted env that triangulate as **unanimous**
-/// (name + desc GUID + owner all agree with the row → `Reap`-classified).
-pub fn signals_for(conn: &Connection, guid: &str, vmid: u32) -> GuestSignals {
+/// Live kento signals for an inserted env that **agree** with the DB row
+/// (GUID + name + MAC + host-key-fps all match → reap-eligible once past
+/// deadline). The `vmid` arg is informational only (kento exposes it on PVE
+/// backends); the identity anchor is the injected `SEADOG_GUID`.
+pub fn signals_for(conn: &Connection, guid: &str, vmid: u32) -> InstanceSignals {
     let env = store::get_env(conn, guid).unwrap().unwrap();
-    GuestSignals {
-        vmid,
-        name: Some(env.name.clone()),
-        description: Some(format!(
-            "{GUID_MARKER_PREFIX}{guid}\n{OWNER_MARKER_PREFIX}{}",
-            env.owner
-        )),
+    InstanceSignals {
+        name: env.name.clone(),
+        guid: Some(guid.to_string()),
+        owner: Some(env.owner.clone()),
         mac: Some(env.mac.clone()),
-        fingerprint: Fingerprint::default(),
+        ssh_host_key_fps: env.ssh_host_key_fps.clone(),
+        image: env.image.clone(),
+        status: "running".to_string(),
+        mode: env.mode,
+        vmid: Some(vmid),
     }
 }
 
-/// Live signals for an inserted env with the description marker **clobbered**
-/// (an anomaly): seadog name still present, but no desc-GUID → `Anomaly`,
-/// flagged, never reaped.
-pub fn clobbered_signals_for(conn: &Connection, guid: &str, vmid: u32) -> GuestSignals {
+/// Live signals for an inserted env whose strong confirmer is **clobbered**
+/// (the live instance carries the right GUID but a mismatched name) → the
+/// classifier flags it as an anomaly, never reaped.
+pub fn clobbered_signals_for(conn: &Connection, guid: &str, vmid: u32) -> InstanceSignals {
     let mut s = signals_for(conn, guid, vmid);
-    s.description = Some("user wiped this description".into());
+    s.name = "seadog-alice-clobbered".into();
     s
 }
 
-/// A **foreign** in-range guest with no seadog markers at all → `HeadsUp`,
-/// one-time heads-up, never touched. No DB row should back it.
-pub fn foreign_signals(vmid: u32) -> GuestSignals {
-    GuestSignals {
-        vmid,
-        name: Some("someones-prod-db".into()),
-        description: Some("not a seadog guest".into()),
+/// A **foreign** kento instance carrying no `SEADOG_GUID` anchor → ignored
+/// (no flag, no row, never touched). No DB row backs it.
+pub fn foreign_signals(vmid: u32) -> InstanceSignals {
+    InstanceSignals {
+        name: "someones-prod-db".into(),
+        guid: None,
+        owner: None,
         mac: Some("11:22:33:44:55:66".into()),
-        fingerprint: Fingerprint::default(),
+        ssh_host_key_fps: Vec::new(),
+        image: "registry.example.com/foreign:1".into(),
+        status: "running".to_string(),
+        mode: Mode::Vm,
+        vmid: Some(vmid),
     }
 }

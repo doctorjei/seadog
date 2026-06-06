@@ -10,20 +10,18 @@
 //! - It does NOT depend on the `seadog` crate — the untrusted SSH-command
 //!   parser is never linked in here.
 //! - It does NOT allocate — `provision` receives the front-end-allocated
-//!   vmid/ip/mac/guid/name and re-checks them, then creates the guest.
-//! - It does NOT touch the DB in this phase — `teardown` re-triangulates
-//!   against **live PVE** (`Kento::list_guests`), never the DB, because
-//!   "root never blindly trusts the DB for a destroy."
+//!   ip/mac/guid/name and re-checks them, then creates the guest.
+//! - `teardown` re-validates the owner against the DB row, then confirms a
+//!   **live kento instance** (`Kento::list_instances`) actually carries the
+//!   requested guid and matches the row's name before destroying — "root
+//!   never blindly trusts the front-end for a destroy."
 //!
 //! Every verb emits **JSON on stdout** (the front-end parses it); an error
 //! emits JSON on stderr and exits non-zero.
 
 mod owners;
 mod provision;
-mod set_meta;
-mod start_sshd;
 mod teardown;
-mod verify;
 
 use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
@@ -54,12 +52,8 @@ struct Cli {
 enum Verb {
     /// Create a guest with the front-end-allocated identifiers.
     Provision(provision::ProvisionArgs),
-    /// Destroy a guest after re-triangulating it against live PVE.
+    /// Destroy a guest after re-validating its owner + live kento instance.
     Teardown(teardown::TeardownArgs),
-    /// Narrow metadata update (deadline/description) on a seadog guest.
-    SetMeta(set_meta::SetMetaArgs),
-    /// Start the in-CT sshd on a verified seadog LXC.
-    StartSshd(start_sshd::StartSshdArgs),
     /// Reaper watcher loop: fast self-extinguishing sweep loop (flock
     /// singleton; exits when idle).
     Watch,
@@ -79,8 +73,6 @@ impl Verb {
         match self {
             Verb::Provision(_) => "provision",
             Verb::Teardown(_) => "teardown",
-            Verb::SetMeta(_) => "set-meta",
-            Verb::StartSshd(_) => "start-sshd",
             Verb::Watch => "watch",
             Verb::Sweep => "sweep",
             Verb::AddOwner(_) => "add-owner",
@@ -135,8 +127,6 @@ fn dispatch(verb: &Verb, kento: &dyn Kento, config: &Config) -> Result<Value> {
     match verb {
         Verb::Provision(args) => provision::run(args, kento, config),
         Verb::Teardown(args) => teardown::run(args, kento, config),
-        Verb::SetMeta(args) => set_meta::run(args, kento, config),
-        Verb::StartSshd(args) => start_sshd::run(args, kento, config),
         // watch/sweep open the DB themselves (they are the only DB-touching
         // verbs); `now` is wall-clock in prod.
         Verb::Sweep => sweep::run(kento, config, wall_clock_now()),
@@ -165,10 +155,8 @@ fn wall_clock_now() -> i64 {
 /// op, so failures are swallowed by the tracing layer itself.
 fn log_op(verb: &Verb) {
     let (owner, target): (&str, String) = match verb {
-        Verb::Provision(a) => (a.owner.as_str(), format!("vmid {}", a.vmid)),
-        Verb::Teardown(a) => (a.owner.as_str(), format!("vmid {}", a.vmid)),
-        Verb::SetMeta(a) => ("-", format!("vmid {}", a.vmid)),
-        Verb::StartSshd(a) => ("-", format!("vmid {}", a.vmid)),
+        Verb::Provision(a) => (a.owner.as_str(), format!("name {}", a.name)),
+        Verb::Teardown(a) => (a.owner.as_str(), format!("guid {}", a.guid)),
         Verb::Watch | Verb::Sweep => ("-", "-".to_string()),
         Verb::AddOwner(a) => (a.owner.as_str(), a.owner.clone()),
         Verb::RemoveOwner(a) => (a.owner.as_str(), a.owner.clone()),
@@ -251,10 +239,9 @@ fn run_with_real_backend(verb: &Verb, config: &Config) -> Result<Value> {
     // Production builds with the default `real-kento` feature.
     struct NoBackend;
     impl Kento for NoBackend {
-        fn list_guests(
+        fn list_instances(
             &self,
-            _vmid_range: (u32, u32),
-        ) -> std::result::Result<Vec<seadog_core::identity::GuestSignals>, seadog_core::Error>
+        ) -> std::result::Result<Vec<seadog_core::kento::InstanceSignals>, seadog_core::Error>
         {
             Err(no_backend_err())
         }
@@ -269,17 +256,6 @@ fn run_with_real_backend(verb: &Verb, config: &Config) -> Result<Value> {
             &self,
             _spec: &seadog_core::kento::ProvisionSpec,
         ) -> std::result::Result<seadog_core::kento::ProvisionOutcome, seadog_core::Error> {
-            Err(no_backend_err())
-        }
-        fn set_meta(
-            &self,
-            _vmid: u32,
-            _mode: Mode,
-            _meta: &seadog_core::kento::MetaUpdate,
-        ) -> std::result::Result<(), seadog_core::Error> {
-            Err(no_backend_err())
-        }
-        fn start_sshd(&self, _vmid: u32) -> std::result::Result<(), seadog_core::Error> {
             Err(no_backend_err())
         }
     }
@@ -432,14 +408,21 @@ images:
     /// Point `$SEADOG_DB` + `$SEADOG_WATCHER_LOCK` at fresh temp paths for a
     /// test that exercises the prod `dispatch` path (which opens the DB /
     /// flock by env). Restores the prior values on drop.
+    /// `$SEADOG_DB` (+ `$SEADOG_WATCHER_LOCK`) are process-global; serialize
+    /// every test that opens the DB by env (TempEnv users + the teardown
+    /// verb tests) on this ONE lock so they can't race each other's path.
+    pub static DB_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     pub struct TempEnv {
         _dir: std::path::PathBuf,
         prev_db: Option<std::ffi::OsString>,
         prev_lock: Option<std::ffi::OsString>,
+        _guard: std::sync::MutexGuard<'static, ()>,
     }
 
     impl TempEnv {
         pub fn isolated() -> Self {
+            let guard = DB_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let unique = format!(
                 "seadog-priv-test-{}-{}",
                 std::process::id(),
@@ -458,6 +441,7 @@ images:
                 _dir: dir,
                 prev_db,
                 prev_lock,
+                _guard: guard,
             }
         }
     }
