@@ -3,9 +3,9 @@
 //!
 //! The front-end resolves the env-id (a `guid`) to the caller's own env,
 //! refusing another owner's env or an unknown id, then elevates `teardown`
-//! with **structured args** (`--guid`/`--vmid`/`--mode`). The helper
-//! (Phase 3a) re-validates ownership and re-triangulates against live PVE
-//! before destroying — the front-end passes data, never a raw command.
+//! with **structured args** (`--guid`/`--mode`). The helper (GUID-driven)
+//! re-validates ownership, finds the live instance whose guid matches, and
+//! tears it down by name — the front-end passes data, never a raw command.
 //!
 //! On helper success the row is marked `Reaped` (the lease frees). On
 //! helper failure the row is left `Active` and the error is surfaced; the
@@ -34,12 +34,12 @@ pub fn run(ctx: &Ctx, env_id: &str) -> Result<Value> {
         return Err(anyhow!("env '{env_id}' is not owned by '{}'", ctx.owner));
     }
 
-    // Structured teardown args. The helper re-validates + triangulates.
+    // Structured teardown args. The helper is GUID-driven: it re-validates
+    // ownership, finds the live instance whose guid matches, and tears it
+    // down by name. No vmid (kento owns backend ids now).
     let argv = vec![
         "--guid".to_string(),
         env.guid.clone(),
-        "--vmid".to_string(),
-        env.vmid.to_string(),
         "--mode".to_string(),
         env.mode.as_str().to_string(),
     ];

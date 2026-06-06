@@ -109,13 +109,14 @@ fn fake_priv_path() -> String {
 fn mk_env(guid: &str, vmid: u32, owner: &str, status: EnvStatus, created_at: i64, ttl: i64) -> Env {
     Env {
         guid: guid.into(),
-        vmid,
+        vmid: Some(vmid),
         mode: Mode::Lxc,
         owner: owner.into(),
         image: "loom".into(),
         name: format!("seadog-{owner}-p-{guid}"),
         ip: "192.168.99.200".into(),
         mac: format!("aa:bb:cc:00:00:{:02x}", vmid % 256),
+        ssh_host_key_fps: Vec::new(),
         created_at,
         ttl_deadline: ttl,
         soft_deadline: ttl - 600,
@@ -242,7 +243,7 @@ fn ack_flips_notify_state() {
     )
     .unwrap();
 
-    let (ok, json, err) = fx.run("alice", &["ack", "10010"]);
+    let (ok, json, err) = fx.run("alice", &["ack", "g-1"]);
     assert!(ok, "stderr: {err}");
     assert_eq!(json["guid"], "g-1");
     assert_eq!(json["acked"], true);
@@ -340,6 +341,8 @@ fn create_shells_provision_and_writes_active_row() {
     assert_eq!(json["ip"].as_str().unwrap(), "192.168.99.192");
     let name = json["name"].as_str().unwrap();
     assert!(name.starts_with("seadog-alice-loom-"), "got: {name}");
+    // vmid now comes from the helper's read-back (ProvisionOutcome), not from
+    // front-end allocation. The fake reports 10000.
     let vmid = json["vmid"].as_u64().unwrap();
     assert_eq!(vmid, 10000);
     assert_eq!(json["mode"], "lxc");
@@ -349,7 +352,10 @@ fn create_shells_provision_and_writes_active_row() {
     let env = store::get_env(&fx.conn(), id).unwrap().unwrap();
     assert_eq!(env.status, EnvStatus::Active);
     assert_eq!(env.owner, "alice");
-    assert_eq!(env.vmid, 10000);
+    // The read-back vmid + host-key fps were written onto the row via
+    // `set_provision_signals`.
+    assert_eq!(env.vmid, Some(10000));
+    assert_eq!(env.ssh_host_key_fps, vec!["SHA256:fakefp".to_string()]);
     // LXC: the helper reports no effective MAC (this fake omits the field),
     // so the front-end records "" ("no MAC recorded") rather than the
     // fictional minted MAC. Identity treats MAC as confirming-when-present.
@@ -362,7 +368,11 @@ fn create_shells_provision_and_writes_active_row() {
         .find(|l| l.starts_with("provision "))
         .expect("provision was invoked");
     assert!(prov.contains("--owner alice"), "argv: {prov}");
-    assert!(prov.contains(&format!("--vmid {vmid}")), "argv: {prov}");
+    // No `--vmid`: kento auto-assigns; the front-end allocates name + IP only.
+    assert!(
+        !prov.contains("--vmid"),
+        "argv must not carry --vmid: {prov}"
+    );
     assert!(prov.contains("--ip 192.168.99.192"), "argv: {prov}");
     assert!(prov.contains(&format!("--name {name}")), "argv: {prov}");
     assert!(prov.contains(&format!("--guid {id}")), "argv: {prov}");
@@ -373,6 +383,8 @@ fn create_shells_provision_and_writes_active_row() {
     );
     // A locally-administered MAC was minted and passed.
     assert!(prov.contains("--mac "), "argv: {prov}");
+    // allow_nesting resolved from loom's catalog entry (no field ⇒ false).
+    assert!(prov.contains("--allow-nesting false"), "argv: {prov}");
 }
 
 #[test]
@@ -495,7 +507,8 @@ fn destroy_shells_teardown_and_refuses_foreign_or_unknown() {
         .expect("teardown invoked");
     assert!(td.contains("--owner alice"), "argv: {td}");
     assert!(td.contains("--guid g-mine"), "argv: {td}");
-    assert!(td.contains("--vmid 10010"), "argv: {td}");
+    // GUID-driven teardown: no `--vmid` (kento owns backend ids now).
+    assert!(!td.contains("--vmid"), "argv must not carry --vmid: {td}");
     assert!(td.contains("--mode lxc"), "argv: {td}");
 
     // alice cannot destroy bob's env (refused).

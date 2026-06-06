@@ -95,7 +95,6 @@ pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
     let mac = mint_mac();
     let name = mint_guest_name(&ctx.owner, &args.image)?;
 
-    let vmid_range = ctx.config.allocation.vmid_range;
     let [ip_lo, ip_hi] = ctx.config.allocation.ip_pool.range;
 
     // `core::alloc::allocate` needs a writable connection; `ctx.conn` is a
@@ -104,7 +103,6 @@ pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
     let mut wconn = store::open(&ctx.db_path)?;
     let allocation = alloc::allocate(
         &mut wconn,
-        (vmid_range[0], vmid_range[1]),
         (ip_lo, ip_hi),
         &NewEnv {
             guid: &guid,
@@ -121,11 +119,20 @@ pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
 
     // 5. Elevate `provision` with the allocated params. The helper
     //    re-validates everything; it does NOT re-allocate.
+    //
+    // `allow_nesting` is advisory at the front-end: read it from the served
+    // alias's catalog entry (the user-supplied alias is fine to read config
+    // with — the helper independently re-validates via `nesting_ok_for_ref`).
+    // Absent entry / absent field ⇒ false.
+    let allow_nesting = ctx
+        .config
+        .images
+        .get(&args.image)
+        .and_then(|i| i.allow_nesting)
+        .unwrap_or(false);
     let argv = vec![
         "--guid".to_string(),
         guid.clone(),
-        "--vmid".to_string(),
-        allocation.vmid.to_string(),
         "--ip".to_string(),
         allocation.ip.to_string(),
         "--mac".to_string(),
@@ -136,35 +143,55 @@ pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
         mode.as_str().to_string(),
         "--image-ref".to_string(),
         resolved.image_ref.clone(),
+        "--allow-nesting".to_string(),
+        allow_nesting.to_string(),
     ];
     let req = ElevateArgs::new("provision", ctx.owner.clone(), argv);
 
     match elevate(&req) {
         Ok(outcome) => {
-            // The helper reports the EFFECTIVE mac the guest actually carries.
-            // For a VM it is the minted MAC (a JSON string). For an LXC the
-            // MAC is unobservable via `pct config`, so the helper emits JSON
-            // `null` (or omits it): the allocated MAC is fictional, so we
-            // record `""` ("no MAC recorded") on the row rather than leave the
-            // fiction. Identity then treats MAC as confirming-when-present.
-            // Best-effort: a recording failure is not fatal to the create.
-            // VM → the real MAC string; LXC / unobservable → null or absent,
-            // which `unwrap_or_default` maps to "" ("no MAC recorded").
+            // The helper reports the realized provision signals it read back
+            // from kento `inspect`:
+            //   - `mac`: the EFFECTIVE mac the guest carries. For a VM it is
+            //     the minted MAC (a JSON string); for an LXC the MAC is
+            //     unobservable via `pct config`, so the helper emits JSON
+            //     `null`/absent and we record `""` ("no MAC recorded") rather
+            //     than the fictional minted MAC. Identity then treats MAC as
+            //     confirming-when-present.
+            //   - `ssh_host_key_fps`: an array of host-key fingerprints (soft
+            //     confirmer); absent ⇒ empty.
+            //   - `vmid`: the backend vmid where one exists (PVE); JSON
+            //     `null`/absent for backend-neutral runtimes (kept as None).
+            // Record all three on the row in one UPDATE. Best-effort: a
+            // recording failure is not fatal to the create.
             let effective_mac: &str = outcome
                 .result
                 .get("mac")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            if effective_mac != mac {
-                if let Err(e) = store::set_mac(&wconn, &guid, effective_mac) {
-                    eprintln!("seadog: recording effective mac for '{guid}' failed: {e}");
-                }
+            let fps: Vec<String> = outcome
+                .result
+                .get("ssh_host_key_fps")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let vmid: Option<u32> = outcome
+                .result
+                .get("vmid")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            if let Err(e) = store::set_provision_signals(&wconn, &guid, effective_mac, &fps, vmid) {
+                eprintln!("seadog: recording provision signals for '{guid}' failed: {e}");
             }
             Ok(json!({
                 "id": guid,
                 "ip": allocation.ip.to_string(),
                 "name": name,
-                "vmid": allocation.vmid,
+                "vmid": vmid,
                 "mode": mode.as_str(),
                 "mac": effective_mac,
                 "ttl_deadline": ttl_deadline,

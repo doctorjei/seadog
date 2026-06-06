@@ -79,10 +79,10 @@ enum Verb {
         /// How much to add (humantime, e.g. `30m`, `1h`).
         duration: String,
     },
-    /// Acknowledge a notification for a vmid (suppress escalation).
+    /// Acknowledge a notification for an env (suppress escalation).
     Ack {
-        /// The vmid whose notification to acknowledge.
-        vmid: u32,
+        /// The env-id (guid) whose notification to acknowledge.
+        env_id: String,
     },
     /// Provision a new env (elevated — routes through the bridge).
     Create {
@@ -189,7 +189,7 @@ fn dispatch(ctx: &Ctx, verb: Verb) -> anyhow::Result<serde_json::Value> {
                 .map_err(|e| anyhow::anyhow!("invalid duration '{duration}': {e}"))?;
             verbs::extend::run(ctx, &env_id, d)
         }
-        Verb::Ack { vmid } => verbs::ack::run(ctx, vmid),
+        Verb::Ack { env_id } => verbs::ack::run(ctx, &env_id),
         Verb::Create {
             image,
             mode,

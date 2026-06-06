@@ -28,7 +28,11 @@ case "$verb" in
       echo "fake provision failure (forced)" >&2
       exit 7
     fi
-    echo '{"ok":true,"verb":"provision"}'
+    # Realized provision signals (what the real helper reads back from kento
+    # `inspect`): a backend vmid + host-key fps. No `mac` field → LXC, so the
+    # front-end records "" ("no MAC recorded"). The front-end writes all three
+    # onto the row via `set_provision_signals`.
+    echo '{"ok":true,"verb":"provision","vmid":10000,"ssh_host_key_fps":["SHA256:fakefp"]}'
     ;;
   teardown)
     if [ -n "$SEADOG_FAKE_FAIL" ]; then
