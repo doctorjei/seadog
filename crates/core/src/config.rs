@@ -44,8 +44,14 @@ pub struct Config {
     /// Per-owner cap overrides (optional).
     #[serde(default)]
     pub owners: BTreeMap<String, OwnerOverride>,
-    #[serde(default)]
-    pub identity: Identity,
+    /// **Deprecated, ignored.** The PVE hardware-fingerprint tie-breaker was
+    /// removed in the kento decouple (identity is now the injected
+    /// `SEADOG_GUID` anchor + native confirmers). Kept ONLY as an
+    /// accept-and-ignore shim so a deployed `config.yaml` still carrying a
+    /// stale `identity:` block under `deny_unknown_fields` keeps parsing.
+    /// Never serialized back out. Removed for good in P6 (example cleanup).
+    #[serde(default, skip_serializing)]
+    pub identity: serde::de::IgnoredAny,
     #[serde(default)]
     pub lifecycle: Lifecycle,
     #[serde(default)]
@@ -75,14 +81,18 @@ impl Default for Cadence {
     }
 }
 
-/// vmid / ip / cap allocation policy.
+/// name / ip / cap allocation policy.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Allocation {
-    /// Inclusive `[low, high]` vmid scan + allocate range.
-    #[serde(default = "default_vmid_range")]
-    pub vmid_range: [u32; 2],
-    /// The PVE bridge kento attaches guests to (e.g. `vmbr0`). Passed to
+    /// **Deprecated, ignored.** vmid allocation was removed in the kento
+    /// decouple (allocate by unique name + IP lease; kento auto-assigns a
+    /// backend vmid where one exists). Kept ONLY as an accept-and-ignore
+    /// shim so a deployed `config.yaml` still carrying a stale `vmid_range:`
+    /// under `deny_unknown_fields` keeps parsing. Never serialized back out.
+    #[serde(default, skip_serializing)]
+    pub vmid_range: serde::de::IgnoredAny,
+    /// The bridge kento attaches guests to (e.g. `vmbr0`). Passed to
     /// `kento create` as `--network bridge=<this>`.
     #[serde(default = "default_bridge")]
     pub bridge: String,
@@ -95,7 +105,7 @@ pub struct Allocation {
 impl Default for Allocation {
     fn default() -> Self {
         Allocation {
-            vmid_range: default_vmid_range(),
+            vmid_range: serde::de::IgnoredAny,
             bridge: default_bridge(),
             ip_pool: IpPool::default(),
             caps: Caps::default(),
@@ -169,53 +179,6 @@ pub struct OwnerOverride {
     pub max_lxc: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_vm: Option<u32>,
-}
-
-/// Hardware-fingerprint tie-breaker config (flag-only; never reaps).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Identity {
-    #[serde(default = "default_threshold")]
-    pub threshold: f64,
-    #[serde(default)]
-    pub weights: IdentityWeights,
-}
-
-impl Default for Identity {
-    fn default() -> Self {
-        Identity {
-            threshold: default_threshold(),
-            weights: IdentityWeights::default(),
-        }
-    }
-}
-
-/// Per-field fingerprint weights (high-info fields carry weight).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IdentityWeights {
-    #[serde(default = "weight_3")]
-    pub network: u32,
-    #[serde(default = "weight_3")]
-    pub disk: u32,
-    #[serde(default = "weight_2")]
-    pub machine: u32,
-    #[serde(default)]
-    pub memory: u32,
-    #[serde(default)]
-    pub cores: u32,
-}
-
-impl Default for IdentityWeights {
-    fn default() -> Self {
-        IdentityWeights {
-            network: 3,
-            disk: 3,
-            machine: 2,
-            memory: 0,
-            cores: 0,
-        }
-    }
 }
 
 /// Deadline / grace / herd-cap lifecycle policy. All duration fields.
@@ -316,23 +279,9 @@ impl Config {
 
     /// Validate semantic invariants the type system can't enforce.
     ///
-    /// Errors on: inverted/degenerate `vmid_range` (low >= high) or out
-    /// of the `[10000, 10999]` window; an empty `images` allowlist; an
-    /// inverted/degenerate IP-pool range; an identity threshold outside
-    /// `[0, 1]`.
+    /// Errors on: an empty `images` allowlist; an inverted/degenerate
+    /// IP-pool range.
     pub fn validate(&self) -> Result<(), Error> {
-        let [vlo, vhi] = self.allocation.vmid_range;
-        if vlo >= vhi {
-            return Err(Error::ConfigValidation(format!(
-                "vmid_range low ({vlo}) must be < high ({vhi})"
-            )));
-        }
-        if vlo < 10000 || vhi > 10999 {
-            return Err(Error::ConfigValidation(format!(
-                "vmid_range [{vlo}, {vhi}] must lie within [10000, 10999]"
-            )));
-        }
-
         if self.images.is_empty() {
             return Err(Error::ConfigValidation(
                 "images allowlist must not be empty".to_string(),
@@ -350,13 +299,6 @@ impl Config {
         if u32::from(iplo) >= u32::from(iphi) {
             return Err(Error::ConfigValidation(format!(
                 "ip_pool.range low ({iplo}) must be < high ({iphi})"
-            )));
-        }
-
-        let t = self.identity.threshold;
-        if !(0.0..=1.0).contains(&t) {
-            return Err(Error::ConfigValidation(format!(
-                "identity.threshold ({t}) must be within [0.0, 1.0]"
             )));
         }
 
@@ -427,9 +369,6 @@ fn mins_60() -> Duration {
 fn days_7() -> Duration {
     Duration::from_secs(7 * 24 * 60 * 60)
 }
-fn default_vmid_range() -> [u32; 2] {
-    [10000, 10999]
-}
 fn default_bridge() -> String {
     "vmbr0".to_string()
 }
@@ -450,15 +389,6 @@ fn max_lxc_default() -> u32 {
     8
 }
 fn max_vm_default() -> u32 {
-    3
-}
-fn default_threshold() -> f64 {
-    0.6
-}
-fn weight_2() -> u32 {
-    2
-}
-fn weight_3() -> u32 {
     3
 }
 fn herd_cap_default() -> u32 {

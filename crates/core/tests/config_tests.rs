@@ -21,7 +21,8 @@ fn parses_annotated_example() {
     cfg.validate().expect("example must validate");
 
     assert!(cfg.reaper_enabled);
-    assert_eq!(cfg.allocation.vmid_range, [10000, 10999]);
+    // removed: vmid_range assertion (vmid allocation dropped; the example
+    // still carries a stale `vmid_range:` block, parsed as an ignored shim).
     assert_eq!(
         cfg.allocation.ip_pool.range,
         [
@@ -63,10 +64,10 @@ fn parses_annotated_example() {
     assert_eq!(o.max_lxc, Some(12));
     assert_eq!(o.max_vm, None);
 
-    // Identity weights.
-    assert_eq!(cfg.identity.threshold, 0.6);
-    assert_eq!(cfg.identity.weights.network, 3);
-    assert_eq!(cfg.identity.weights.memory, 0);
+    // removed: identity weight/threshold assertions — the hardware-
+    // fingerprint tie-breaker is gone (identity is now the injected
+    // SEADOG_GUID anchor + native confirmers). The example still carries a
+    // stale `identity:` block, parsed as an ignored shim.
 
     // notify nulls -> None.
     assert!(cfg.notify.journald);
@@ -100,7 +101,7 @@ images:
     assert!(cfg.reaper_enabled); // default true
     assert_eq!(cfg.cadence.fast, Duration::from_secs(60));
     assert_eq!(cfg.cadence.idle, Duration::from_secs(3600));
-    assert_eq!(cfg.allocation.vmid_range, [10000, 10999]);
+    // removed: vmid_range assertion (vmid allocation dropped).
     assert_eq!(
         cfg.allocation.ip_pool.range[0],
         Ipv4Addr::new(192, 168, 99, 192)
@@ -111,7 +112,7 @@ images:
     assert_eq!(cfg.lifecycle.herd_cap, 10);
     assert_eq!(cfg.retention.terminal, Duration::from_secs(7 * 24 * 3600));
     assert!(cfg.notify.journald);
-    assert_eq!(cfg.identity.threshold, 0.6);
+    // removed: identity.threshold assertion (fingerprint tie-breaker gone).
 }
 
 #[test]
@@ -172,29 +173,21 @@ fn kento_path_parses_and_validates() {
     assert!(matches!(empty.validate(), Err(Error::ConfigValidation(_))));
 }
 
+// removed: rejects_bad_vmid_range + rejects_out_of_window_vmid_range — vmid
+// allocation and its validation are gone (kento decouple). A `vmid_range:`
+// block is now an accept-and-ignore shim, so it no longer fails validation.
+// Replaced with a guard that a stale `vmid_range:` block still parses.
 #[test]
-fn rejects_bad_vmid_range() {
+fn stale_vmid_range_block_is_ignored_not_rejected() {
     let yaml = r#"
 allocation:
   vmid_range: [10999, 10000]
 images:
   loom: { ref: ghcr.io/doctorjei/droste-loom:latest, modes: [lxc] }
 "#;
-    let cfg = Config::from_yaml_str(yaml).expect("parse");
-    let err = cfg.validate().expect_err("inverted range must fail");
-    assert!(matches!(err, Error::ConfigValidation(_)), "{err:?}");
-}
-
-#[test]
-fn rejects_out_of_window_vmid_range() {
-    let yaml = r#"
-allocation:
-  vmid_range: [9000, 9999]
-images:
-  loom: { ref: ghcr.io/doctorjei/droste-loom:latest, modes: [lxc] }
-"#;
-    let cfg = Config::from_yaml_str(yaml).expect("parse");
-    assert!(matches!(cfg.validate(), Err(Error::ConfigValidation(_))));
+    let cfg = Config::from_yaml_str(yaml).expect("stale vmid_range still parses");
+    cfg.validate()
+        .expect("a stale vmid_range block must not fail validation");
 }
 
 #[test]

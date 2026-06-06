@@ -94,30 +94,34 @@ impl EnvStatus {
 /// A provisioned (or formerly provisioned) test environment.
 ///
 /// The DB row is authoritative for `ttl_deadline` — a user clobbering
-/// the PVE guest description must never orphan the kill time. `guid` is
-/// the primary key (minted at create, globally unique); `vmid`/`ip` are
-/// leased allocation slots freed when `status` leaves `Active`.
+/// the guest must never orphan the kill time. `guid` is the primary key
+/// (minted at create, globally unique, injected as the `SEADOG_GUID`
+/// anchor); `ip` is a leased allocation slot freed when `status` leaves
+/// `Active`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Env {
     /// Globally-unique id minted at create — the primary key.
     pub guid: String,
-    /// Proxmox guest id, allocated from `[10000, 10999]`.
-    pub vmid: u32,
+    /// Backend vmid when one exists (PVE backends only); `None` for
+    /// backend-neutral runtimes. Informational — never an identity key.
+    pub vmid: Option<u32>,
     /// LXC or VM.
     pub mode: Mode,
     /// Resolved owner name (from the SSH key fingerprint).
     pub owner: String,
     /// Allowlist image *name* (e.g. `loom`), never an OCI ref.
     pub image: String,
-    /// PVE guest name `seadog-<owner>-<shortproj>-<token>` (DNS-label).
+    /// Guest name `seadog-<owner>-<shortproj>-<token>` (DNS-label).
     pub name: String,
     /// Leased IPv4, as a string (e.g. `192.168.99.192`).
     pub ip: String,
-    /// Recorded MAC address. An empty string `""` means **no MAC recorded**
-    /// (e.g. a kento LXC, whose MAC is unobservable via `pct config`); the
-    /// reaper treats MAC as confirming-when-present, so `""` simply drops MAC
-    /// out of that env's reap decision.
+    /// Recorded MAC address. An empty string `""` means **no MAC recorded**;
+    /// the reaper treats MAC as confirming-when-present, so `""` simply drops
+    /// MAC out of that env's reap decision.
     pub mac: String,
+    /// Recorded SSH host-key fingerprints (kento `inspect`). A soft
+    /// confirmer — present-but-mismatched is logged, never blocks a reap.
+    pub ssh_host_key_fps: Vec<String>,
     /// Create time, unix epoch seconds.
     pub created_at: i64,
     /// Hard-kill deadline, unix epoch seconds. **DB-authoritative.**

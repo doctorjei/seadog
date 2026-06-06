@@ -1,78 +1,91 @@
-//! The runtime bridge between seadog's logic and the live PVE node.
+//! The runtime bridge between seadog's logic and the `kento` runtime.
 //!
 //! [`Kento`] abstracts every operation the reaper/provisioner needs from
-//! `qm`/`pct`/`kento` so the business logic can be exercised against an
-//! in-memory [`FakeKento`] with **no real PVE host** in the loop. The
-//! shelling-out implementation, [`RealKento`], lives behind the
-//! `real-kento` cargo feature so the library builds and tests with zero
-//! external tools by default.
+//! `kento` so the business logic can be exercised against an in-memory
+//! [`FakeKento`] with **no real host** in the loop. The shelling-out
+//! implementation, [`RealKento`], lives behind the `real-kento` cargo
+//! feature so the library builds and tests with zero external tools by
+//! default.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::identity::{GuestSignals, GUID_MARKER_PREFIX, OWNER_MARKER_PREFIX};
 use crate::models::Mode;
 use crate::Error;
 
-/// Operations seadog needs from the PVE node.
+/// Operations seadog needs from the `kento` runtime.
 ///
-/// Only [`Kento::list_guests`] and [`Kento::teardown`] carry real
-/// behavior in this phase; the provisioning methods are declared with
-/// minimal signatures for later phases to implement. Implementors must
-/// surface a quorum-loss / pmxcfs-read-only condition as
+/// Implementors must surface a quorum-loss / pmxcfs-read-only condition as
 /// [`Error::QuorumLost`] so the reaper can stop cleanly instead of
-/// spinning.
+/// spinning. Identity is now backend-neutral: kento exposes every signal
+/// natively via `inspect --json`, so the bridge no longer reads PVE
+/// `description`/config fields or pokes guest metadata.
 pub trait Kento {
-    /// Enumerate every guest whose vmid falls in the inclusive
-    /// `vmid_range`, returning the signals the sweeper observes.
-    fn list_guests(&self, vmid_range: (u32, u32)) -> Result<Vec<GuestSignals>, Error>;
+    /// Enumerate every kento instance, returning the signals the sweeper
+    /// observes. `kento` only knows about kento-managed instances, so there
+    /// is no vmid-range scan: the live set IS the kento list.
+    fn list_instances(&self) -> Result<Vec<InstanceSignals>, Error>;
 
-    /// Destroy the guest named `name` (LXC via `kento lxc destroy`, VM via
-    /// `kento vm destroy`). `kento` removes **by instance name**, not vmid,
-    /// so its own overlay state is cleaned alongside the PVE guest. The
-    /// caller passes the name it read back from **live PVE** during
-    /// triangulation (never a caller-supplied name).
+    /// Destroy the instance named `name` (LXC via `kento lxc destroy`, VM
+    /// via `kento vm destroy`). `kento` removes **by instance name**, so its
+    /// own overlay state is cleaned alongside the backend guest. The caller
+    /// passes the name it read back from the **live instance list** during
+    /// classification (never a caller-supplied name).
     fn teardown(&self, name: &str, mode: Mode) -> Result<(), Error>;
 
-    /// Create a new guest from a fully-resolved [`ProvisionSpec`].
+    /// Create a new instance from a fully-resolved [`ProvisionSpec`].
     ///
     /// `kento` owns networking, ssh-host-key injection and the initial
-    /// start: `provision` shells `kento <mode> create --vmid … --name …
-    /// --network bridge=<bridge> --ip <ip>/<prefix> --gateway <gw>
-    /// --ssh-host-keys --start [--mac <mac> ONLY for vm] <image-ref>`.
+    /// start, and records the seadog identity anchor via injected env:
+    /// `provision` shells `kento <mode> create --name … --network
+    /// bridge=<bridge> --ip <ip>/<prefix> --gateway <gw> --env
+    /// SEADOG_GUID=<guid> --env SEADOG_OWNER=<owner> --start [--mac <mac>
+    /// ONLY for vm] <image-ref>`, then reads the realized signals back via
+    /// `inspect --json` for the [`ProvisionOutcome`].
     ///
-    /// `--mac` is **VM-only**. For a VM the realized guest carries the minted
-    /// MAC, so [`ProvisionOutcome::mac`] is `Some(spec.mac)`. For an LXC the
-    /// MAC is **unobservable via `pct config`** (the hwaddr lives only in the
-    /// raw lxc config and the runtime MAC need not match it), so the read-back
-    /// yields nothing and [`ProvisionOutcome::mac`] is `None`. The front-end
-    /// records `Some` → the real MAC, `None` → `""` ("no MAC recorded") on the
-    /// DB row, so identity/triangulation treat MAC as confirming-when-present.
+    /// `--mac` is **VM-only** at the argv layer (P4/P5), but kento now
+    /// exposes the realized MAC for **both** LXC and VM via `inspect`, so
+    /// [`ProvisionOutcome::mac`] is `Some` whenever kento reports one.
     fn provision(&self, spec: &ProvisionSpec) -> Result<ProvisionOutcome, Error>;
+}
 
-    /// Narrow metadata update on an **already-verified** seadog guest:
-    /// optionally set the description and/or the TTL-deadline marker. The
-    /// caller validates the target is in-range + seadog-marked first; this
-    /// is `qm set`/`pct set`, never a general passthrough.
-    fn set_meta(&self, vmid: u32, mode: Mode, meta: &MetaUpdate) -> Result<(), Error>;
-
-    /// Start the in-guest sshd inside an **already-verified** seadog CT
-    /// (loom ships sshd disabled). LXC-only — the caller validates the
-    /// target is an in-range, seadog-marked container first. This is a
-    /// narrow `pct exec … systemctl start ssh`, not a general
-    /// `pct exec` passthrough.
-    fn start_sshd(&self, vmid: u32) -> Result<(), Error>;
+/// What the sweeper observes about one live kento instance, all sourced
+/// from `kento inspect --json`. Replaces the PVE-era `GuestSignals`
+/// (description-marker + hardware-fingerprint) with kento's native,
+/// backend-neutral signal set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstanceSignals {
+    /// Instance name — kento's primary key (seadog controls it; encodes the
+    /// owner as `seadog-<owner>-<shortproj>-<token>`).
+    pub name: String,
+    /// Injected `SEADOG_GUID` env, read back via inspect. `None` ⇒ the
+    /// instance carries no seadog anchor and is **foreign** (ignored).
+    pub guid: Option<String>,
+    /// Injected `SEADOG_OWNER` env, read back via inspect.
+    pub owner: Option<String>,
+    /// Realized MAC, when kento reports one (confirming-when-present).
+    pub mac: Option<String>,
+    /// SSH host-key fingerprints, when kento reports them
+    /// (confirming-when-present; a soft confirmer — regenerated keys must
+    /// not strand an env).
+    pub ssh_host_key_fps: Vec<String>,
+    /// Image ref/name kento reports for the instance.
+    pub image: String,
+    /// kento-reported status text (informational).
+    pub status: String,
+    /// Backend vmid when kento exposes one (PVE backends only);
+    /// informational, never an identity key.
+    pub vmid: Option<u32>,
 }
 
 /// A fully-resolved provisioning request: every field has already been
 /// re-validated by `seadog-priv` against its own config load. The MAC,
-/// IP, vmid, name and GUID were allocated by the (untrusted) front-end but
+/// IP, name and GUID were allocated by the (untrusted) front-end but
 /// re-checked here; `image_ref` is the allowlisted ref the server picked,
-/// never a raw caller ref.
+/// never a raw caller ref. No vmid: kento auto-assigns where the backend
+/// has one (PVE), and seadog no longer allocates it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionSpec {
-    /// Allocated Proxmox guest id (re-validated in-range).
-    pub vmid: u32,
     /// LXC or VM.
     pub mode: Mode,
     /// Allowlisted OCI image ref (server-resolved, never caller-supplied).
@@ -89,10 +102,11 @@ pub struct ProvisionSpec {
     pub gateway: String,
     /// PVE bridge `kento` attaches the guest to (config `allocation.bridge`).
     pub bridge: String,
-    /// Instance GUID minted by the front-end (written into the desc marker).
+    /// Instance GUID minted by the front-end (injected as the
+    /// `SEADOG_GUID` env — the create-time-immutable identity anchor).
     pub guid: String,
-    /// Resolved owner (trusted from the front-end; written into the desc
-    /// marker so teardown can verify ownership against live PVE).
+    /// Resolved owner (trusted from the front-end; injected as the
+    /// `SEADOG_OWNER` env so the instance carries its owner natively).
     pub owner: String,
     /// Path to a root-owned file of the OWNER's authorized ssh pubkey line(s)
     /// (one `ssh-…` per line) to inject into the guest so the owner can log
@@ -105,53 +119,31 @@ pub struct ProvisionSpec {
     pub ssh_key_user: String,
 }
 
-/// What [`Kento::provision`] reports back: the **effective** MAC the guest
-/// actually carries after create, or `None` when it is unobservable. For a
-/// VM this is `Some` the MAC seadog passed (`--mac`). For an LXC it is `None`
-/// — a kento LXC's MAC is not exposed by `pct config` (the hwaddr lives only
-/// in the raw lxc config), so there is no real MAC to read back. The
-/// front-end records `Some` → the MAC, `None` → `""` on the DB row, so
-/// identity treats MAC as confirming-when-present.
+/// What [`Kento::provision`] reports back, read from kento's `inspect
+/// --json` after create: the realized MAC (kento now reports it for BOTH
+/// LXC and VM — `Some` whenever present), the SSH host-key fingerprints,
+/// and the backend vmid when one exists (PVE backends; `None` otherwise).
+/// The front-end records these on the DB row; identity treats MAC and
+/// host-key fps as confirming-when-present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionOutcome {
-    /// The MAC the realized guest actually carries, or `None` when it is
-    /// unobservable (the kento LXC path).
+    /// The MAC the realized instance carries, or `None` if kento reports
+    /// none.
     pub mac: Option<String>,
-}
-
-impl ProvisionSpec {
-    /// The guest `description` body seadog writes at create: the GUID and
-    /// owner marker lines [`crate::identity`] greps back out. Kept here so
-    /// `FakeKento` (markers in-memory) and `RealKento` (markers via
-    /// `qm`/`pct set --description`) build an identical block.
-    pub fn description_marker(&self) -> String {
-        format!(
-            "{GUID_MARKER_PREFIX}{guid}\n{OWNER_MARKER_PREFIX}{owner}",
-            guid = self.guid,
-            owner = self.owner,
-        )
-    }
-}
-
-/// A narrow metadata update for [`Kento::set_meta`]: any combination of a
-/// new description and/or a TTL-deadline (unix epoch seconds). Both are
-/// optional so a caller can touch just one.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MetaUpdate {
-    /// Replacement description body, if updating it.
-    pub description: Option<String>,
-    /// TTL-deadline as a unix epoch second, if updating it.
-    pub ttl_deadline: Option<i64>,
+    /// The realized SSH host-key fingerprints (empty if kento reports none).
+    pub ssh_host_key_fps: Vec<String>,
+    /// Backend vmid when kento exposes one (PVE backends); `None` otherwise.
+    pub vmid: Option<u32>,
 }
 
 /// In-memory [`Kento`] for tests. Always compiled (not `#[cfg(test)]`) so
 /// later integration tests in sibling crates can drive it too.
 ///
-/// Tests populate [`FakeKento::guests`], then assert on
-/// [`FakeKento::teardowns`] to see exactly what got reaped. Priming
-/// [`FakeKento::quorum_lost`] makes both `list_guests` and `teardown`
-/// return [`Error::QuorumLost`], so the reaper's stop-on-quorum-loss path
-/// is testable without a cluster.
+/// Tests populate [`FakeKento::instances`] via [`FakeKento::set_instances`],
+/// then assert on [`FakeKento::teardowns`] to see exactly what got reaped.
+/// Priming [`FakeKento::quorum_lost`] makes both `list_instances` and
+/// `teardown` return [`Error::QuorumLost`], so the reaper's
+/// stop-on-quorum-loss path is testable without a cluster.
 #[derive(Default)]
 pub struct FakeKento {
     inner: Mutex<FakeState>,
@@ -159,15 +151,11 @@ pub struct FakeKento {
 
 #[derive(Default)]
 struct FakeState {
-    guests: Vec<GuestSignals>,
+    instances: Vec<InstanceSignals>,
     /// Teardown calls recorded as `(name, mode)` — `kento` destroys by name.
     teardowns: Vec<(String, Mode)>,
     /// Provision calls recorded so tests can assert exact params.
     provisions: Vec<ProvisionSpec>,
-    /// `set_meta` calls recorded, in order.
-    set_metas: Vec<(u32, Mode, MetaUpdate)>,
-    /// vmids `start_sshd` was called on, in order.
-    sshd_starts: Vec<u32>,
     /// When set, every op returns this quorum-loss message.
     quorum_lost: Option<String>,
     /// Optional per-name teardown failures (non-quorum), to test errors.
@@ -175,14 +163,14 @@ struct FakeState {
 }
 
 impl FakeKento {
-    /// A fresh fake with no guests.
+    /// A fresh fake with no instances.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Replace the live guest list the sweeper will observe.
-    pub fn set_guests(&self, guests: Vec<GuestSignals>) {
-        self.inner.lock().unwrap().guests = guests;
+    /// Replace the live instance list the sweeper will observe.
+    pub fn set_instances(&self, instances: Vec<InstanceSignals>) {
+        self.inner.lock().unwrap().instances = instances;
     }
 
     /// Prime a quorum-loss condition: every subsequent op fails with
@@ -209,31 +197,33 @@ impl FakeKento {
     pub fn provisions(&self) -> Vec<ProvisionSpec> {
         self.inner.lock().unwrap().provisions.clone()
     }
+}
 
-    /// The `set_meta` calls recorded so far, in order.
-    pub fn set_metas(&self) -> Vec<(u32, Mode, MetaUpdate)> {
-        self.inner.lock().unwrap().set_metas.clone()
+/// Deterministic fake MAC derived from the instance name, so an LXC
+/// provision yields a stable (non-empty) MAC the way kento now does —
+/// the empty-sentinel LXC dance is gone.
+fn fake_mac(name: &str) -> String {
+    let mut h: u64 = 1469598103934665603;
+    for b in name.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(1099511628211);
     }
-
-    /// The vmids `start_sshd` was called on, in order.
-    pub fn sshd_starts(&self) -> Vec<u32> {
-        self.inner.lock().unwrap().sshd_starts.clone()
-    }
+    let o = h.to_be_bytes();
+    format!(
+        "02:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        o[1], o[2], o[3], o[4], o[5]
+    )
 }
 
 impl Kento for FakeKento {
-    fn list_guests(&self, vmid_range: (u32, u32)) -> Result<Vec<GuestSignals>, Error> {
+    fn list_instances(&self) -> Result<Vec<InstanceSignals>, Error> {
         let st = self.inner.lock().unwrap();
         if let Some(msg) = &st.quorum_lost {
             return Err(Error::QuorumLost(msg.clone()));
         }
-        let (lo, hi) = vmid_range;
-        Ok(st
-            .guests
-            .iter()
-            .filter(|g| g.vmid >= lo && g.vmid <= hi)
-            .cloned()
-            .collect())
+        // kento only knows kento instances — return the set list as-is, no
+        // vmid-range filter.
+        Ok(st.instances.clone())
     }
 
     fn teardown(&self, name: &str, mode: Mode) -> Result<(), Error> {
@@ -245,9 +235,9 @@ impl Kento for FakeKento {
             return Err(Error::Kento(msg));
         }
         st.teardowns.push((name.to_string(), mode));
-        // Remove the guest by name so a subsequent list_guests reflects the
-        // destroy (kento removes by instance name, not vmid).
-        st.guests.retain(|g| g.name.as_deref() != Some(name));
+        // Remove the instance by name so a subsequent list_instances
+        // reflects the destroy (kento removes by instance name).
+        st.instances.retain(|i| i.name != name);
         Ok(())
     }
 
@@ -256,42 +246,35 @@ impl Kento for FakeKento {
         if let Some(msg) = &st.quorum_lost {
             return Err(Error::QuorumLost(msg.clone()));
         }
-        // Model REALITY: `--mac` is VM-only. For a VM the realized guest
-        // carries the passed MAC (`Some`). For an LXC the MAC is unobservable
-        // via `pct config` (kento LXC), so the realized guest carries NO MAC
-        // (`None`) and the outcome reports `None`. A later teardown still
-        // triangulates the LXC via the GUID/owner desc markers + seadog- name.
+        // kento now knows the realized MAC for BOTH modes: a VM keeps the
+        // passed `--mac`; an LXC gets a kento-assigned MAC (we synthesize a
+        // deterministic fake one — no empty sentinel anymore).
         let effective_mac = match spec.mode {
-            Mode::Vm => Some(spec.mac.clone()),
-            Mode::Lxc => None,
+            Mode::Vm => spec.mac.clone(),
+            Mode::Lxc => fake_mac(&spec.name),
         };
-        st.guests.push(GuestSignals {
-            vmid: spec.vmid,
-            name: Some(spec.name.clone()),
-            description: Some(spec.description_marker()),
-            mac: effective_mac.clone(),
-            fingerprint: Default::default(),
+        // Synthesize a couple of stable host-key fingerprints.
+        let fps = vec![
+            format!("SHA256:fp-ed25519-{}", spec.name),
+            format!("SHA256:fp-rsa-{}", spec.name),
+        ];
+        st.instances.push(InstanceSignals {
+            name: spec.name.clone(),
+            guid: Some(spec.guid.clone()),
+            owner: Some(spec.owner.clone()),
+            mac: Some(effective_mac.clone()),
+            ssh_host_key_fps: fps.clone(),
+            image: spec.image_ref.clone(),
+            status: "running".to_string(),
+            // FakeKento has no PVE backend → no vmid.
+            vmid: None,
         });
         st.provisions.push(spec.clone());
-        Ok(ProvisionOutcome { mac: effective_mac })
-    }
-
-    fn set_meta(&self, vmid: u32, mode: Mode, meta: &MetaUpdate) -> Result<(), Error> {
-        let mut st = self.inner.lock().unwrap();
-        if let Some(msg) = &st.quorum_lost {
-            return Err(Error::QuorumLost(msg.clone()));
-        }
-        st.set_metas.push((vmid, mode, meta.clone()));
-        Ok(())
-    }
-
-    fn start_sshd(&self, vmid: u32) -> Result<(), Error> {
-        let mut st = self.inner.lock().unwrap();
-        if let Some(msg) = &st.quorum_lost {
-            return Err(Error::QuorumLost(msg.clone()));
-        }
-        st.sshd_starts.push(vmid);
-        Ok(())
+        Ok(ProvisionOutcome {
+            mac: Some(effective_mac),
+            ssh_host_key_fps: fps,
+            vmid: None,
+        })
     }
 }
 
@@ -997,36 +980,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fake_filters_by_range_and_records_teardowns() {
+    fn fake_lists_set_instances_and_records_teardowns() {
         let k = FakeKento::new();
-        k.set_guests(vec![
-            GuestSignals {
-                vmid: 9999,
+        k.set_instances(vec![
+            InstanceSignals {
+                name: "seadog-a".into(),
+                guid: Some("g-a".into()),
                 ..Default::default()
             },
-            GuestSignals {
-                vmid: 10010,
-                ..Default::default()
-            },
-            GuestSignals {
-                vmid: 11000,
+            InstanceSignals {
+                name: "seadog-b".into(),
+                guid: Some("g-b".into()),
                 ..Default::default()
             },
         ]);
-        let listed = k.list_guests((10000, 10999)).unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].vmid, 10010);
+        // No vmid-range filter: the set list IS the live list.
+        let listed = k.list_instances().unwrap();
+        assert_eq!(listed.len(), 2);
 
-        k.teardown("seadog-some-guest", Mode::Vm).unwrap();
-        assert_eq!(
-            k.teardowns(),
-            vec![("seadog-some-guest".to_string(), Mode::Vm)]
-        );
+        k.teardown("seadog-a", Mode::Vm).unwrap();
+        assert_eq!(k.teardowns(), vec![("seadog-a".to_string(), Mode::Vm)]);
+        // The torn-down instance is gone from a subsequent list.
+        let listed = k.list_instances().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "seadog-b");
     }
 
     fn sample_spec(mode: Mode) -> ProvisionSpec {
         ProvisionSpec {
-            vmid: 10010,
             mode,
             image_ref: "registry/loom:1".into(),
             name: "seadog-alice-proj-ab12".into(),
@@ -1043,96 +1024,78 @@ mod tests {
     }
 
     #[test]
-    fn fake_provision_realizes_triangulatable_guest() {
-        use crate::identity::{extract_desc_guid, extract_desc_owner};
+    fn fake_provision_realizes_classifiable_instance() {
         let k = FakeKento::new();
         let spec = sample_spec(Mode::Lxc);
         let outcome = k.provision(&spec).unwrap();
         assert_eq!(k.provisions(), vec![spec.clone()]);
 
-        // The realized guest carries every marker teardown triangulates on.
-        let listed = k.list_guests((10000, 10999)).unwrap();
+        // The realized instance carries the injected GUID/owner anchor + a
+        // kento-reported MAC and host-key fps (no empty-sentinel LXC dance).
+        let listed = k.list_instances().unwrap();
         assert_eq!(listed.len(), 1);
-        let g = &listed[0];
-        assert_eq!(g.name.as_deref(), Some("seadog-alice-proj-ab12"));
-        // LXC: the MAC is unobservable via pct config, so the outcome MAC is
-        // None and the realized guest carries no MAC. It still triangulates
-        // via the GUID/owner desc markers + the seadog- name (below).
-        assert_eq!(outcome.mac, None);
-        assert_eq!(g.mac, None);
-        assert_eq!(
-            extract_desc_guid(g.description.as_deref()),
-            Some("guid-abc".into())
-        );
-        assert_eq!(
-            extract_desc_owner(g.description.as_deref()),
-            Some("alice".into())
-        );
+        let i = &listed[0];
+        assert_eq!(i.name, "seadog-alice-proj-ab12");
+        assert_eq!(i.guid.as_deref(), Some("guid-abc"));
+        assert_eq!(i.owner.as_deref(), Some("alice"));
+        assert!(i.mac.is_some(), "LXC now has a kento-reported MAC");
+        assert_eq!(i.mac, outcome.mac);
+        assert!(!i.ssh_host_key_fps.is_empty());
+        assert_eq!(i.ssh_host_key_fps, outcome.ssh_host_key_fps);
+        assert_eq!(outcome.vmid, None);
 
         // Teardown by the realized name removes it.
         k.teardown(&spec.name, Mode::Lxc).unwrap();
-        assert!(k.list_guests((10000, 10999)).unwrap().is_empty());
-    }
-
-    #[test]
-    fn mac_persists_for_vm_and_is_empty_sentinel_for_lxc() {
-        // Regression: a VM env persists its (non-empty) minted MAC, while an
-        // LXC env persists the `""` sentinel (the front-end maps the LXC's
-        // `None` outcome → "" on the DB row). LXC MAC is unobservable by
-        // design (empty "" sentinel), VMs keep their real minted/pinned MAC.
-        let k = FakeKento::new();
-
-        // VM: the realized guest carries the minted MAC; outcome is Some.
-        let vm = sample_spec(Mode::Vm);
-        let vm_out = k.provision(&vm).unwrap();
-        assert_eq!(vm_out.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
-        assert!(!vm_out.mac.unwrap().is_empty());
-
-        // LXC: the MAC is unobservable, so the outcome is None — which the
-        // front-end records as the empty "" sentinel (never a fictional MAC).
-        let lxc = sample_spec(Mode::Lxc);
-        let lxc_out = k.provision(&lxc).unwrap();
-        assert_eq!(lxc_out.mac, None);
-        // The "" the front-end would record never equals a real live MAC.
-        let recorded_lxc_mac = lxc_out.mac.unwrap_or_default();
-        assert_eq!(recorded_lxc_mac, "");
+        assert!(k.list_instances().unwrap().is_empty());
     }
 
     #[test]
     fn fake_provision_vm_keeps_passed_mac() {
-        // VM path: --mac is honored, so the effective MAC is Some(spec's).
+        // VM path: --mac is honored, so the effective MAC is the spec's.
         let k = FakeKento::new();
         let spec = sample_spec(Mode::Vm);
         let outcome = k.provision(&spec).unwrap();
         assert_eq!(outcome.mac.as_deref(), Some(spec.mac.as_str()));
-        let listed = k.list_guests((10000, 10999)).unwrap();
+        let listed = k.list_instances().unwrap();
         assert_eq!(listed[0].mac.as_deref(), Some(spec.mac.as_str()));
     }
 
     #[test]
-    fn fake_records_set_meta_and_sshd() {
+    fn fake_provision_lxc_synthesizes_nonempty_mac() {
+        // Regression: kento now reports an LXC MAC, so the outcome is Some and
+        // non-empty (the old `""` empty-sentinel for LXC is gone).
         let k = FakeKento::new();
-        let meta = MetaUpdate {
-            description: Some("d".into()),
-            ttl_deadline: Some(5000),
-        };
-        k.set_meta(10010, Mode::Vm, &meta).unwrap();
-        k.start_sshd(10010).unwrap();
-        assert_eq!(k.set_metas(), vec![(10010, Mode::Vm, meta)]);
-        assert_eq!(k.sshd_starts(), vec![10010]);
+        let lxc = sample_spec(Mode::Lxc);
+        let out = k.provision(&lxc).unwrap();
+        let mac = out.mac.expect("LXC MAC is now reported");
+        assert!(!mac.is_empty());
     }
 
     #[test]
     fn fake_signals_quorum_loss() {
         let k = FakeKento::new();
         k.set_quorum_lost("no quorum");
-        assert!(matches!(
-            k.list_guests((10000, 10999)),
-            Err(Error::QuorumLost(_))
-        ));
+        assert!(matches!(k.list_instances(), Err(Error::QuorumLost(_))));
         assert!(matches!(
             k.teardown("seadog-x", Mode::Vm),
             Err(Error::QuorumLost(_))
         ));
+    }
+
+    #[test]
+    fn fake_teardown_failure_hook() {
+        let k = FakeKento::new();
+        k.set_instances(vec![InstanceSignals {
+            name: "seadog-x".into(),
+            guid: Some("g-x".into()),
+            ..Default::default()
+        }]);
+        k.fail_teardown("seadog-x", "boom");
+        assert!(matches!(
+            k.teardown("seadog-x", Mode::Lxc),
+            Err(Error::Kento(_))
+        ));
+        // The instance is still present (teardown failed).
+        assert_eq!(k.list_instances().unwrap().len(), 1);
     }
 }

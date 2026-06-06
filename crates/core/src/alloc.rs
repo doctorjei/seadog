@@ -1,34 +1,35 @@
-//! Atomic vmid + IP allocation.
+//! Atomic name + IP allocation.
 //!
-//! [`allocate`] picks the lowest-available vmid in `[range.0, range.1]`
-//! and the lowest-available IPv4 in `[pool.0, pool.1]`, skipping values
-//! currently held by an `Active` env. Concurrency-safe: the read + the
-//! write happen inside a single `BEGIN IMMEDIATE` transaction, which
-//! takes a RESERVED lock up front so two concurrent allocators cannot
-//! observe the same gap and both claim it. The "lease" is just the
-//! inserted `Active` env row — releasing is transitioning that row out
-//! of `Active` (see [`crate::store::mark_reaped`] /
-//! [`crate::store::mark_vanished`]), which frees the vmid/ip for reuse.
+//! [`allocate`] picks the lowest-available IPv4 in `[pool.0, pool.1]`,
+//! skipping addresses currently held by an `Active` env, and inserts the
+//! leased env row. Concurrency-safe: the read + the write happen inside a
+//! single `BEGIN IMMEDIATE` transaction, which takes a RESERVED lock up
+//! front so two concurrent allocators cannot observe the same gap and both
+//! claim it. The "lease" is just the inserted `Active` env row — releasing
+//! is transitioning that row out of `Active` (see
+//! [`crate::store::mark_reaped`] / [`crate::store::mark_vanished`]), which
+//! frees the IP for reuse. vmid is no longer allocated: kento auto-assigns
+//! a backend vmid where one exists (PVE), and seadog allocates by unique
+//! name + IP only.
 
 use std::net::Ipv4Addr;
 
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::models::{Env, EnvStatus, Mode};
 use crate::Error;
 
-/// A claimed allocation: the lowest-available vmid + IP.
+/// A claimed allocation: the lowest-available IP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Allocation {
-    pub vmid: u32,
     pub ip: Ipv4Addr,
 }
 
 /// Inputs needed to materialize the leased env row once a slot is found.
 ///
 /// Allocation and row-insert are one atomic step, so the caller supplies
-/// the rest of the [`Env`] fields up front. `vmid`/`ip` are filled in by
-/// the allocator.
+/// the rest of the [`Env`] fields up front. `ip` is filled in by the
+/// allocator; `vmid` is no longer allocated (kento auto-assigns it).
 pub struct NewEnv<'a> {
     pub guid: &'a str,
     pub mode: Mode,
@@ -41,38 +42,37 @@ pub struct NewEnv<'a> {
     pub soft_deadline: i64,
 }
 
-/// Allocate the lowest-available vmid + IP and insert the `Active` env
-/// row, atomically.
+/// Allocate the lowest-available IP and insert the `Active` env row,
+/// atomically.
 ///
-/// `vmid_range` and `ip_pool` are inclusive `[low, high]`. Returns the
-/// claimed [`Allocation`]; the env is persisted with `status = Active`
-/// inside the same transaction. Returns [`Error::Exhausted`] if either
-/// the vmid range or the IP pool has no free slot.
+/// `ip_pool` is an inclusive `[low, high]`. Returns the claimed
+/// [`Allocation`]; the env is persisted with `status = Active` inside the
+/// same transaction (vmid `NULL`, host-key fps empty — both are recorded
+/// post-provision from the kento read-back). Returns [`Error::Exhausted`]
+/// if the IP pool has no free slot.
 pub fn allocate(
     conn: &mut Connection,
-    vmid_range: (u32, u32),
     ip_pool: (Ipv4Addr, Ipv4Addr),
     new: &NewEnv<'_>,
 ) -> Result<Allocation, Error> {
     // IMMEDIATE: take the RESERVED write lock now, before reading the
-    // occupied sets — serializes concurrent allocators so two cannot
+    // occupied set — serializes concurrent allocators so two cannot
     // pick the same gap.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-    let vmid = lowest_free_vmid(&tx, vmid_range)?
-        .ok_or_else(|| Error::Exhausted("vmid range".to_string()))?;
     let ip =
         lowest_free_ip(&tx, ip_pool)?.ok_or_else(|| Error::Exhausted("ip pool".to_string()))?;
 
     let env = Env {
         guid: new.guid.to_string(),
-        vmid,
+        vmid: None,
         mode: new.mode,
         owner: new.owner.to_string(),
         image: new.image.to_string(),
         name: new.name.to_string(),
         ip: ip.to_string(),
         mac: new.mac.to_string(),
+        ssh_host_key_fps: Vec::new(),
         created_at: new.created_at,
         ttl_deadline: new.ttl_deadline,
         soft_deadline: new.soft_deadline,
@@ -81,9 +81,9 @@ pub fn allocate(
 
     tx.execute(
         r#"INSERT INTO envs
-            (guid, vmid, mode, owner, image, name, ip, mac,
+            (guid, vmid, mode, owner, image, name, ip, mac, ssh_host_key_fps,
              created_at, ttl_deadline, soft_deadline, status)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
         params![
             env.guid,
             env.vmid,
@@ -93,6 +93,7 @@ pub fn allocate(
             env.name,
             env.ip,
             env.mac,
+            env.ssh_host_key_fps.join(","),
             env.created_at,
             env.ttl_deadline,
             env.soft_deadline,
@@ -101,38 +102,23 @@ pub fn allocate(
     )?;
 
     tx.commit()?;
-    Ok(Allocation { vmid, ip })
+    Ok(Allocation { ip })
 }
 
-/// Lowest vmid in `[lo, hi]` not held by an `Active` env, or `None` if
-/// the range is full.
-fn lowest_free_vmid(conn: &Connection, (lo, hi): (u32, u32)) -> Result<Option<u32>, Error> {
-    let mut stmt = conn.prepare(
-        "SELECT vmid FROM envs WHERE status = 'active' \
-         AND vmid BETWEEN ?1 AND ?2 ORDER BY vmid",
-    )?;
-    let mut rows = stmt.query(params![lo, hi])?;
-
-    // Walk the occupied set in ascending order; the first integer it
-    // skips is the lowest free slot.
-    let mut candidate = lo;
-    while let Some(row) = rows.next()? {
-        let used: u32 = row.get(0)?;
-        if used > candidate {
-            return Ok(Some(candidate));
-        }
-        if used == candidate {
-            if candidate == hi {
-                return Ok(None);
-            }
-            candidate += 1;
-        }
-    }
-    if candidate <= hi {
-        Ok(Some(candidate))
-    } else {
-        Ok(None)
-    }
+/// Whether an `Active` env already holds the instance `name`.
+///
+/// Name is now an allocation key (unique among live envs), so the
+/// front-end checks this before minting a guest name. Terminal rows
+/// (reaped/vanished) free the name for reuse, so only `Active` rows count.
+pub fn name_in_use(conn: &Connection, name: &str) -> Result<bool, Error> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM envs WHERE status = 'active' AND name = ?1 LIMIT 1",
+            params![name],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 /// Lowest IPv4 in `[lo, hi]` not held by an `Active` env, or `None` if

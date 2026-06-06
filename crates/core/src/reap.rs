@@ -1,31 +1,33 @@
 //! The shared sweep: one codepath for all three reap triggers
 //! (opportunistic, watch-loop, systemd-backstop).
 //!
-//! [`sweep`] scans the vmid range via [`Kento::list_guests`], loads the
-//! matching DB rows, [`classify`](crate::identity::classify)es each live
-//! guest, and acts:
-//! - **age floor**: never reap an env younger than `lifecycle.age_floor`
-//!   (covers the non-atomic create window).
-//! - **deadline**: only [`Reap`](crate::identity::Classification::Reap)-
-//!   classified envs **past their DB `ttl_deadline`** are torn down.
-//! - **grace warning**: warn when within `lifecycle.grace` of the
-//!   deadline, before the kill.
-//! - **herd cap**: at most `lifecycle.herd_cap` teardowns per sweep; the
-//!   remainder is carried to the next tick and **logged**, never silently
-//!   dropped.
-//! - **anomaly / heads-up**: routed to [`notify`](crate::notify), never
-//!   destroyed.
+//! [`sweep`] enumerates every live kento instance via
+//! [`Kento::list_instances`], joins each to its DB row **by GUID**,
+//! [`classify`](crate::identity::classify)es it, and acts:
+//! - **foreign**: an instance with no `SEADOG_GUID` is ignored (kento only
+//!   lists kento instances anyway).
+//! - **orphan**: a GUID with no DB row is **re-adopted** onto a fresh
+//!   `Active` row (deadline = `now + lifecycle.default_ttl`) and flagged.
+//! - **anomaly**: a name/MAC confirmer mismatch is routed to
+//!   [`notify`](crate::notify) (create-window-suppressed inside the age
+//!   floor when a DB row exists), never destroyed.
+//! - **reap-eligible**: gated by age floor, DB `ttl_deadline` (+ grace
+//!   warning) and the per-sweep herd cap before teardown.
+//! - **vanished**: after the live pass, every `Active` DB row whose GUID is
+//!   absent from the live set is marked `Vanished`.
 //! - **quorum loss**: surfaced and the sweep stops cleanly — no spin.
 //!
-//! The heartbeat (`last_sweep_at = now`) is written at the end so
-//! `health` can detect a dead reaper.
+//! The heartbeat (`last_sweep_at = now`) is written at the end so `health`
+//! can detect a dead reaper.
+
+use std::collections::HashSet;
 
 use rusqlite::Connection;
 
 use crate::config::Config;
-use crate::identity::{classify, Classification, GuestSignals};
-use crate::kento::Kento;
-use crate::models::{Env, EnvStatus};
+use crate::identity::{classify, Classification};
+use crate::kento::{InstanceSignals, Kento};
+use crate::models::{Env, EnvStatus, Mode};
 use crate::notify::{decide, emit, Event};
 use crate::{store, Error};
 
@@ -34,22 +36,23 @@ use crate::{store, Error};
 pub struct SweepOutcome {
     /// Envs actually torn down this tick.
     pub reaped: u32,
-    /// Anomalies routed to notify (flagged, never destroyed).
+    /// Anomalies routed to notify (flagged, never destroyed). Re-adopted
+    /// orphans also bump this (they route an anomaly event).
     pub flagged: u32,
-    /// Foreign heads-ups routed to notify.
-    pub heads_up: u32,
+    /// Orphans re-adopted onto a fresh DB row this tick.
+    pub readopted: u32,
     /// Envs eligible to reap but deferred by the herd cap (carried over).
     pub deferred: u32,
-    /// Envs detected as vanished (row present, guest gone).
+    /// Envs detected as vanished (Active row, GUID absent from live set).
     pub vanished: u32,
     /// Set when a quorum-loss aborted the sweep early.
     pub quorum_lost: Option<String>,
 }
 
-/// Run one sweep over the configured vmid range.
+/// Run one sweep over every live kento instance.
 ///
 /// `now_unix` is injected so tests control time. On a quorum-loss signal
-/// from `list_guests`/`teardown`, the sweep records it in
+/// from `list_instances`/`teardown`, the sweep records it in
 /// [`SweepOutcome::quorum_lost`], routes a `SweeperDegraded` notify, and
 /// returns **cleanly** — it does not retry in a loop. The heartbeat is
 /// written at the end (even on quorum loss, so health sees liveness).
@@ -60,10 +63,9 @@ pub fn sweep(
     now_unix: i64,
 ) -> Result<SweepOutcome, Error> {
     let mut outcome = SweepOutcome::default();
-    let [lo, hi] = config.allocation.vmid_range;
 
-    let guests = match kento.list_guests((lo, hi)) {
-        Ok(g) => g,
+    let instances = match kento.list_instances() {
+        Ok(i) => i,
         Err(Error::QuorumLost(msg)) => {
             surface_quorum_loss(config, &msg, now_unix, conn);
             outcome.quorum_lost = Some(msg);
@@ -74,20 +76,55 @@ pub fn sweep(
         Err(e) => return Err(e),
     };
 
+    // The live GUID set, for the vanished pass. Only instances carrying a
+    // SEADOG_GUID participate (foreign instances have none).
+    let live_guids: HashSet<String> = instances.iter().filter_map(|i| i.guid.clone()).collect();
+
     let age_floor = config.lifecycle.age_floor.as_secs() as i64;
     let grace = config.lifecycle.grace.as_secs() as i64;
     let herd_cap = config.lifecycle.herd_cap;
 
-    for g in &guests {
-        // The authoritative row for this vmid is the *active* one, if any.
-        let db_row = active_env_for_vmid(conn, g.vmid)?;
-        let cls = classify(g, db_row.as_ref(), None, config);
+    for sig in &instances {
+        // Join the live instance to its DB row by GUID (None when foreign).
+        let db_row = match &sig.guid {
+            Some(g) => store::get_env(conn, g)?,
+            None => None,
+        };
+        let cls = classify(sig, db_row.as_ref());
 
         match cls {
-            Classification::Reap { guid, .. } => {
+            // Foreign: not ours, ignore entirely (no notify).
+            Classification::Foreign => {}
+
+            // Orphan: a GUID with no DB row → re-adopt onto a fresh Active
+            // row and flag the event for the operator.
+            Classification::Orphan { guid, owner } => {
+                readopt_orphan(conn, config, now_unix, sig, &guid, owner, &mut outcome);
+            }
+
+            // Anomaly: a hard-confirmer mismatch. Suppress inside the create
+            // window when a DB row exists (it carries created_at); otherwise
+            // flag + route.
+            Classification::Anomaly { detail, .. } => {
+                if let Some(env) = db_row.as_ref() {
+                    if now_unix - env.created_at < age_floor {
+                        continue;
+                    }
+                }
+                outcome.flagged += 1;
+                let guid = db_row
+                    .map(|e| e.guid)
+                    .or_else(|| sig.guid.clone())
+                    .unwrap_or_else(|| format!("name-{}", sig.name));
+                route(conn, config, now_unix, Event::Anomaly { guid, detail });
+            }
+
+            // Reap-eligible: GUID + confirmers agree. A ReapEligible always
+            // implies a DB row (classify returns it only when one matched).
+            Classification::ReapEligible { guid } => {
                 let env = match db_row {
                     Some(e) => e,
-                    None => continue, // unreachable: Reap implies a row
+                    None => continue, // unreachable: ReapEligible implies a row
                 };
                 handle_reap_candidate(
                     kento,
@@ -97,7 +134,7 @@ pub fn sweep(
                     age_floor,
                     grace,
                     herd_cap,
-                    g,
+                    sig,
                     &env,
                     &guid,
                     &mut outcome,
@@ -106,64 +143,26 @@ pub fn sweep(
                     break;
                 }
             }
-            Classification::Anomaly { detail, .. } => {
-                // Create-window suppression: a just-born guest can carry a
-                // GUID marker before set-meta has fully landed its DB row,
-                // so `classify` transiently sees a marker/DB mismatch and
-                // returns `Anomaly`. The age floor (same gate the reap path
-                // uses for the non-atomic create window at
-                // `handle_reap_candidate`) is the discriminator: when there
-                // IS a DB row AND the guest is younger than `age_floor`, it
-                // is still inside that window and will reconcile on the next
-                // sweep once set-meta lands. Suppress it entirely — no
-                // `warning`/`notify_state` row is persisted, so these
-                // transient mismatches don't accumulate as stale unacked
-                // alerts. We deliberately do NOT increment `outcome.flagged`
-                // here: a suppressed create-window anomaly is transient and
-                // expected, not a flagged anomaly; the sweep loop continues
-                // normally either way.
-                //
-                // We only suppress when a DB row exists (it carries
-                // `created_at`, the only source of age here). A
-                // marker-bearing guest with NO db row in range cannot have
-                // its age computed and is treated as a genuine anomaly worth
-                // flagging. An OLD guest (age >= age_floor) is likewise a
-                // genuine anomaly and flagged exactly as before — this is
-                // also why the gate can't mask a real vmid-reuse anomaly on
-                // an aged guest.
-                if let Some(env) = db_row.as_ref() {
-                    if now_unix - env.created_at < age_floor {
-                        continue;
-                    }
-                }
-                outcome.flagged += 1;
-                let guid = db_row
-                    .map(|e| e.guid)
-                    .unwrap_or_else(|| format!("vmid-{}", g.vmid));
-                route(conn, config, now_unix, Event::Anomaly { guid, detail });
-            }
-            Classification::HeadsUp { detail, .. } => {
-                outcome.heads_up += 1;
-                route(
-                    conn,
-                    config,
-                    now_unix,
-                    Event::ForeignHeadsUp {
-                        guid_or_vmid: format!("vmid-{}", g.vmid),
-                        detail,
-                    },
-                );
-            }
-            Classification::Vanished { guid } => {
+        }
+    }
+
+    // Vanished pass: every Active DB row whose GUID is absent from the live
+    // set has lost its backing instance. Mark it Vanished + route lifecycle.
+    if outcome.quorum_lost.is_none() {
+        for env in store::list_by_status(conn, EnvStatus::Active)? {
+            if !live_guids.contains(&env.guid) {
                 outcome.vanished += 1;
-                let _ = store::mark_vanished(conn, &guid);
+                let _ = store::mark_vanished(conn, &env.guid);
                 route(
                     conn,
                     config,
                     now_unix,
                     Event::Lifecycle {
-                        guid,
-                        detail: format!("guest at vmid {} vanished from PVE", g.vmid),
+                        guid: env.guid.clone(),
+                        detail: format!(
+                            "env {} ({}) vanished: no live kento instance carries its guid",
+                            env.guid, env.name
+                        ),
                     },
                 );
             }
@@ -174,7 +173,89 @@ pub fn sweep(
     Ok(outcome)
 }
 
-/// Decide + act on one `Reap`-classified guest: enforce age-floor +
+/// Re-adopt an orphan (GUID present, no DB row) onto a fresh `Active` row
+/// and route an anomaly event so the operator knows. Deadlines reuse
+/// `lifecycle.default_ttl` / `default_duration` (no new knob). Mutates
+/// `outcome` (`readopted` + `flagged`).
+fn readopt_orphan(
+    conn: &Connection,
+    config: &Config,
+    now_unix: i64,
+    sig: &InstanceSignals,
+    guid: &str,
+    owner: Option<String>,
+    outcome: &mut SweepOutcome,
+) {
+    let default_ttl = config.lifecycle.default_ttl.as_secs() as i64;
+    let default_duration = config.lifecycle.default_duration.as_secs() as i64;
+
+    let env = Env {
+        guid: guid.to_string(),
+        vmid: sig.vmid,
+        // kento `InstanceSignals` has no explicit mode; the status text does
+        // not encode it cleanly. Default to Lxc here.
+        // TODO(P4): mode from kento inspect.mode.
+        mode: mode_from_status(&sig.status),
+        owner: owner.unwrap_or_else(|| "unknown".to_string()),
+        image: sig.image.clone(),
+        name: sig.name.clone(),
+        // Lease unknown at adopt time — record empty.
+        ip: String::new(),
+        mac: sig.mac.clone().unwrap_or_default(),
+        ssh_host_key_fps: sig.ssh_host_key_fps.clone(),
+        created_at: now_unix,
+        ttl_deadline: now_unix + default_ttl,
+        soft_deadline: now_unix + default_duration,
+        status: EnvStatus::Active,
+    };
+
+    if let Err(e) = store::insert_env(conn, &env) {
+        // A racing insert (or guid collision) shouldn't abort the sweep;
+        // surface it as an anomaly and move on.
+        outcome.flagged += 1;
+        route(
+            conn,
+            config,
+            now_unix,
+            Event::Anomaly {
+                guid: guid.to_string(),
+                detail: format!("failed to re-adopt orphan {} ({}): {e}", guid, sig.name),
+            },
+        );
+        return;
+    }
+
+    outcome.readopted += 1;
+    outcome.flagged += 1;
+    route(
+        conn,
+        config,
+        now_unix,
+        Event::Anomaly {
+            guid: guid.to_string(),
+            detail: format!(
+                "re-adopted orphan {} ({}) with no DB row; fresh ttl deadline set",
+                guid, sig.name
+            ),
+        },
+    );
+}
+
+/// Best-effort mode guess for a re-adopted orphan from the kento status
+/// text. kento doesn't currently surface the mode cleanly in
+/// `InstanceSignals`, so a status string that mentions `vm` maps to a VM and
+/// everything else defaults to LXC.
+// TODO(P4): mode from kento inspect.mode (drop this heuristic).
+fn mode_from_status(status: &str) -> Mode {
+    let s = status.to_ascii_lowercase();
+    if s.contains("vm") || s.contains("qemu") {
+        Mode::Vm
+    } else {
+        Mode::Lxc
+    }
+}
+
+/// Decide + act on one `ReapEligible` instance: enforce age-floor +
 /// deadline, honor the herd cap, warn within grace, then teardown +
 /// mark-reaped. Mutates `outcome`.
 #[allow(clippy::too_many_arguments)]
@@ -186,7 +267,7 @@ fn handle_reap_candidate(
     age_floor: i64,
     grace: i64,
     herd_cap: u32,
-    g: &GuestSignals,
+    sig: &InstanceSignals,
     env: &Env,
     guid: &str,
     outcome: &mut SweepOutcome,
@@ -206,10 +287,7 @@ fn handle_reap_candidate(
                 now_unix,
                 Event::Lifecycle {
                     guid: guid.to_string(),
-                    detail: format!(
-                        "env {} (vmid {}) within grace of ttl deadline",
-                        guid, g.vmid
-                    ),
+                    detail: format!("env {} ({}) within grace of ttl deadline", guid, sig.name),
                 },
             );
         }
@@ -227,39 +305,17 @@ fn handle_reap_candidate(
             Event::OverdueUnreaped {
                 guid: guid.to_string(),
                 detail: format!(
-                    "env {} (vmid {}) overdue but deferred by herd cap ({herd_cap}/sweep)",
-                    guid, g.vmid
+                    "env {} ({}) overdue but deferred by herd cap ({herd_cap}/sweep)",
+                    guid, sig.name
                 ),
             },
         );
         return Ok(());
     }
 
-    // Tear it down by the LIVE guest name (kento destroys by name, cleaning
-    // its overlay state too). A `Reap` classification is unanimous, which
-    // requires the seadog- name prefix, so `g.name` is present here; guard
-    // defensively against a missing name rather than ever passing an empty
-    // one to a destroy.
-    let live_name = match g.name.as_deref() {
-        Some(n) if !n.is_empty() => n,
-        _ => {
-            outcome.deferred += 1;
-            route(
-                conn,
-                config,
-                now_unix,
-                Event::OverdueUnreaped {
-                    guid: guid.to_string(),
-                    detail: format!(
-                        "teardown of env {} (vmid {}) skipped: live guest has no name",
-                        guid, g.vmid
-                    ),
-                },
-            );
-            return Ok(());
-        }
-    };
-    match kento.teardown(live_name, env.mode) {
+    // Tear it down by the LIVE instance name (kento destroys by name,
+    // cleaning its overlay state too) and the DB row's mode.
+    match kento.teardown(&sig.name, env.mode) {
         Ok(()) => {
             store::mark_reaped(conn, guid)?;
             outcome.reaped += 1;
@@ -269,7 +325,7 @@ fn handle_reap_candidate(
                 now_unix,
                 Event::Lifecycle {
                     guid: guid.to_string(),
-                    detail: format!("reaped env {} (vmid {}) past ttl", guid, g.vmid),
+                    detail: format!("reaped env {} ({}) past ttl", guid, sig.name),
                 },
             );
         }
@@ -287,22 +343,12 @@ fn handle_reap_candidate(
                 now_unix,
                 Event::OverdueUnreaped {
                     guid: guid.to_string(),
-                    detail: format!("teardown of env {} (vmid {}) failed: {e}", guid, g.vmid),
+                    detail: format!("teardown of env {} ({}) failed: {e}", guid, sig.name),
                 },
             );
         }
     }
     Ok(())
-}
-
-/// Fetch the **active** env row for a vmid, if any. Terminal rows for the
-/// same (reused) vmid are ignored — only a live lease is authoritative
-/// for a live guest.
-fn active_env_for_vmid(conn: &Connection, vmid: u32) -> Result<Option<Env>, Error> {
-    match store::get_env_by_vmid(conn, vmid)? {
-        Some(env) if env.status == EnvStatus::Active => Ok(Some(env)),
-        _ => Ok(None),
-    }
 }
 
 /// Route an event through the notify policy: load prior state, [`decide`],
@@ -346,8 +392,7 @@ fn surface_quorum_loss(config: &Config, msg: &str, now_unix: i64, conn: &Connect
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::{Fingerprint, GUID_MARKER_PREFIX};
-    use crate::kento::FakeKento;
+    use crate::kento::{FakeKento, InstanceSignals};
     use crate::models::{Env, EnvStatus, Mode};
     use crate::store;
 
@@ -364,16 +409,17 @@ images:
         Config::from_yaml_str(yaml).unwrap()
     }
 
-    fn insert_active(conn: &Connection, guid: &str, vmid: u32, created_at: i64, ttl: i64) {
+    fn insert_active(conn: &Connection, guid: &str, created_at: i64, ttl: i64) {
         let env = Env {
             guid: guid.into(),
-            vmid,
+            vmid: Some(10010),
             mode: Mode::Vm,
             owner: "alice".into(),
             image: "loom".into(),
             name: format!("seadog-alice-p-{guid}"),
             ip: "192.168.99.200".into(),
-            mac: format!("aa:bb:cc:00:00:{:02x}", vmid % 256),
+            mac: "aa:bb:cc:00:00:11".into(),
+            ssh_host_key_fps: vec!["SHA256:hk".into()],
             created_at,
             ttl_deadline: ttl,
             soft_deadline: ttl - 600,
@@ -382,14 +428,18 @@ images:
         store::insert_env(conn, &env).unwrap();
     }
 
-    fn signals_for(conn: &Connection, guid: &str, vmid: u32) -> GuestSignals {
+    /// Live signals matching a DB row exactly (GUID + name + MAC + fps).
+    fn signals_for(conn: &Connection, guid: &str) -> InstanceSignals {
         let env = store::get_env(conn, guid).unwrap().unwrap();
-        GuestSignals {
-            vmid,
-            name: Some(env.name.clone()),
-            description: Some(format!("{GUID_MARKER_PREFIX}{guid}")),
+        InstanceSignals {
+            name: env.name.clone(),
+            guid: Some(guid.to_string()),
+            owner: Some(env.owner.clone()),
             mac: Some(env.mac.clone()),
-            fingerprint: Fingerprint::default(),
+            ssh_host_key_fps: env.ssh_host_key_fps.clone(),
+            image: env.image.clone(),
+            status: "running vm".to_string(),
+            vmid: env.vmid,
         }
     }
 
@@ -399,14 +449,13 @@ images:
         let conn = store::open_in_memory().unwrap();
         let now = 1_000_000i64;
         // Created 1 minute ago (< 5m age floor), already "expired".
-        insert_active(&conn, "g1", 10010, now - 60, now - 10);
+        insert_active(&conn, "g1", now - 60, now - 10);
         let k = FakeKento::new();
-        k.set_guests(vec![signals_for(&conn, "g1", 10010)]);
+        k.set_instances(vec![signals_for(&conn, "g1")]);
 
         let out = sweep(&k, &conn, &c, now).unwrap();
         assert_eq!(out.reaped, 0, "age floor must protect just-born env");
         assert!(k.teardowns().is_empty());
-        // Row still active.
         assert_eq!(
             store::get_env(&conn, "g1").unwrap().unwrap().status,
             EnvStatus::Active
@@ -414,14 +463,13 @@ images:
     }
 
     #[test]
-    fn past_deadline_unanimous_reaps_and_marks_row() {
+    fn past_deadline_agreeing_reaps_and_marks_row() {
         let c = config();
         let conn = store::open_in_memory().unwrap();
         let now = 1_000_000i64;
-        // Old enough (created 1h ago), past deadline.
-        insert_active(&conn, "g1", 10010, now - 3600, now - 100);
+        insert_active(&conn, "g1", now - 3600, now - 100);
         let k = FakeKento::new();
-        k.set_guests(vec![signals_for(&conn, "g1", 10010)]);
+        k.set_instances(vec![signals_for(&conn, "g1")]);
 
         let out = sweep(&k, &conn, &c, now).unwrap();
         assert_eq!(out.reaped, 1);
@@ -433,46 +481,45 @@ images:
             store::get_env(&conn, "g1").unwrap().unwrap().status,
             EnvStatus::Reaped
         );
-        // Heartbeat written.
         assert_eq!(store::read_heartbeat(&conn).unwrap(), Some(now));
     }
 
     #[test]
     fn lxc_no_mac_past_deadline_reaps() {
-        // An LXC env: the DB row records no MAC ("") and the live guest
-        // exposes none (mac=None), but GUID/name/desc all agree. Past its
-        // deadline + age floor, it must reap — the regression this fixes
-        // (previously the fictional row MAC vs None blocked the LXC path).
+        // LXC env: the DB row records no MAC ("") and the live instance
+        // exposes none (mac=None), but GUID + name agree. Past deadline +
+        // age floor, it must reap (the MAC-blocks-LXC regression).
         let c = config();
         let conn = store::open_in_memory().unwrap();
         let now = 1_000_000i64;
-        // Insert an LXC row with an empty MAC (the "unknown" sentinel).
         let env = Env {
             guid: "lxc1".into(),
-            vmid: 10020,
+            vmid: None,
             mode: Mode::Lxc,
             owner: "alice".into(),
             image: "loom".into(),
             name: "seadog-alice-p-lxc1".into(),
             ip: "192.168.99.201".into(),
             mac: String::new(),
+            ssh_host_key_fps: Vec::new(),
             created_at: now - 3600,
             ttl_deadline: now - 100,
             soft_deadline: now - 700,
             status: EnvStatus::Active,
         };
         store::insert_env(&conn, &env).unwrap();
-        // Live signals as a kento LXC would present: markers + seadog- name,
-        // but NO MAC.
-        let s = GuestSignals {
-            vmid: 10020,
-            name: Some("seadog-alice-p-lxc1".into()),
-            description: Some(format!("{GUID_MARKER_PREFIX}lxc1")),
+        let s = InstanceSignals {
+            name: "seadog-alice-p-lxc1".into(),
+            guid: Some("lxc1".into()),
+            owner: Some("alice".into()),
             mac: None,
-            fingerprint: Fingerprint::default(),
+            ssh_host_key_fps: Vec::new(),
+            image: "loom".into(),
+            status: "running lxc".into(),
+            vmid: None,
         };
         let k = FakeKento::new();
-        k.set_guests(vec![s]);
+        k.set_instances(vec![s]);
 
         let out = sweep(&k, &conn, &c, now).unwrap();
         assert_eq!(out.reaped, 1, "LXC with no live MAC must reap");
@@ -487,16 +534,16 @@ images:
     }
 
     #[test]
-    fn ambiguous_is_flagged_not_reaped() {
+    fn anomaly_is_flagged_not_reaped() {
         let c = config();
         let conn = store::open_in_memory().unwrap();
         let now = 1_000_000i64;
-        insert_active(&conn, "g1", 10010, now - 3600, now - 100);
-        // Clobber the description marker → desc-clobber anomaly.
-        let mut s = signals_for(&conn, "g1", 10010);
-        s.description = Some("user wiped this".into());
+        insert_active(&conn, "g1", now - 3600, now - 100);
+        // Rename the live instance → NameMismatch anomaly.
+        let mut s = signals_for(&conn, "g1");
+        s.name = "user-renamed-this".into();
         let k = FakeKento::new();
-        k.set_guests(vec![s]);
+        k.set_instances(vec![s]);
 
         let out = sweep(&k, &conn, &c, now).unwrap();
         assert_eq!(out.reaped, 0);
@@ -510,24 +557,17 @@ images:
 
     #[test]
     fn young_create_window_anomaly_is_suppressed_not_flagged() {
-        // A just-born guest (age < age_floor, 5m default) carries its GUID
-        // marker but its DB row's GUID hasn't matched yet (set-meta still
-        // landing) → classify returns a VmidReuse-style Anomaly. Inside the
-        // create window this must be suppressed: no flag, no persisted
-        // notify_state row (so stale unacked warnings can't accumulate).
+        // A just-born instance (age < age_floor) whose name disagrees with
+        // its row (set-meta still landing) → Anomaly. Inside the create
+        // window this must be suppressed: no flag, no persisted notify_state.
         let c = config();
         let conn = store::open_in_memory().unwrap();
         let now = 1_000_000i64;
-        // Created 1 minute ago (< 5m age floor). Not expired (deadline far
-        // out) — we only care about the anomaly path here.
-        insert_active(&conn, "g1", 10010, now - 60, now + 3600);
-        // Live guest carries a marker, but the desc-GUID and MAC don't match
-        // the row → Anomaly (the create-window mismatch shape).
-        let mut s = signals_for(&conn, "g1", 10010);
-        s.description = Some(format!("{GUID_MARKER_PREFIX}not-yet-set"));
-        s.mac = Some("ff:ff:ff:ff:ff:ff".into());
+        insert_active(&conn, "g1", now - 60, now + 3600);
+        let mut s = signals_for(&conn, "g1");
+        s.name = "not-yet-renamed".into();
         let k = FakeKento::new();
-        k.set_guests(vec![s]);
+        k.set_instances(vec![s]);
 
         let out = sweep(&k, &conn, &c, now).unwrap();
         assert_eq!(
@@ -535,12 +575,10 @@ images:
             "create-window anomaly inside age floor must not be flagged"
         );
         assert!(k.teardowns().is_empty());
-        // No notify_state row persisted for the env guid.
         assert!(
             store::get_notify_state(&conn, "g1").unwrap().is_none(),
             "no warning notify_state row must be persisted in the create window"
         );
-        // Row untouched.
         assert_eq!(
             store::get_env(&conn, "g1").unwrap().unwrap().status,
             EnvStatus::Active
@@ -548,26 +586,21 @@ images:
     }
 
     #[test]
-    fn old_create_window_style_anomaly_is_flagged_and_persisted() {
-        // Same marker/DB mismatch shape, but the guest is OLD (age >=
-        // age_floor) → a genuine anomaly. It must be flagged AND a warning
-        // notify_state row persisted (regression guard: the age-floor gate
-        // must not over-suppress real anomalies).
+    fn old_anomaly_is_flagged_and_persisted() {
+        // Same mismatch shape, but the instance is OLD (age >= age_floor) →
+        // a genuine anomaly: flagged AND a warning notify_state row persisted.
         let c = config();
         let conn = store::open_in_memory().unwrap();
         let now = 1_000_000i64;
-        // Created 1 hour ago (>> 5m age floor).
-        insert_active(&conn, "g1", 10010, now - 3600, now + 3600);
-        let mut s = signals_for(&conn, "g1", 10010);
-        s.description = Some(format!("{GUID_MARKER_PREFIX}wrong-guid"));
-        s.mac = Some("ff:ff:ff:ff:ff:ff".into());
+        insert_active(&conn, "g1", now - 3600, now + 3600);
+        let mut s = signals_for(&conn, "g1");
+        s.name = "renamed".into();
         let k = FakeKento::new();
-        k.set_guests(vec![s]);
+        k.set_instances(vec![s]);
 
         let out = sweep(&k, &conn, &c, now).unwrap();
         assert_eq!(out.flagged, 1, "an aged anomaly must still be flagged");
         assert!(k.teardowns().is_empty(), "anomaly is never reaped");
-        // A warning notify_state row IS persisted, keyed by the env guid.
         let st = store::get_notify_state(&conn, "g1")
             .unwrap()
             .expect("aged anomaly must persist a notify_state row");
@@ -576,24 +609,187 @@ images:
     }
 
     #[test]
+    fn orphan_is_readopted_and_flagged() {
+        // A live instance carries a GUID but no DB row backs it → re-adopt
+        // onto a fresh Active row + flag.
+        let c = config();
+        let conn = store::open_in_memory().unwrap();
+        let now = 1_000_000i64;
+        let s = InstanceSignals {
+            name: "seadog-bob-p-orph".into(),
+            guid: Some("orph1".into()),
+            owner: Some("bob".into()),
+            mac: Some("02:aa:bb:cc:dd:ee".into()),
+            ssh_host_key_fps: vec!["SHA256:hk".into()],
+            image: "loom".into(),
+            status: "running lxc".into(),
+            vmid: None,
+        };
+        let k = FakeKento::new();
+        k.set_instances(vec![s]);
+
+        let out = sweep(&k, &conn, &c, now).unwrap();
+        assert_eq!(out.readopted, 1, "orphan must be re-adopted");
+        assert_eq!(out.flagged, 1, "re-adopt routes a flagged anomaly");
+        assert_eq!(out.reaped, 0);
+        assert!(k.teardowns().is_empty());
+
+        // A fresh Active row now exists with the reused-ttl deadline.
+        let env = store::get_env(&conn, "orph1")
+            .unwrap()
+            .expect("row created");
+        assert_eq!(env.status, EnvStatus::Active);
+        assert_eq!(env.owner, "bob");
+        assert_eq!(env.name, "seadog-bob-p-orph");
+        assert_eq!(env.mode, Mode::Lxc, "non-vm status defaults to LXC");
+        assert_eq!(env.created_at, now);
+        assert_eq!(
+            env.ttl_deadline,
+            now + c.lifecycle.default_ttl.as_secs() as i64
+        );
+        assert_eq!(env.mac, "02:aa:bb:cc:dd:ee");
+        assert_eq!(env.ip, "");
+    }
+
+    #[test]
+    fn orphan_without_owner_defaults_unknown() {
+        let c = config();
+        let conn = store::open_in_memory().unwrap();
+        let now = 1_000_000i64;
+        let s = InstanceSignals {
+            name: "seadog-x".into(),
+            guid: Some("orph2".into()),
+            owner: None,
+            mac: None,
+            ssh_host_key_fps: Vec::new(),
+            image: "loom".into(),
+            status: "running vm".into(),
+            vmid: Some(123),
+        };
+        let k = FakeKento::new();
+        k.set_instances(vec![s]);
+
+        sweep(&k, &conn, &c, now).unwrap();
+        let env = store::get_env(&conn, "orph2").unwrap().unwrap();
+        assert_eq!(env.owner, "unknown");
+        assert_eq!(env.mode, Mode::Vm, "vm status maps to VM mode");
+        assert_eq!(env.vmid, Some(123));
+        assert_eq!(env.mac, "");
+    }
+
+    #[test]
+    fn foreign_instance_is_ignored() {
+        // An instance with no GUID is foreign: no flag, no row, no teardown.
+        let c = config();
+        let conn = store::open_in_memory().unwrap();
+        let now = 1_000_000i64;
+        let s = InstanceSignals {
+            name: "someone-elses".into(),
+            guid: None,
+            owner: None,
+            mac: Some("11:22:33:44:55:66".into()),
+            ssh_host_key_fps: Vec::new(),
+            image: "other".into(),
+            status: "running".into(),
+            vmid: None,
+        };
+        let k = FakeKento::new();
+        k.set_instances(vec![s]);
+
+        let out = sweep(&k, &conn, &c, now).unwrap();
+        assert_eq!(
+            out,
+            SweepOutcome {
+                quorum_lost: None,
+                ..Default::default()
+            }
+        );
+        assert!(k.teardowns().is_empty());
+    }
+
+    #[test]
+    fn vanished_active_row_with_no_live_instance_is_marked() {
+        // An Active DB row whose GUID is absent from the live set → vanished.
+        let c = config();
+        let conn = store::open_in_memory().unwrap();
+        let now = 1_000_000i64;
+        insert_active(&conn, "gone", now - 3600, now + 3600);
+        // No live instance carries "gone".
+        let k = FakeKento::new();
+        k.set_instances(vec![]);
+
+        let out = sweep(&k, &conn, &c, now).unwrap();
+        assert_eq!(out.vanished, 1);
+        assert_eq!(out.reaped, 0);
+        assert_eq!(
+            store::get_env(&conn, "gone").unwrap().unwrap().status,
+            EnvStatus::Vanished
+        );
+    }
+
+    #[test]
+    fn present_live_guid_is_not_vanished() {
+        // The reaped row is removed from Active; a still-live agreeing row is
+        // neither reaped (deadline in the future) nor vanished.
+        let c = config();
+        let conn = store::open_in_memory().unwrap();
+        let now = 1_000_000i64;
+        insert_active(&conn, "live", now - 3600, now + 3600);
+        let k = FakeKento::new();
+        k.set_instances(vec![signals_for(&conn, "live")]);
+
+        let out = sweep(&k, &conn, &c, now).unwrap();
+        assert_eq!(out.vanished, 0);
+        assert_eq!(out.reaped, 0);
+        assert_eq!(
+            store::get_env(&conn, "live").unwrap().unwrap().status,
+            EnvStatus::Active
+        );
+    }
+
+    #[test]
     fn herd_cap_caps_reaps_and_reports_deferred() {
         let c = config(); // herd_cap = 2
         let conn = store::open_in_memory().unwrap();
         let now = 1_000_000i64;
-        let mut guests = Vec::new();
+        let mut instances = Vec::new();
         for i in 0..5u32 {
             let guid = format!("g{i}");
-            let vmid = 10010 + i;
-            insert_active(&conn, &guid, vmid, now - 3600, now - 100);
-            guests.push(signals_for(&conn, &guid, vmid));
+            // Distinct names so teardown-by-name is unambiguous.
+            let env = Env {
+                guid: guid.clone(),
+                vmid: None,
+                mode: Mode::Vm,
+                owner: "alice".into(),
+                image: "loom".into(),
+                name: format!("seadog-alice-p-{guid}"),
+                ip: format!("192.168.99.{}", 200 + i),
+                mac: String::new(),
+                ssh_host_key_fps: Vec::new(),
+                created_at: now - 3600,
+                ttl_deadline: now - 100,
+                soft_deadline: now - 700,
+                status: EnvStatus::Active,
+            };
+            store::insert_env(&conn, &env).unwrap();
+            instances.push(signals_for(&conn, &guid));
         }
         let k = FakeKento::new();
-        k.set_guests(guests);
+        k.set_instances(instances);
 
         let out = sweep(&k, &conn, &c, now).unwrap();
         assert_eq!(out.reaped, 2, "herd cap limits reaps per sweep");
         assert_eq!(out.deferred, 3, "remainder carried + reported");
         assert_eq!(k.teardowns().len(), 2);
+        // The 3 deferred rows stay Active for the next tick.
+        assert_eq!(
+            store::list_by_status(&conn, EnvStatus::Active)
+                .unwrap()
+                .len(),
+            3
+        );
+        // Deferred-but-still-live rows must NOT be counted vanished.
+        assert_eq!(out.vanished, 0);
     }
 
     #[test]
@@ -607,7 +803,7 @@ images:
         let out = sweep(&k, &conn, &c, now).unwrap();
         assert!(out.quorum_lost.is_some());
         assert_eq!(out.reaped, 0);
-        // Heartbeat still written so health sees the reaper ran.
+        assert_eq!(out.vanished, 0, "no vanished pass on quorum loss");
         assert_eq!(store::read_heartbeat(&conn).unwrap(), Some(now));
     }
 
@@ -616,17 +812,18 @@ images:
         let c = config();
         let conn = store::open_in_memory().unwrap();
         let now = 1_000_000i64;
-        insert_active(&conn, "g1", 10010, now - 3600, now - 100);
+        insert_active(&conn, "g1", now - 3600, now - 100);
         let k = FakeKento::new();
-        k.set_guests(vec![signals_for(&conn, "g1", 10010)]);
-        // Teardown fails for a non-quorum reason → deferred, not reaped,
-        // and the row stays Active (no spin).
+        k.set_instances(vec![signals_for(&conn, "g1")]);
         k.fail_teardown("seadog-alice-p-g1", "lock busy");
 
         let out = sweep(&k, &conn, &c, now).unwrap();
         assert_eq!(out.reaped, 0);
         assert_eq!(out.deferred, 1);
         assert!(out.quorum_lost.is_none());
+        // A failed teardown leaves the row Active — and the live instance is
+        // still listed, so it must NOT be counted vanished.
+        assert_eq!(out.vanished, 0);
         assert_eq!(
             store::get_env(&conn, "g1").unwrap().unwrap().status,
             EnvStatus::Active

@@ -16,9 +16,9 @@
 //! [`run_migrations`] stamps a fresh or pre-framework DB to
 //! [`BASELINE_VERSION`] and then applies each entry of [`MIGRATIONS`]
 //! whose `version` exceeds the DB's current `user_version`, in ascending
-//! order, each inside its own transaction. [`MIGRATIONS`] is EMPTY by
-//! design today (every deployed DB is already at the baseline schema);
-//! the next schema change appends a `version 2` migration there.
+//! order, each inside its own transaction. [`MIGRATIONS`] carries the
+//! version-2 `envs` rebuild (`vmid` made nullable + `ssh_host_key_fps`
+//! added) — the framework's first real migration.
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -66,12 +66,58 @@ struct Migration {
 /// Schema version produced by `create_baseline`. Frozen.
 const BASELINE_VERSION: i64 = 1;
 
-/// Ordered forward migrations beyond the baseline. EMPTY by design:
-/// every deployed DB is already at the current (baseline) schema, so
-/// there is nothing to migrate yet. The NEXT schema change adds one
-/// entry here (version 2, ascending) — and only then does the engine
-/// have work to do. See the migration-engine tests for a worked example.
-const MIGRATIONS: &[Migration] = &[];
+/// Ordered forward migrations beyond the baseline. Strictly ascending by
+/// `version`, every version above the baseline. Version 2 rebuilds `envs`
+/// to make `vmid` nullable and add the `ssh_host_key_fps` column (the PVE
+/// decouple: vmid drops to optional informational, host-key fps become a
+/// confirmer).
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 2,
+    up: m2_vmid_nullable_add_fps,
+}];
+
+/// Migration v2 — make `vmid` nullable and add `ssh_host_key_fps`.
+///
+/// SQLite can't drop a `NOT NULL` constraint (or add a `NOT NULL DEFAULT`
+/// column to an existing table cleanly across all versions) in place, so
+/// this is the textbook 12-step table rebuild: create `envs_new` with
+/// `vmid INTEGER` (nullable) and the new `ssh_host_key_fps TEXT NOT NULL
+/// DEFAULT ''` column, copy every existing row through (defaulting the new
+/// column to `''`), drop the old table, rename, then recreate the owner +
+/// status indexes. The old `idx_envs_vmid` is intentionally NOT recreated:
+/// vmid is no longer a query key after the decouple.
+fn m2_vmid_nullable_add_fps(conn: &Connection) -> Result<(), Error> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE envs_new (
+            guid             TEXT    PRIMARY KEY,
+            vmid             INTEGER,
+            mode             TEXT    NOT NULL,
+            owner            TEXT    NOT NULL,
+            image            TEXT    NOT NULL,
+            name             TEXT    NOT NULL,
+            ip               TEXT    NOT NULL,
+            mac              TEXT    NOT NULL,
+            ssh_host_key_fps TEXT    NOT NULL DEFAULT '',
+            created_at       INTEGER NOT NULL,
+            ttl_deadline     INTEGER NOT NULL,
+            soft_deadline    INTEGER NOT NULL,
+            status           TEXT    NOT NULL
+        );
+        INSERT INTO envs_new
+            (guid, vmid, mode, owner, image, name, ip, mac,
+             ssh_host_key_fps, created_at, ttl_deadline, soft_deadline, status)
+            SELECT guid, vmid, mode, owner, image, name, ip, mac,
+             '', created_at, ttl_deadline, soft_deadline, status
+            FROM envs;
+        DROP TABLE envs;
+        ALTER TABLE envs_new RENAME TO envs;
+        CREATE INDEX IF NOT EXISTS idx_envs_owner  ON envs(owner);
+        CREATE INDEX IF NOT EXISTS idx_envs_status ON envs(status);
+        "#,
+    )?;
+    Ok(())
+}
 
 /// The version-1 baseline schema.
 ///
@@ -197,13 +243,29 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
 
 // --- env CRUD ---
 
+/// Join SSH host-key fingerprints into the single TEXT column. SSH
+/// `SHA256:<base64>` fingerprints carry no comma, so a comma delimiter is
+/// unambiguous. An empty list serializes to `""`.
+fn join_fps(fps: &[String]) -> String {
+    fps.join(",")
+}
+
+/// Split the stored fps TEXT column back into a `Vec`. `""` → `[]`.
+fn split_fps(s: &str) -> Vec<String> {
+    if s.is_empty() {
+        Vec::new()
+    } else {
+        s.split(',').map(|f| f.to_string()).collect()
+    }
+}
+
 /// Insert a new env row. Fails if `guid` already exists.
 pub fn insert_env(conn: &Connection, env: &Env) -> Result<(), Error> {
     conn.execute(
         r#"INSERT INTO envs
-            (guid, vmid, mode, owner, image, name, ip, mac,
+            (guid, vmid, mode, owner, image, name, ip, mac, ssh_host_key_fps,
              created_at, ttl_deadline, soft_deadline, status)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
         params![
             env.guid,
             env.vmid,
@@ -213,6 +275,7 @@ pub fn insert_env(conn: &Connection, env: &Env) -> Result<(), Error> {
             env.name,
             env.ip,
             env.mac,
+            join_fps(&env.ssh_host_key_fps),
             env.created_at,
             env.ttl_deadline,
             env.soft_deadline,
@@ -225,8 +288,10 @@ pub fn insert_env(conn: &Connection, env: &Env) -> Result<(), Error> {
 fn row_to_env(row: &rusqlite::Row) -> rusqlite::Result<Env> {
     let mode_s: String = row.get("mode")?;
     let status_s: String = row.get("status")?;
+    let fps_s: String = row.get("ssh_host_key_fps")?;
     Ok(Env {
         guid: row.get("guid")?,
+        // NULL → None now that vmid is nullable.
         vmid: row.get("vmid")?,
         mode: Mode::from_str_opt(&mode_s).ok_or_else(|| {
             rusqlite::Error::FromSqlConversionFailure(
@@ -240,6 +305,7 @@ fn row_to_env(row: &rusqlite::Row) -> rusqlite::Result<Env> {
         name: row.get("name")?,
         ip: row.get("ip")?,
         mac: row.get("mac")?,
+        ssh_host_key_fps: split_fps(&fps_s),
         created_at: row.get("created_at")?,
         ttl_deadline: row.get("ttl_deadline")?,
         soft_deadline: row.get("soft_deadline")?,
@@ -254,25 +320,12 @@ fn row_to_env(row: &rusqlite::Row) -> rusqlite::Result<Env> {
 }
 
 const ENV_COLS: &str = "guid, vmid, mode, owner, image, name, ip, mac, \
-     created_at, ttl_deadline, soft_deadline, status";
+     ssh_host_key_fps, created_at, ttl_deadline, soft_deadline, status";
 
 /// Fetch an env by its `guid` primary key. `None` if absent.
 pub fn get_env(conn: &Connection, guid: &str) -> Result<Option<Env>, Error> {
     let sql = format!("SELECT {ENV_COLS} FROM envs WHERE guid = ?1");
     let env = conn.query_row(&sql, params![guid], row_to_env).optional()?;
-    Ok(env)
-}
-
-/// Fetch an env by its leased `vmid`. `None` if absent.
-///
-/// Since vmids are reused once an env leaves `Active`, multiple terminal
-/// rows can share a vmid; this returns the most recently created one.
-pub fn get_env_by_vmid(conn: &Connection, vmid: u32) -> Result<Option<Env>, Error> {
-    let sql = format!(
-        "SELECT {ENV_COLS} FROM envs WHERE vmid = ?1 \
-         ORDER BY created_at DESC LIMIT 1"
-    );
-    let env = conn.query_row(&sql, params![vmid], row_to_env).optional()?;
     Ok(env)
 }
 
@@ -466,13 +519,14 @@ mod tests {
     fn env(guid: &str, status: EnvStatus, created_at: i64) -> Env {
         Env {
             guid: guid.into(),
-            vmid: 10010,
+            vmid: Some(10010),
             mode: Mode::Vm,
             owner: "alice".into(),
             image: "loom".into(),
             name: format!("seadog-alice-p-{guid}"),
             ip: "192.168.99.200".into(),
             mac: "aa:bb:cc:dd:ee:ff".into(),
+            ssh_host_key_fps: vec!["SHA256:abc".into(), "SHA256:def".into()],
             created_at,
             ttl_deadline: created_at + 100,
             soft_deadline: created_at + 50,
@@ -666,12 +720,126 @@ images:
         }]
     }
 
-    /// Fresh DB through the normal open path is stamped to the baseline and
-    /// has all three tables.
+    /// Seed a bare DB at the v1 BASELINE schema (NOT NULL vmid, no
+    /// `ssh_host_key_fps`), stamped to `user_version = 1`, with one env row.
+    /// This is the shape a 0.5.0 install carries before the v2 rebuild.
+    fn open_v1_baseline_with_row() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        // The frozen v1 baseline (same DDL as `create_baseline`).
+        conn.execute_batch(
+            r#"
+            CREATE TABLE envs (
+                guid          TEXT    PRIMARY KEY,
+                vmid          INTEGER NOT NULL,
+                mode          TEXT    NOT NULL,
+                owner         TEXT    NOT NULL,
+                image         TEXT    NOT NULL,
+                name          TEXT    NOT NULL,
+                ip            TEXT    NOT NULL,
+                mac           TEXT    NOT NULL,
+                created_at    INTEGER NOT NULL,
+                ttl_deadline  INTEGER NOT NULL,
+                soft_deadline INTEGER NOT NULL,
+                status        TEXT    NOT NULL
+            );
+            CREATE INDEX idx_envs_owner  ON envs(owner);
+            CREATE INDEX idx_envs_status ON envs(status);
+            CREATE INDEX idx_envs_vmid   ON envs(vmid);
+            CREATE TABLE notify_state (
+                guid            TEXT    PRIMARY KEY,
+                last_severity   TEXT    NOT NULL,
+                last_emitted_at INTEGER NOT NULL,
+                acked           INTEGER NOT NULL
+            );
+            CREATE TABLE heartbeat (
+                id            INTEGER PRIMARY KEY CHECK (id = 0),
+                last_sweep_at INTEGER NOT NULL
+            );
+            INSERT INTO envs
+                (guid, vmid, mode, owner, image, name, ip, mac,
+                 created_at, ttl_deadline, soft_deadline, status)
+                VALUES ('g1', 10010, 'vm', 'alice', 'loom',
+                        'seadog-alice-p-g1', '192.168.99.200',
+                        'aa:bb:cc:dd:ee:ff', 1000, 1100, 1050, 'active');
+            "#,
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", BASELINE_VERSION)
+            .unwrap();
+        conn
+    }
+
+    /// The production v2 migration on a real v1 DB: a NOT NULL vmid row
+    /// migrates forward, `user_version` advances to 2, the vmid is still
+    /// readable, and the new `ssh_host_key_fps` column defaults to `''`.
+    #[test]
+    fn migration_v2_makes_vmid_nullable_and_adds_fps() {
+        let conn = open_v1_baseline_with_row();
+        assert_eq!(user_version(&conn), BASELINE_VERSION);
+
+        run_migrations(&conn, MIGRATIONS).unwrap();
+        assert_eq!(user_version(&conn), 2);
+
+        // The pre-existing row survives: vmid still readable (Some), the new
+        // fps column present and defaulted to '' (→ empty Vec on read).
+        let env = get_env(&conn, "g1").unwrap().expect("row preserved");
+        assert_eq!(env.vmid, Some(10010));
+        assert!(env.ssh_host_key_fps.is_empty());
+
+        // vmid is now nullable: a NULL inserts cleanly and reads back None.
+        conn.execute(
+            "INSERT INTO envs \
+                (guid, vmid, mode, owner, image, name, ip, mac, \
+                 ssh_host_key_fps, created_at, ttl_deadline, soft_deadline, status) \
+             VALUES ('g2', NULL, 'lxc', 'bob', 'loom', 'seadog-bob-p-g2', \
+                     '192.168.99.201', '', 'SHA256:x', 2000, 2100, 2050, 'active')",
+            [],
+        )
+        .expect("NULL vmid must insert after v2");
+        let env2 = get_env(&conn, "g2").unwrap().unwrap();
+        assert_eq!(env2.vmid, None);
+        assert_eq!(env2.ssh_host_key_fps, vec!["SHA256:x".to_string()]);
+
+        // The vmid index was dropped (no longer a query key).
+        let idx: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type='index' AND name='idx_envs_vmid'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 0, "idx_envs_vmid must be gone after v2");
+    }
+
+    /// Insert/read round-trip through the production schema: an `Option`
+    /// vmid (both Some and None) and the comma-joined fps survive a write
+    /// then read.
+    #[test]
+    fn insert_get_roundtrips_option_vmid_and_fps() {
+        let conn = open_in_memory().unwrap();
+        let mut e = env("rt", EnvStatus::Active, 5000);
+        e.vmid = None;
+        e.ssh_host_key_fps = vec!["SHA256:k1".into(), "SHA256:k2".into()];
+        insert_env(&conn, &e).unwrap();
+        let got = get_env(&conn, "rt").unwrap().unwrap();
+        assert_eq!(got, e);
+    }
+
+    /// Fresh DB through the normal open path is stamped past the baseline to
+    /// the latest registered migration (v2) and has all three tables. A fresh
+    /// open applies every migration, so it lands at the highest version in
+    /// `MIGRATIONS`, not at the bare baseline.
     #[test]
     fn baseline_stamps_user_version() {
         let conn = open_in_memory().unwrap();
-        assert_eq!(user_version(&conn), BASELINE_VERSION);
+        let latest = MIGRATIONS
+            .iter()
+            .map(|m| m.version)
+            .max()
+            .unwrap_or(BASELINE_VERSION);
+        assert_eq!(user_version(&conn), latest);
         for t in ["envs", "notify_state", "heartbeat"] {
             let n: i64 = conn
                 .query_row(

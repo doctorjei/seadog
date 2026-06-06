@@ -517,13 +517,14 @@ images:
     fn env(guid: &str, status: EnvStatus, created_at: i64) -> Env {
         Env {
             guid: guid.into(),
-            vmid: 10010,
+            vmid: Some(10010),
             mode: Mode::Vm,
             owner: "alice".into(),
             image: "loom".into(),
             name: "seadog-alice-p-a".into(),
             ip: "192.168.99.200".into(),
             mac: "aa:bb:cc:dd:ee:ff".into(),
+            ssh_host_key_fps: Vec::new(),
             created_at,
             ttl_deadline: created_at + 100,
             soft_deadline: created_at + 50,
