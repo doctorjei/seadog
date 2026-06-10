@@ -43,9 +43,11 @@ pub trait Kento {
     /// ONLY for vm] <image-ref>`, then reads the realized signals back via
     /// `inspect --json` for the [`ProvisionOutcome`].
     ///
-    /// `--mac` is **VM-only** at the argv layer (P4/P5), but kento now
-    /// exposes the realized MAC for **both** LXC and VM via `inspect`, so
-    /// [`ProvisionOutcome::mac`] is `Some` whenever kento reports one.
+    /// `--mac` is **VM-only**: kento reports (and accepts) a MAC for VM
+    /// modes only — it writes the `kento-mac` meta at create time for VMs
+    /// and emits `mac` from `inspect --json` present-only, so an LXC has no
+    /// MAC at all. [`ProvisionOutcome::mac`] is therefore `Some` for a VM
+    /// (the passed `--mac`) and `None` for an LXC.
     fn provision(&self, spec: &ProvisionSpec) -> Result<ProvisionOutcome, Error>;
 }
 
@@ -64,6 +66,10 @@ pub struct InstanceSignals {
     /// Injected `SEADOG_OWNER` env, read back via inspect.
     pub owner: Option<String>,
     /// Realized MAC, when kento reports one (confirming-when-present).
+    /// kento reports a MAC for **VM modes only** (it is written at create
+    /// time for VMs and emitted from `inspect` present-only), so this is
+    /// `None` for every LXC — that `None` is the designed sentinel
+    /// identity treats as "nothing to confirm".
     pub mac: Option<String>,
     /// SSH host-key fingerprints, when kento reports them
     /// (confirming-when-present; a soft confirmer — regenerated keys must
@@ -73,11 +79,17 @@ pub struct InstanceSignals {
     pub image: String,
     /// kento-reported status text (informational).
     pub status: String,
-    /// Backend mode kento reports (`inspect.mode`: `lxc`/`vm`/`pve-lxc`/
-    /// `pve-vm`), collapsed to the backend-neutral [`Mode`] (lxc-family →
-    /// [`Mode::Lxc`], vm-family → [`Mode::Vm`]). Lets reap recover an orphan's
-    /// mode precisely instead of guessing from the status text. Defaults to
-    /// [`Mode::Lxc`] when kento reports nothing recognizable.
+    /// Backend family, collapsed to the backend-neutral [`Mode`]
+    /// ([`Mode::Lxc`] / [`Mode::Vm`]). kento `inspect --json` emits an
+    /// authoritative `type` field ∈ {`LXC`, `VM`} (always present:
+    /// `info.py:97`) that is the unambiguous family signal: `VM` →
+    /// [`Mode::Vm`], `LXC` → [`Mode::Lxc`]. The accompanying `mode` string
+    /// (`inspect.mode` ∈ {`lxc`, `vm`, `pve`, `pve-vm`} — note a PVE-LXC is
+    /// promoted to bare `pve`, NOT `pve-lxc`) is informational and serves
+    /// only as a defensive fallback if `type` is ever missing/unrecognized.
+    /// Lets reap recover an orphan's family precisely instead of guessing
+    /// from the status text. Defaults to [`Mode::Lxc`] when kento reports
+    /// nothing recognizable.
     pub mode: Mode,
     /// Backend vmid when kento exposes one (PVE backends only);
     /// informational, never an identity key.
@@ -133,15 +145,15 @@ pub struct ProvisionSpec {
 }
 
 /// What [`Kento::provision`] reports back, read from kento's `inspect
-/// --json` after create: the realized MAC (kento now reports it for BOTH
-/// LXC and VM — `Some` whenever present), the SSH host-key fingerprints,
-/// and the backend vmid when one exists (PVE backends; `None` otherwise).
-/// The front-end records these on the DB row; identity treats MAC and
-/// host-key fps as confirming-when-present.
+/// --json` after create: the realized MAC (kento reports it for **VM
+/// modes only** — `Some` for a VM, `None` for an LXC), the SSH host-key
+/// fingerprints, and the backend vmid when one exists (PVE backends;
+/// `None` otherwise). The front-end records these on the DB row; identity
+/// treats MAC and host-key fps as confirming-when-present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionOutcome {
-    /// The MAC the realized instance carries, or `None` if kento reports
-    /// none.
+    /// The MAC the realized instance carries: `Some` for a VM, `None` for
+    /// an LXC (kento reports a MAC for VM modes only).
     pub mac: Option<String>,
     /// The realized SSH host-key fingerprints (empty if kento reports none).
     pub ssh_host_key_fps: Vec<String>,
@@ -222,22 +234,6 @@ impl FakeKento {
     }
 }
 
-/// Deterministic fake MAC derived from the instance name, so an LXC
-/// provision yields a stable (non-empty) MAC the way kento now does —
-/// the empty-sentinel LXC dance is gone.
-fn fake_mac(name: &str) -> String {
-    let mut h: u64 = 1469598103934665603;
-    for b in name.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(1099511628211);
-    }
-    let o = h.to_be_bytes();
-    format!(
-        "02:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        o[1], o[2], o[3], o[4], o[5]
-    )
-}
-
 impl Kento for FakeKento {
     fn list_instances(&self) -> Result<Vec<InstanceSignals>, Error> {
         let st = self.inner.lock().unwrap();
@@ -269,12 +265,13 @@ impl Kento for FakeKento {
         if let Some(msg) = &st.quorum_lost {
             return Err(Error::QuorumLost(msg.clone()));
         }
-        // kento now knows the realized MAC for BOTH modes: a VM keeps the
-        // passed `--mac`; an LXC gets a kento-assigned MAC (we synthesize a
-        // deterministic fake one — no empty sentinel anymore).
+        // kento reports the realized MAC for VM modes ONLY: a VM keeps the
+        // passed `--mac`; an LXC has no MAC at all (kento writes the
+        // `kento-mac` meta only for VMs and emits `mac` from inspect
+        // present-only), so an LXC yields `None` — the designed sentinel.
         let effective_mac = match spec.mode {
-            Mode::Vm => spec.mac.clone(),
-            Mode::Lxc => fake_mac(&spec.name),
+            Mode::Vm => Some(spec.mac.clone()),
+            Mode::Lxc => None,
         };
         // Synthesize a couple of stable host-key fingerprints.
         let fps = vec![
@@ -285,7 +282,7 @@ impl Kento for FakeKento {
             name: spec.name.clone(),
             guid: Some(spec.guid.clone()),
             owner: Some(spec.owner.clone()),
-            mac: Some(effective_mac.clone()),
+            mac: effective_mac.clone(),
             ssh_host_key_fps: fps.clone(),
             image: spec.image_ref.clone(),
             status: "running".to_string(),
@@ -298,7 +295,7 @@ impl Kento for FakeKento {
         st.provisions.push(spec.clone());
         st.provision_allow_nesting.push(spec.allow_nesting);
         Ok(ProvisionOutcome {
-            mac: Some(effective_mac),
+            mac: effective_mac,
             ssh_host_key_fps: fps,
             vmid: None,
         })
@@ -334,7 +331,7 @@ mod real {
     const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
     /// Substrings that mark a pmxcfs quorum-loss / read-only condition.
-    /// kento runs on PVE backends (pve-lxc/pve-vm), where a corosym
+    /// kento runs on PVE backends (kento-mode `pve`/`pve-vm`), where a corosym
     /// partition still drops pmxcfs to read-only and surfaces the same
     /// kernel/cluster wording through the failing `kento` invocation, so we
     /// keep mapping these to [`Error::QuorumLost`] (the sweep stops cleanly
@@ -446,6 +443,33 @@ mod real {
         }
     }
 
+    /// The decision for a failing per-instance `kento inspect` in
+    /// [`RealKento::list_instances`]: keep the sweep going (skip the one bad
+    /// instance) or abort it (a global condition).
+    enum PerInstance {
+        /// A GLOBAL condition — propagate and abort the whole sweep.
+        Propagate(Error),
+        /// A per-instance fault — log it and skip just this instance.
+        Skip(Error),
+    }
+
+    /// Classify a per-instance `inspect` exec error into propagate-vs-skip.
+    ///
+    /// [`Error::QuorumLost`] is a GLOBAL pmxcfs/cluster condition (not a fault
+    /// of the one instance), so continuing the sweep would be wrong — it
+    /// propagates and aborts. Every OTHER error (a `kento inspect` exec
+    /// failure — e.g. a "ghost" instance present in `kento list` with no
+    /// backing guest, whose inspect exits non-zero) is per-instance: it is
+    /// skipped so a single broken instance can't blind the reaper to every
+    /// other env. Pure (no I/O) so the resilience contract is unit-testable
+    /// without a real `kento` in the loop.
+    fn classify_per_instance_error(e: Error) -> PerInstance {
+        match e {
+            Error::QuorumLost(_) => PerInstance::Propagate(e),
+            _ => PerInstance::Skip(e),
+        }
+    }
+
     impl Kento for RealKento {
         fn list_instances(&self) -> Result<Vec<InstanceSignals>, Error> {
             // Strategy (kento-only — no pvesh/qm/pct):
@@ -460,15 +484,54 @@ mod real {
             // Parsing is split into pure functions (`parse_kento_list` /
             // `parse_kento_inspect`) so they are unit-tested on sample output
             // with no real command in the loop.
+            // Enumeration is GLOBAL: a failing `kento list` (incl. quorum
+            // loss) means we cannot see the live set at all, so it MUST
+            // propagate — the sweep aborts rather than reaping against an
+            // empty/partial view.
             let list_out = self.run(&["list"])?;
             let names = parse_kento_list(&list_out);
 
             let mut out = Vec::with_capacity(names.len());
             for name in names {
-                let json = self.run(&["inspect", &name, "--json"])?;
-                let signals = parse_kento_inspect(&json)
-                    .map_err(|e| Error::Kento(format!("parsing inspect {name}: {e}")))?;
-                out.push(signals);
+                // Per-instance inspect/parse is RESILIENT: a single broken
+                // instance (a "ghost" in `kento list` with no backing guest
+                // whose `inspect` exits non-zero, or one emitting unparseable
+                // JSON) must NOT blind the reaper to every OTHER env. We log +
+                // skip such an instance and keep evaluating the rest.
+                //
+                // The ONE exception is `Error::QuorumLost`: that is a GLOBAL
+                // pmxcfs/cluster condition, not a per-instance fault, so
+                // continuing would be wrong — it propagates and aborts the
+                // sweep just like a failing `list`.
+                let json = match self.run(&["inspect", &name, "--json"]) {
+                    Ok(json) => json,
+                    // `classify_per_instance_error` is the single point that
+                    // decides propagate (QuorumLost) vs skip (everything
+                    // else); it is unit-tested without shelling out.
+                    Err(e) => match classify_per_instance_error(e) {
+                        PerInstance::Propagate(e) => return Err(e),
+                        PerInstance::Skip(e) => {
+                            tracing::warn!(
+                                instance = %name,
+                                "skipping instance: kento inspect failed: {e}"
+                            );
+                            continue;
+                        }
+                    },
+                };
+                match parse_kento_inspect(&json) {
+                    Ok(signals) => out.push(signals),
+                    Err(e) => {
+                        // A parse failure is always per-instance (it never
+                        // carries a global quorum signal), so it is always
+                        // log+skip.
+                        tracing::warn!(
+                            instance = %name,
+                            "skipping instance: failed to parse kento inspect output: {e}"
+                        );
+                        continue;
+                    }
+                }
             }
             Ok(out)
         }
@@ -533,8 +596,9 @@ mod real {
                 argv.push("--config-mode");
                 argv.push("auto");
             }
-            // VM-only MAC: kento rejects --mac for LXC (it auto-assigns one).
-            // kento still reports the realized MAC for BOTH modes via inspect.
+            // VM-only MAC: kento accepts --mac for VM modes only (it rejects
+            // it for LXC) and likewise reports a `mac` from inspect for VMs
+            // only — an LXC has no MAC, so the outcome MAC is None there.
             if spec.mode == Mode::Vm {
                 argv.push("--mac");
                 argv.push(&spec.mac);
@@ -551,9 +615,10 @@ mod real {
             argv.push(&spec.image_ref);
             self.run(&argv)?;
 
-            // Read the realized signals back. kento now reports the MAC for
-            // both LXC and VM, the host-key fps it generated, and the vmid on
-            // PVE backends — exactly the fields the front-end records.
+            // Read the realized signals back. kento reports the MAC for VM
+            // modes only (absent ⇒ None for an LXC), the host-key fps it
+            // generated, and the vmid on PVE backends — exactly the fields the
+            // front-end records.
             let json = self.run(&["inspect", &spec.name, "--json"])?;
             let signals = parse_kento_inspect(&json)
                 .map_err(|e| Error::Kento(format!("parsing inspect {}: {e}", spec.name)))?;
@@ -618,9 +683,17 @@ mod real {
     ///   `.ssh_host_key_fingerprints` `{type: fp}` dict, sorted for a stable
     ///   order (the map is unordered in JSON).
     /// - `image` ← `.image`; `status` ← `.status`.
-    /// - `mode` ← `.mode` (`lxc`/`vm`/`pve-lxc`/`pve-vm`): lxc-family →
-    ///   [`Mode::Lxc`], vm-family → [`Mode::Vm`]; absent/unrecognized →
-    ///   [`Mode::Lxc`]. reap uses this to recover an orphan's mode precisely.
+    /// - family ← the authoritative `.type` ∈ {`LXC`, `VM`} (ALWAYS present:
+    ///   kento `info.py:97`): `VM` → [`Mode::Vm`], `LXC` → [`Mode::Lxc`].
+    ///   That `type` is the unambiguous family signal — immune to the
+    ///   `pve`/`pve-vm` mode-string nuance below. `.mode` (the raw kento-mode
+    ///   ∈ {`lxc`, `vm`, `pve`, `pve-vm`} — kento `info.py:96`; note a
+    ///   PVE-LXC is promoted to bare `pve`, NOT `pve-lxc`, at kento
+    ///   `create.py:410-421`/`628`, and `pve-lxc` exists ONLY in the `list`
+    ///   TYPE column, never in `inspect --json`) is read as a DEFENSIVE
+    ///   fallback used ONLY when `type` is missing/unrecognized: `vm`/`pve-vm`
+    ///   → [`Mode::Vm`], everything else → [`Mode::Lxc`]. reap uses the
+    ///   collapsed family to recover an orphan's mode precisely.
     /// - `vmid` ← `.vmid` (present only on PVE backends; informational).
     pub fn parse_kento_inspect(json: &str) -> Result<InstanceSignals, String> {
         let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
@@ -640,12 +713,22 @@ mod real {
         let status = str_field("status").unwrap_or_default();
         let mac = str_field("mac");
 
-        // mode ← `.mode` (lxc/vm/pve-lxc/pve-vm). Collapse the backend family
-        // to the neutral Mode: anything in the vm family → Vm, everything else
-        // (incl. absent/unrecognized) → Lxc.
-        let mode = match str_field("mode").as_deref() {
-            Some("vm") | Some("pve-vm") => Mode::Vm,
-            _ => Mode::Lxc,
+        // Collapse the backend family to the neutral Mode on the AUTHORITATIVE
+        // `.type` field (kento info.py:97 — ALWAYS present, ∈ {LXC, VM}): it is
+        // the unambiguous family signal, immune to the raw `.mode` string's
+        // pve/pve-vm nuance (a PVE-LXC reports bare `pve`, NOT `pve-lxc`, so a
+        // mode-only match would be fragile). `.type` is the primary path.
+        //
+        // DEFENSIVE fallback ONLY when `.type` is missing/unrecognized (kento
+        // would have to break its own contract): fall back to the `.mode`
+        // string — vm-family (`vm`/`pve-vm`) → Vm, everything else → Lxc.
+        let mode = match str_field("type").as_deref() {
+            Some("VM") => Mode::Vm,
+            Some("LXC") => Mode::Lxc,
+            _ => match str_field("mode").as_deref() {
+                Some("vm") | Some("pve-vm") => Mode::Vm,
+                _ => Mode::Lxc,
+            },
         };
 
         // vmid is emitted as a JSON number (int) on PVE backends, absent
@@ -716,7 +799,10 @@ mod real {
         #[test]
         fn parse_list_extracts_name_column_skips_header_and_separator() {
             // The exact shape `kento list` prints: header, dash separator,
-            // then space-padded rows. NAME is the first column.
+            // then space-padded rows. NAME is the first column. (`pve-lxc` in
+            // the TYPE column is the LIST-table display label — the only place
+            // kento ever renders that string; `inspect --json` reports bare
+            // `pve` + `type:"LXC"` instead. Only the NAME column is parsed.)
             let text = "\
 NAME                       TYPE     IMAGE              STATUS   UPPER SIZE
 -------------------------  -------  -----------------  -------  ----------
@@ -752,7 +838,7 @@ foreign-thing              lxc      some/other:img     running  0
             let json = r#"{
                 "name": "seadog-alice-proj-ab12",
                 "image": "registry/loom:1",
-                "mode": "pve-lxc",
+                "mode": "pve",
                 "type": "LXC",
                 "status": "running",
                 "directory": "/var/lib/kento/lxc/10010",
@@ -784,7 +870,11 @@ foreign-thing              lxc      some/other:img     running  0
             assert_eq!(s.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
             assert_eq!(s.image, "registry/loom:1");
             assert_eq!(s.status, "running");
-            assert_eq!(s.mode, Mode::Lxc, "pve-lxc collapses to Lxc");
+            assert_eq!(
+                s.mode,
+                Mode::Lxc,
+                "bare `pve` mode + type LXC collapses to Lxc"
+            );
             assert_eq!(s.vmid, Some(10010));
             // Flattened + sorted fingerprint values (map order not trusted).
             assert_eq!(
@@ -855,16 +945,60 @@ foreign-thing              lxc      some/other:img     running  0
         }
 
         #[test]
-        fn parse_inspect_mode_absent_or_unrecognized_defaults_lxc() {
-            // No `.mode` at all, and an unrecognized backend label, both fall
-            // back to the safe Lxc default.
+        fn parse_inspect_type_drives_family_collapse() {
+            // The authoritative `.type` field decides the family — even when
+            // the `.mode` string is unrecognized or would point the other way.
+            // type=VM ⇒ Vm regardless of an unknown/contradictory mode.
+            let vm_by_type = r#"{"name":"n","mode":"weird-future-vm","type":"VM","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(
+                parse_kento_inspect(vm_by_type).unwrap().mode,
+                Mode::Vm,
+                "type=VM drives the collapse to Vm even with an unknown mode string"
+            );
+            // type=LXC ⇒ Lxc.
+            let lxc_by_type = r#"{"name":"n","mode":"weird-future-lxc","type":"LXC","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(parse_kento_inspect(lxc_by_type).unwrap().mode, Mode::Lxc);
+            // Bare `pve` (the REAL PVE-LXC kento-mode) + type=LXC ⇒ Lxc.
+            let pve_lxc =
+                r#"{"name":"n","mode":"pve","type":"LXC","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(
+                parse_kento_inspect(pve_lxc).unwrap().mode,
+                Mode::Lxc,
+                "bare `pve` mode + type=LXC ⇒ Lxc (kento never emits `pve-lxc` from inspect)"
+            );
+            // PVE-VM: mode `pve-vm` + type=VM ⇒ Vm.
+            let pve_vm =
+                r#"{"name":"n","mode":"pve-vm","type":"VM","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(parse_kento_inspect(pve_vm).unwrap().mode, Mode::Vm);
+        }
+
+        #[test]
+        fn parse_inspect_mode_fallback_when_type_missing() {
+            // DEFENSIVE fallback: if kento ever omits/garbles the authoritative
+            // `.type`, we fall back to the `.mode` string. No `.type` and no
+            // `.mode` ⇒ safe Lxc default.
             let absent = r#"{"name":"n","environment":["SEADOG_GUID=g"]}"#;
             assert_eq!(parse_kento_inspect(absent).unwrap().mode, Mode::Lxc);
+            // No `.type`, unrecognized `.mode` ⇒ Lxc default.
             let weird = r#"{"name":"n","mode":"podman","environment":["SEADOG_GUID=g"]}"#;
             assert_eq!(parse_kento_inspect(weird).unwrap().mode, Mode::Lxc);
-            // pve-vm collapses to the vm family.
+            // No `.type`, `.mode`=vm ⇒ Vm via the fallback.
+            let vm = r#"{"name":"n","mode":"vm","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(parse_kento_inspect(vm).unwrap().mode, Mode::Vm);
+            // No `.type`, `.mode`=pve-vm ⇒ Vm via the fallback.
             let pve_vm = r#"{"name":"n","mode":"pve-vm","environment":["SEADOG_GUID=g"]}"#;
             assert_eq!(parse_kento_inspect(pve_vm).unwrap().mode, Mode::Vm);
+            // No `.type`, `.mode`=pve (the real PVE-LXC mode) ⇒ Lxc via fallback.
+            let pve = r#"{"name":"n","mode":"pve","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(parse_kento_inspect(pve).unwrap().mode, Mode::Lxc);
+            // Unrecognized `.type` value also drops to the mode fallback.
+            let bad_type =
+                r#"{"name":"n","mode":"vm","type":"CONTAINER","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(
+                parse_kento_inspect(bad_type).unwrap().mode,
+                Mode::Vm,
+                "unrecognized type ⇒ fall back to mode string (vm ⇒ Vm)"
+            );
         }
 
         #[test]
@@ -927,6 +1061,30 @@ foreign-thing              lxc      some/other:img     running  0
             assert!(parse_kento_inspect("[]").is_err());
             assert!(parse_kento_inspect("not json").is_err());
         }
+
+        #[test]
+        fn per_instance_kento_error_is_skipped() {
+            // A ghost/broken instance whose `kento inspect` exits non-zero
+            // surfaces as Error::Kento — it must be skipped (not propagated)
+            // so one bad instance can't blind the sweep to every other env.
+            let e = Error::Kento("kento exited Some(255): no such guest".into());
+            assert!(matches!(
+                classify_per_instance_error(e),
+                PerInstance::Skip(_)
+            ));
+        }
+
+        #[test]
+        fn per_instance_quorum_loss_propagates() {
+            // QuorumLost is a GLOBAL condition, never a per-instance fault:
+            // continuing the sweep would be wrong, so it must propagate and
+            // abort even though it surfaced through a per-instance inspect.
+            let e = Error::QuorumLost("kento reported quorum loss".into());
+            assert!(matches!(
+                classify_per_instance_error(e),
+                PerInstance::Propagate(_)
+            ));
+        }
     }
 }
 
@@ -986,15 +1144,17 @@ mod tests {
         let outcome = k.provision(&spec).unwrap();
         assert_eq!(k.provisions(), vec![spec.clone()]);
 
-        // The realized instance carries the injected GUID/owner anchor + a
-        // kento-reported MAC and host-key fps (no empty-sentinel LXC dance).
+        // The realized instance carries the injected GUID/owner anchor +
+        // host-key fps. This spec is an LXC, so kento reports NO MAC: the
+        // live signals and the outcome both carry `None` (the designed
+        // LXC sentinel — kento reports a MAC for VM modes only).
         let listed = k.list_instances().unwrap();
         assert_eq!(listed.len(), 1);
         let i = &listed[0];
         assert_eq!(i.name, "seadog-alice-proj-ab12");
         assert_eq!(i.guid.as_deref(), Some("guid-abc"));
         assert_eq!(i.owner.as_deref(), Some("alice"));
-        assert!(i.mac.is_some(), "LXC now has a kento-reported MAC");
+        assert_eq!(i.mac, None, "LXC has no kento-reported MAC");
         assert_eq!(i.mac, outcome.mac);
         assert!(!i.ssh_host_key_fps.is_empty());
         assert_eq!(i.ssh_host_key_fps, outcome.ssh_host_key_fps);
@@ -1035,14 +1195,16 @@ mod tests {
     }
 
     #[test]
-    fn fake_provision_lxc_synthesizes_nonempty_mac() {
-        // Regression: kento now reports an LXC MAC, so the outcome is Some and
-        // non-empty (the old `""` empty-sentinel for LXC is gone).
+    fn fake_provision_lxc_reports_no_mac() {
+        // kento reports a MAC for VM modes only: an LXC provision yields
+        // `None` (the designed sentinel), both in the outcome and on the
+        // realized live instance.
         let k = FakeKento::new();
         let lxc = sample_spec(Mode::Lxc);
         let out = k.provision(&lxc).unwrap();
-        let mac = out.mac.expect("LXC MAC is now reported");
-        assert!(!mac.is_empty());
+        assert_eq!(out.mac, None, "LXC has no MAC");
+        let listed = k.list_instances().unwrap();
+        assert_eq!(listed[0].mac, None, "LXC live instance has no MAC");
     }
 
     #[test]

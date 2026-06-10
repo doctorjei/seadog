@@ -246,8 +246,8 @@ mod tests {
         let mut e = env("g-lxc", "");
         e.mode = Mode::Lxc;
         let mut s = signals("g-lxc", None);
-        // The kento LXC mac may actually be Some now, but with an empty DB
-        // MAC it still drops out — cover both: live None here.
+        // kento reports a MAC for VM modes only, so an LXC live instance has
+        // no MAC (None) — it drops out of the decision entirely.
         s.mac = None;
         match classify(&s, Some(&e)) {
             Classification::ReapEligible { guid } => assert_eq!(guid, "g-lxc"),

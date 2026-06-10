@@ -266,9 +266,10 @@ mod tests {
         let k = FakeKento::new();
         let out = run(&args(), &k, &cfg).unwrap();
         assert_eq!(out["ok"], true);
-        // kento reports the realized signals back: an LXC gets a
-        // kento-assigned MAC (no empty sentinel) and host-key fingerprints.
-        assert!(out["mac"].is_string());
+        // kento reports the realized signals back: an LXC has NO MAC (kento
+        // reports a MAC for VM modes only), so `mac` is JSON null; host-key
+        // fingerprints are still reported.
+        assert!(out["mac"].is_null(), "LXC has no MAC");
         assert!(out["ssh_host_key_fps"].is_array());
         // FakeKento has no PVE backend → vmid is JSON null.
         assert!(out["vmid"].is_null());

@@ -152,12 +152,12 @@ pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
         Ok(outcome) => {
             // The helper reports the realized provision signals it read back
             // from kento `inspect`:
-            //   - `mac`: the EFFECTIVE mac the guest carries. For a VM it is
-            //     the minted MAC (a JSON string); for an LXC the MAC is
-            //     unobservable via `pct config`, so the helper emits JSON
-            //     `null`/absent and we record `""` ("no MAC recorded") rather
-            //     than the fictional minted MAC. Identity then treats MAC as
-            //     confirming-when-present.
+            //   - `mac`: the EFFECTIVE mac the guest carries. kento reports a
+            //     MAC for VM modes only, so for a VM it is the minted MAC (a
+            //     JSON string); for an LXC kento reports no MAC, so the helper
+            //     emits JSON `null`/absent and we record `""` ("no MAC
+            //     recorded") rather than the fictional minted MAC. Identity
+            //     then treats MAC as confirming-when-present.
             //   - `ssh_host_key_fps`: an array of host-key fingerprints (soft
             //     confirmer); absent ⇒ empty.
             //   - `vmid`: the backend vmid where one exists (PVE); JSON
