@@ -113,7 +113,7 @@ pub struct ProvisionArgs {
     pub image_ref: String,
     /// Whether nesting is permitted, resolved by the front-end from the
     /// served image alias. Re-validated here against the allowlist.
-    #[arg(long = "allow-nesting")]
+    #[arg(long = "allow-nesting", action = clap::ArgAction::Set)]
     pub allow_nesting: bool,
 }
 
@@ -460,6 +460,41 @@ images:
         a.image_ref = "evil.example.com/backdoor:latest".into();
         assert!(run(&a, &k, &cfg).is_err());
         assert!(k.provisions().is_empty());
+    }
+
+    #[test]
+    fn allow_nesting_value_form_argv_parses() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Harness {
+            #[command(flatten)]
+            a: ProvisionArgs,
+        }
+        // Mirror exactly what crates/seadog/src/verbs/create.rs builds.
+        let base = [
+            "provision",
+            "--owner",
+            "kanibako",
+            "--guid",
+            "11111111-1111-1111-1111-111111111111",
+            "--ip",
+            "10.0.4.192",
+            "--mac",
+            "00:11:22:33:44:55",
+            "--name",
+            "seadog-kanibako-p-abcd",
+            "--mode",
+            "lxc",
+            "--image-ref",
+            "localhost/gemet-bifrost-kento:1.7.2",
+        ];
+        for (val, expect) in [("false", false), ("true", true)] {
+            let mut argv: Vec<&str> = base.to_vec();
+            argv.push("--allow-nesting");
+            argv.push(val);
+            let h = Harness::try_parse_from(argv).expect("value-form --allow-nesting must parse");
+            assert_eq!(h.a.allow_nesting, expect);
+        }
     }
 
     #[test]
