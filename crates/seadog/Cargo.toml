@@ -1,6 +1,6 @@
 [package]
 name = "seadog"
-version = "0.7.0"
+version = "0.7.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -47,9 +47,10 @@ maintainer = "Jei Blanchard <jjb@eng.ufl.edu>"
 copyright = "2026, Jei Blanchard <jjb@eng.ufl.edu>"
 license-file = ["../../LICENSE.md", "0"]
 extended-description = """\
-seadog provisions ephemeral, owner-scoped Proxmox VE test environments. \
-Callers SSH into a locked-down `testenv` login shell that runs one verb \
-per connection; a root helper (seadog-priv) realizes/destroys guests and \
+seadog provisions ephemeral, owner-scoped test environments via the \
+`kento` runtime. Callers SSH into a locked-down `testenv` login shell that \
+runs one verb per connection; a root helper (seadog-priv) realizes/destroys \
+guests and \
 a systemd-timer-driven backstop sweeper reaps expired environments. This \
 package ships both static-musl binaries plus the sudoers/sshd/systemd/ \
 tmpfiles/sysusers plumbing.\
@@ -94,7 +95,7 @@ assets = [
 # install=1, upgrade=2, final-removal=0).
 # ====================================================================
 [package.metadata.generate-rpm]
-summary = "Unprivileged login-shell front-end + root helper for the seadog ephemeral PVE test-env provisioner."
+summary = "Unprivileged login-shell front-end + root helper for the seadog ephemeral test-env provisioner (kento-native)."
 # Static-musl: no auto-detected shared-lib requires; only systemd matters.
 auto-req = "no"
 requires = { systemd = "*" }
