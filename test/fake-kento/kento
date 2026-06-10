@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+# Fake `kento` (the seadog guest realizer) for the pseudo-soak. Emulates the
+# REAL kento 0.7.0-era CLI surface seadog's RealKento drives — and ONLY that
+# surface (see crates/core/src/kento.rs, the source of truth):
+#
+#   kento list                               # columnar table, NAME first col
+#   kento inspect <name> --json              # one instance as a JSON dict
+#   kento <lxc|vm> create [flags] <image>    # create + (--start) start
+#   kento <lxc|vm> destroy -f NAME           # remove BY NAME (-f forces)
+#
+# kento is backend-neutral and addresses instances BY NAME (never a vmid):
+# `list` is the live set, the seadog identity anchor rides in injected env
+# (SEADOG_GUID / SEADOG_OWNER), and `inspect` reports the realized MAC for
+# VM modes ONLY (present-only — an LXC has no MAC, so the field is omitted).
+# Each created instance is recorded into the shared JSON instance table so a
+# create -> list/inspect -> destroy roundtrip works within a soak run.
+#
+# create flags honored (exactly RealKento's argv): --name --network bridge=
+# --ip --gateway --env KEY=VALUE --ssh-host-keys --start --config-mode
+# --ssh-key --ssh-key-user --mac (VM ONLY — rejected for LXC) --allow-nesting
+# (only when nesting is on; RealKento NEVER emits --no-allow-nesting).
+# Anything outside this surface is a loud `unsupported` error so future drift
+# in RealKento is caught. State + helpers live in _lib.sh.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=/dev/null
+. "${SCRIPT_DIR}/_lib.sh"
+
+# Strip the `bridge=` wrapper off a --network value, leaving just the bridge
+# name. RealKento ALWAYS sends `bridge=<x>`, so any other form is argv drift
+# and must error (a non-zero exit, never a silent fallback).
+network_bridge() {
+  case "$1" in
+    bridge=*) printf '%s' "${1#bridge=}" ;;
+    *)
+      printf 'fake kento: unsupported --network value %s (expected bridge=…)\n' "$1" >&2
+      exit 2
+      ;;
+  esac
+}
+
+# `kento <mode> create [flags] <image>`. $1 is the resolved mode; the rest is
+# the flag/positional tail (mode + `create` already stripped by the caller).
+# Records the realized instance into the table, then prints a small JSON ack
+# the way kento does. RealKento ignores create's stdout and re-reads the
+# realized signals via a subsequent `inspect --json`.
+do_create() {
+  local mode="$1"
+  shift
+  quorum_guard
+  local name="" mac="" bridge="vmbr0" image=""
+  # environment[] accumulates the injected --env KEY=VALUE pairs, as a JSON
+  # array, exactly the shape `inspect` reports.
+  local env_json='[]'
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --mac) mac="$2"; shift 2 ;;
+      --network) bridge="$(network_bridge "$2")" || exit 2; shift 2 ;;
+      --env) env_json="$(printf '%s' "$env_json" | jq -c --arg e "$2" '. + [$e]')"; shift 2 ;;
+      --ip) shift 2 ;;
+      --gateway) shift 2 ;;
+      --config-mode) shift 2 ;;
+      --ssh-key) shift 2 ;;
+      --ssh-key-user) shift 2 ;;
+      --ssh-host-keys | --start) shift ;;
+      --allow-nesting) shift ;;
+      -*)
+        printf 'fake kento: unsupported %s create flag %s\n' "$mode" "$1" >&2
+        exit 2
+        ;;
+      *) image="$1"; shift ;;
+    esac
+  done
+  if [ -z "$name" ]; then
+    printf 'kento %s create: missing --name\n' "$mode" >&2
+    exit 2
+  fi
+  if [ -z "$image" ]; then
+    printf 'kento %s create: missing <image>\n' "$mode" >&2
+    exit 2
+  fi
+  if instance_exists "$name"; then
+    printf 'kento %s create: instance %s already exists\n' "$mode" "$name" >&2
+    exit 2
+  fi
+  # --mac is VM-only: real kento REJECTS --mac for LXC. kento reports a MAC
+  # for VM modes ONLY (it writes the `kento-mac` meta at create time for VMs
+  # and emits `mac` from inspect present-only), so an LXC carries NO mac at
+  # all — we leave it empty and OMIT the field from the stored instance.
+  if [ "$mode" = "lxc" ] && [ -n "$mac" ]; then
+    printf 'fake kento: --mac is not supported for lxc (kento reports a MAC for VM modes only)\n' >&2
+    exit 2
+  fi
+  # Stable host-key fingerprints, the {type: fp} dict shape inspect reports.
+  local fps_json
+  fps_json="$(jq -nc --arg n "$name" '{ed25519: ("SHA256:fp-ed25519-" + $n), rsa: ("SHA256:fp-rsa-" + $n)}')"
+  # Build the instance dict. `mac` is present-only, exactly as real kento
+  # emits it: a VM carries the passed `--mac`; an LXC has none, so the field
+  # is OMITTED (parse_kento_inspect maps absence to None — the LXC sentinel).
+  # `type` is the authoritative family field real kento ALWAYS emits from
+  # inspect (`VM` for vm/pve-vm modes, else `LXC`) — seadog collapses the
+  # family on it, so the shim must carry it too.
+  local type
+  case "$mode" in
+    vm | pve-vm) type="VM" ;;
+    *) type="LXC" ;;
+  esac
+  jq -nc \
+    --arg name "$name" --arg mode "$mode" --arg type "$type" --arg image "$image" \
+    --arg mac "$mac" --arg network "bridge=${bridge}" \
+    --argjson env "$env_json" --argjson fps "$fps_json" \
+    '{name:$name, mode:$mode, type:$type, image:$image, status:"running", network:$network, environment:$env, ssh_host_key_fingerprints:$fps}
+       + (if $mac == "" then {} else {mac:$mac} end)' |
+    upsert_instance
+  printf '{"ok":true,"mode":"%s","name":"%s"}\n' "$mode" "$name"
+}
+
+# `kento <mode> destroy -f NAME`. $1 is the mode; rest is the tail (`-f` then
+# the name). Removes BY NAME so kento's overlay state is cleaned alongside.
+do_destroy() {
+  local mode="$1"
+  shift
+  quorum_guard
+  local name=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -f | --force) shift ;;
+      -*)
+        printf 'fake kento: unsupported %s destroy flag %s\n' "$mode" "$1" >&2
+        exit 2
+        ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  if [ -z "$name" ]; then
+    printf 'kento %s destroy: missing NAME\n' "$mode" >&2
+    exit 2
+  fi
+  if ! instance_exists "$name"; then
+    printf 'kento %s destroy: no instance named %s\n' "$mode" "$name" >&2
+    exit 2
+  fi
+  remove_instance "$name"
+  printf '{"ok":true,"mode":"%s","destroyed":"%s"}\n' "$mode" "$name"
+}
+
+# `kento inspect <name> --json`. Emits the one instance as the JSON dict the
+# RealKento `parse_kento_inspect` reads: name/mode/image/status, the realized
+# `mac` (present-only), the `environment[]` KEY=VALUE list (carries the seadog
+# anchor), and the `ssh_host_key_fingerprints` {type: fp} dict. The stored
+# instance object is replayed verbatim (plus a synthesized authoritative
+# `type` when an injected fixture omits it), so a row injected with a PVE
+# backend mode (`pve` for PVE-LXC, `pve-vm` for PVE-VM — kento NEVER emits
+# `pve-lxc` from inspect) and a numeric `vmid` carries BOTH through to inspect
+# — exercising parse_kento_inspect's type-driven family collapse + vmid
+# extraction. A vanilla create stores bare `lxc`/`vm` and no `vmid`, so the
+# vmid is absent there and parse_kento_inspect maps absence to None (unchanged).
+do_inspect() {
+  quorum_guard
+  local name="" json=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift ;;
+      -*)
+        printf 'fake kento: unsupported inspect flag %s\n' "$1" >&2
+        exit 2
+        ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  if [ -z "$name" ]; then
+    printf 'kento inspect: missing NAME\n' >&2
+    exit 2
+  fi
+  # Instance names are unique (kento's primary key), so a single select is
+  # enough — no `head -n1` (which can propagate SIGPIPE/141 under pipefail).
+  local g
+  g="$(read_state | jq -c --arg n "$name" 'first(.instances[] | select(.name == $n)) // empty')"
+  if [ -z "$g" ]; then
+    printf 'kento inspect: no instance named %s\n' "$name" >&2
+    exit 2
+  fi
+  # Ghost/broken-instance injection: a stored instance carrying a truthy
+  # `_inspect_fail` marker makes `inspect` exit non-zero, the way a "ghost"
+  # row (present in `kento list` but with no backing guest) errors on a real
+  # host (exit 255). The marker lives IN the state file, not in an env knob,
+  # because RealKento::run() env_clear()s before exec — the shim cannot see a
+  # process-env flag, but it always reads the (fixed-path) state. The reaper's
+  # list_instances must LOG+SKIP this one and keep evaluating the rest.
+  if printf '%s' "$g" | jq -e '._inspect_fail // false' >/dev/null; then
+    printf 'kento inspect: instance %s has no backing guest (ghost)\n' "$name" >&2
+    exit 255
+  fi
+  if [ "$json" -eq 1 ]; then
+    # Real kento ALWAYS emits the authoritative `type` field (`VM` for
+    # vm/pve-vm modes, else `LXC`) from inspect. A row created by this shim
+    # already stored it; an injected fixture row may omit it, so synthesize it
+    # from `mode` here when absent — the shim must always present the real
+    # contract (type-driven family) the way kento does.
+    g="$(printf '%s' "$g" | jq -c 'if has("type") then . else . + {type: (if (.mode == "vm" or .mode == "pve-vm") then "VM" else "LXC" end)} end')"
+    # `kento` emits json.dumps(indent=2); RealKento parses it regardless of
+    # whitespace, so pretty-print for fidelity.
+    printf '%s\n' "$g" | jq '.'
+  else
+    printf '%s' "$g" | jq -r '"name: \(.name)\nmode: \(.mode)\nstatus: \(.status)"'
+  fi
+}
+
+# `kento list`. The columnar table RealKento `parse_kento_list` reads: a NAME
+# header, a dash separator, then one space-padded row per instance (NAME is
+# the first column). When there are no instances it prints the empty-set
+# sentinel `(no instances found)`.
+do_list() {
+  quorum_guard
+  # Default to 0 and guard the integer test: corrupt/empty state must not make
+  # the `-eq` comparison fatally error under `set -e`.
+  local count
+  count="$(read_state | jq '.instances | length' 2>/dev/null)"
+  if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+    count=0
+  fi
+  if [ "$count" -eq 0 ]; then
+    printf '(no instances found)\n'
+    return 0
+  fi
+  printf '%-40s %-8s %-30s %-10s\n' "NAME" "TYPE" "IMAGE" "STATUS"
+  printf '%-40s %-8s %-30s %-10s\n' \
+    "----------------------------------------" "--------" \
+    "------------------------------" "----------"
+  read_state | jq -r '.instances[] | [.name, .mode, .image, .status] | @tsv' |
+    while IFS=$'\t' read -r name mode image status; do
+      printf '%-40s %-8s %-30s %-10s\n' "$name" "$mode" "$image" "$status"
+    done
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  lxc | vm)
+    sub="${2:-}"
+    # Strip the mode + subcommand, leaving just the flag/positional tail.
+    shift 2 || true
+    case "$sub" in
+      create) do_create "$cmd" "$@" ;;
+      destroy) do_destroy "$cmd" "$@" ;;
+      *)
+        printf 'fake kento: unsupported %s subcommand %s\n' "$cmd" "$sub" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  list)
+    shift || true
+    do_list "$@"
+    ;;
+  inspect)
+    shift || true
+    do_inspect "$@"
+    ;;
+  *)
+    printf 'fake kento: unsupported command %s\n' "$cmd" >&2
+    exit 2
+    ;;
+esac

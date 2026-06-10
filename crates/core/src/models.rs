@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Provisioning mode for an env — a Proxmox LXC container or a full VM.
+/// Provisioning mode for an env — an LXC container or a full VM.
 ///
 /// Serializes lowercase (`"lxc"` / `"vm"`) so the YAML `modes:` lists in
 /// the image allowlist and the SQLite `mode` column share one
@@ -16,10 +16,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
-    /// Proxmox LXC container (`pct`).
+    /// LXC container (realized by the backend kento targets).
     #[default]
     Lxc,
-    /// Full virtual machine (`qm`).
+    /// Full virtual machine (realized by the backend kento targets).
     Vm,
 }
 
@@ -46,8 +46,8 @@ impl Mode {
 ///
 /// Phase 1a keeps this a plain enum value — the *classification* logic
 /// (when an env becomes `Flagged`, etc.) is Phase 1b. `Vanished` means
-/// the guest disappeared from PVE out from under us; `Reaped` means
-/// seadog killed it on deadline.
+/// the guest disappeared from the backend out from under us; `Reaped`
+/// means seadog killed it on deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EnvStatus {
@@ -55,7 +55,7 @@ pub enum EnvStatus {
     Active,
     /// seadog destroyed it (deadline reached).
     Reaped,
-    /// Guest disappeared from PVE without seadog acting.
+    /// Guest disappeared from the backend without seadog acting.
     Vanished,
     /// Identity signals disagree — held for operator attention, never
     /// auto-reaped. Classification logic that sets this is Phase 1b.
