@@ -44,14 +44,6 @@ pub struct Config {
     /// Per-owner cap overrides (optional).
     #[serde(default)]
     pub owners: BTreeMap<String, OwnerOverride>,
-    /// **Deprecated, ignored.** The PVE hardware-fingerprint tie-breaker was
-    /// removed in the kento decouple (identity is now the injected
-    /// `SEADOG_GUID` anchor + native confirmers). Kept ONLY as an
-    /// accept-and-ignore shim so a deployed `config.yaml` still carrying a
-    /// stale `identity:` block under `deny_unknown_fields` keeps parsing.
-    /// Never serialized back out. Removed for good in P6 (example cleanup).
-    #[serde(default, skip_serializing)]
-    pub identity: serde::de::IgnoredAny,
     #[serde(default)]
     pub lifecycle: Lifecycle,
     #[serde(default)]
@@ -85,13 +77,6 @@ impl Default for Cadence {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Allocation {
-    /// **Deprecated, ignored.** vmid allocation was removed in the kento
-    /// decouple (allocate by unique name + IP lease; kento auto-assigns a
-    /// backend vmid where one exists). Kept ONLY as an accept-and-ignore
-    /// shim so a deployed `config.yaml` still carrying a stale `vmid_range:`
-    /// under `deny_unknown_fields` keeps parsing. Never serialized back out.
-    #[serde(default, skip_serializing)]
-    pub vmid_range: serde::de::IgnoredAny,
     /// The bridge kento attaches guests to (e.g. `vmbr0`). Passed to
     /// `kento create` as `--network bridge=<this>`.
     #[serde(default = "default_bridge")]
@@ -105,7 +90,6 @@ pub struct Allocation {
 impl Default for Allocation {
     fn default() -> Self {
         Allocation {
-            vmid_range: serde::de::IgnoredAny,
             bridge: default_bridge(),
             ip_pool: IpPool::default(),
             caps: Caps::default(),

@@ -21,8 +21,8 @@ fn parses_annotated_example() {
     cfg.validate().expect("example must validate");
 
     assert!(cfg.reaper_enabled);
-    // removed: vmid_range assertion (vmid allocation dropped; the example
-    // still carries a stale `vmid_range:` block, parsed as an ignored shim).
+    // removed: vmid_range assertion (vmid allocation dropped; the stale
+    // `vmid_range:` block is gone from the example and is now rejected).
     assert_eq!(
         cfg.allocation.ip_pool.range,
         [
@@ -41,7 +41,7 @@ fn parses_annotated_example() {
 
     // Image allowlist: name -> {ref, modes[, user]}.
     let loom = cfg.images.get("loom").expect("loom present");
-    assert_eq!(loom.image_ref, "ghcr.io/doctorjei/droste-loom:latest");
+    assert_eq!(loom.image_ref, "ghcr.io/doctorjei/droste-loom:1.2.0");
     assert_eq!(loom.modes, vec![Mode::Lxc]);
     assert_eq!(loom.user.as_deref(), Some("droste"));
     let ci = cfg.images.get("ci").expect("ci present");
@@ -55,7 +55,7 @@ fn parses_annotated_example() {
     assert_eq!(cfg.login_user_for_image("loom"), "droste");
     assert_eq!(cfg.login_user_for_image("ci"), "agent");
     assert_eq!(
-        cfg.login_user_for_ref("ghcr.io/doctorjei/droste-loom:latest"),
+        cfg.login_user_for_ref("ghcr.io/doctorjei/droste-loom:1.2.0"),
         "droste"
     );
 
@@ -66,8 +66,8 @@ fn parses_annotated_example() {
 
     // removed: identity weight/threshold assertions — the hardware-
     // fingerprint tie-breaker is gone (identity is now the injected
-    // SEADOG_GUID anchor + native confirmers). The example still carries a
-    // stale `identity:` block, parsed as an ignored shim.
+    // SEADOG_GUID anchor + native confirmers). The stale `identity:` block is
+    // gone from the example and is now rejected.
 
     // notify nulls -> None.
     assert!(cfg.notify.journald);
@@ -174,20 +174,37 @@ fn kento_path_parses_and_validates() {
 }
 
 // removed: rejects_bad_vmid_range + rejects_out_of_window_vmid_range — vmid
-// allocation and its validation are gone (kento decouple). A `vmid_range:`
-// block is now an accept-and-ignore shim, so it no longer fails validation.
-// Replaced with a guard that a stale `vmid_range:` block still parses.
+// allocation and its validation are gone (kento decouple). The accept-and-ignore
+// shims for `vmid_range:` and `identity:` were removed in P6, so a stale block of
+// either now fails to PARSE under `deny_unknown_fields` (confirmed below).
 #[test]
-fn stale_vmid_range_block_is_ignored_not_rejected() {
+fn stale_vmid_range_block_is_now_rejected() {
     let yaml = r#"
 allocation:
-  vmid_range: [10999, 10000]
+  vmid_range: [10000, 10999]
 images:
-  loom: { ref: ghcr.io/doctorjei/droste-loom:latest, modes: [lxc] }
+  loom: { ref: ghcr.io/doctorjei/droste-loom:1.2.0, modes: [lxc] }
 "#;
-    let cfg = Config::from_yaml_str(yaml).expect("stale vmid_range still parses");
-    cfg.validate()
-        .expect("a stale vmid_range block must not fail validation");
+    assert!(
+        Config::from_yaml_str(yaml).is_err(),
+        "a stale vmid_range block must now be rejected as an unknown field"
+    );
+}
+
+#[test]
+fn stale_identity_block_is_now_rejected() {
+    let yaml = r#"
+identity:
+  threshold: 0.6
+  weights:
+    network: 3
+images:
+  loom: { ref: ghcr.io/doctorjei/droste-loom:1.2.0, modes: [lxc] }
+"#;
+    assert!(
+        Config::from_yaml_str(yaml).is_err(),
+        "a stale identity block must now be rejected as an unknown field"
+    );
 }
 
 #[test]
