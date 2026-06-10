@@ -151,6 +151,13 @@ pub fn sweep(
     if outcome.quorum_lost.is_none() {
         for env in store::list_by_status(conn, EnvStatus::Active)? {
             if !live_guids.contains(&env.guid) {
+                // Don't vanish within the create window: a just-written Active
+                // row can precede its instance appearing in `kento list`
+                // (create is not atomic). Defer to a later sweep — the same
+                // age floor the anomaly and reap-candidate paths already apply.
+                if now_unix - env.created_at < age_floor {
+                    continue;
+                }
                 outcome.vanished += 1;
                 let _ = store::mark_vanished(conn, &env.guid);
                 route(
@@ -714,6 +721,30 @@ images:
         assert_eq!(
             store::get_env(&conn, "gone").unwrap().unwrap().status,
             EnvStatus::Vanished
+        );
+    }
+
+    #[test]
+    fn young_active_row_absent_from_live_is_not_vanished() {
+        // A just-written Active row (age < age_floor) whose GUID is absent from
+        // the live set must NOT be vanished: create is not atomic, so the row
+        // can land before its instance appears in `kento list`. The create
+        // window defers it to a later sweep — the row stays Active.
+        let c = config();
+        let conn = store::open_in_memory().unwrap();
+        let now = 1_000_000i64;
+        // Created just now (well within the 5m age floor).
+        insert_active(&conn, "fresh", now, now + 3600);
+        // No live instance carries "fresh" yet (kento create still landing).
+        let k = FakeKento::new();
+        k.set_instances(vec![]);
+
+        let out = sweep(&k, &conn, &c, now).unwrap();
+        assert_eq!(out.vanished, 0, "create-window row must not be vanished");
+        assert_eq!(
+            store::get_env(&conn, "fresh").unwrap().unwrap().status,
+            EnvStatus::Active,
+            "deferred create-window row stays Active, not Vanished"
         );
     }
 
