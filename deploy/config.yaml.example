@@ -8,7 +8,6 @@ cadence:
   idle: 60m                     # systemd backstop timer (always-on floor)
 
 allocation:
-  vmid_range: [10000, 10999]    # inclusive; the scan + allocator range
   bridge: vmbr0                 # bridge kento attaches guests to; set to your node's bridge
   ip_pool:                      # static IPs at create, lowest-available, atomic lease
     # EXAMPLE range — set to a free range on your network.
@@ -19,24 +18,34 @@ allocation:
     max_lxc_per_owner: 8
     max_vm_per_owner: 3
 
-images:                         # allowlist: name -> {ref, modes}; never a caller ref
-  # EXAMPLE allowlist — configure your own images. The droste refs below are
-  # the published droste test images; swap in whatever your cluster ships.
-  loom:     { ref: ghcr.io/doctorjei/droste-loom:latest,    modes: [lxc] }
-  stuffer:  { ref: ghcr.io/doctorjei/droste-stuffer:latest, modes: [vm]  }
-  ci:       { ref: ghcr.io/doctorjei/kanibako-lxc:latest,   modes: [lxc, vm] }  # first = default; example, set your own agent image (ref unconfirmed)
+# Login user the OWNER's injected SSH key authorizes inside a provisioned
+# guest (used for `--ssh-key-user`). Fail-open default: "root". A per-image
+# `user:` (below) overrides this for that image.
+default_user: root
+
+# Absolute path to the `kento` binary. Leave commented to invoke the bare
+# `kento` name (resolved via the helper's pinned PATH). Set this if kento is
+# NOT on the default PATH — e.g. a pipx install at /root/.local/bin/kento.
+# kento_path: /usr/local/bin/kento  # set if kento isn't on the default PATH, e.g. a pipx install at /root/.local/bin/kento
+
+images:                         # allowlist: name -> {ref, modes[, user][, allow_nesting]}; never a caller ref
+  # EXAMPLE allowlist — configure your own images. The refs below are ILLUSTRATIVE
+  # and image-source-agnostic: swap in whatever your cluster ships, and pin to an
+  # exact tag or digest, not :latest (the allowlist is a security boundary; a
+  # rolling :latest can move under you). The droste refs are just one example source.
+  # `user:` (optional) pins the login user the owner's SSH key authorizes for
+  # that image; when omitted, `default_user` (above) applies.
+  # `allow_nesting:` (optional bool, per-alias; absent ⇒ false) permits nesting —
+  # mode-agnostic: nested virt in VMs / nested containers. It is re-validated
+  # across the privilege boundary by OCI ref, so the SAME ref may appear under two
+  # aliases with different allow_nesting (see stuffer / stuffer-nested below).
+  loom:           { ref: ghcr.io/doctorjei/droste-loom:1.2.0,    modes: [lxc], user: droste }
+  stuffer:        { ref: ghcr.io/doctorjei/droste-stuffer:1.2.0, modes: [vm],  user: droste }
+  stuffer-nested: { ref: ghcr.io/doctorjei/droste-stuffer:1.2.0, modes: [vm],  user: droste, allow_nesting: true }  # same OCI image as `stuffer`, listed twice with a different nesting policy
+  ci:             { ref: ghcr.io/doctorjei/kanibako-lxc:1.2.0,   modes: [lxc, vm], user: agent }  # first = default; example, set your own agent image (ref unconfirmed)
 
 owners:                         # identity (fingerprint->name) lives in authorized_keys;
   ci: { max_lxc: 12 }           # this block is per-owner cap OVERRIDES only (optional)
-
-identity:                       # hardware-fingerprint tie-breaker (flag-only, never reaps)
-  threshold: 0.6                # tune empirically; bias toward sensitivity
-  weights:                      # high-info fields carry weight; low-info ~0
-    network: 3                  # bridge + VLAN + model
-    disk: 3                     # geometry / size
-    machine: 2                  # machine type / BIOS / scsihw
-    memory: 0
-    cores: 0
 
 lifecycle:
   age_floor: 5m                 # never reap envs younger than this (non-atomic create window)

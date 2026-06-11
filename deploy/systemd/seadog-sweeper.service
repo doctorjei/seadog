@@ -7,28 +7,25 @@
 # as the failure-domain-diverse backstop to the fast in-process watcher
 # (`seadog-priv watch`, which is deliberately NOT a systemd unit).
 #
-# This unit runs as root (the operator is root on the Proxmox host) with NO sudo:
-# `seadog-priv` self-guards on euid 0 and re-validates everything.
+# This unit runs as root (seadog routes all guest ops through `kento`, which
+# needs root on the host to realize/destroy guests) with NO sudo: `seadog-priv`
+# self-guards on euid 0 and re-validates everything.
 
 [Unit]
 Description=seadog one-shot reaper sweep (backstop)
 Documentation=https://github.com/doctorjei/seadog
-# Never sweep before Proxmox is up: a sweep that can't reach pmxcfs /
-# pvedaemon would see no quorum and abort the tick (harmless, but
-# pointless). Ordering only — these are not hard requirements so the
-# timer still fires on a node where PVE is intentionally down.
-After=pve-cluster.service pvedaemon.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/lib/seadog/seadog-priv sweep
-# A hung `qm destroy` / `pct destroy` must not stall reaping forever:
+# A hung `kento … destroy` must not stall reaping forever:
 # cap the whole pass and let the next timer cycle retry the remainder.
 RuntimeMaxSec=300
 # Light sandbox. We deliberately do NOT set ProtectSystem=strict: the
-# sweep writes through the /etc/pve pmxcfs FUSE mount and PVE storage,
-# and strict would remount most of the filesystem read-only and break
-# those writes. NoNewPrivileges + ProtectHome are safe and cheap.
+# sweep shells out to `kento`, which mutates backend guest state across
+# system paths (the exact paths depend on the backend kento targets), and
+# strict would remount most of the filesystem read-only and break those
+# writes. NoNewPrivileges + ProtectHome are safe and cheap.
 NoNewPrivileges=yes
 ProtectHome=yes
 # Keep DB WAL/SHM sidecars group-writable for the testenv front-end (the

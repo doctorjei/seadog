@@ -1,6 +1,6 @@
 [package]
 name = "seadog"
-version = "0.1.0"
+version = "0.7.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -34,7 +34,7 @@ tempfile = "3"
 #
 # Build:  cargo build --release --target x86_64-unknown-linux-musl
 #         cargo deb -p seadog --target x86_64-unknown-linux-musl
-# Output: target/debian/seadog_0.1.0-1_amd64.deb
+# Output: target/debian/seadog_0.5.0-1_amd64.deb
 #
 # ONE .deb holds BOTH binaries + every deploy/ asset. The explicit
 # `assets` list fully replaces cargo-deb's auto-include of this crate's
@@ -47,9 +47,10 @@ maintainer = "Jei Blanchard <jjb@eng.ufl.edu>"
 copyright = "2026, Jei Blanchard <jjb@eng.ufl.edu>"
 license-file = ["../../LICENSE.md", "0"]
 extended-description = """\
-seadog provisions ephemeral, owner-scoped Proxmox VE test environments. \
-Callers SSH into a locked-down `testenv` login shell that runs one verb \
-per connection; a root helper (seadog-priv) realizes/destroys guests and \
+seadog provisions ephemeral, owner-scoped test environments via the \
+`kento` runtime. Callers SSH into a locked-down `testenv` login shell that \
+runs one verb per connection; a root helper (seadog-priv) realizes/destroys \
+guests and \
 a systemd-timer-driven backstop sweeper reaps expired environments. This \
 package ships both static-musl binaries plus the sudoers/sshd/systemd/ \
 tmpfiles/sysusers plumbing.\
@@ -86,7 +87,7 @@ assets = [
 #            the musl release dir, so build the binaries with --target
 #            first, then run generate-rpm WITHOUT it. Passing --target here
 #            produced no artifact in testing.)
-# Output: target/generate-rpm/seadog-0.1.0-1.x86_64.rpm
+# Output: target/generate-rpm/seadog-0.5.0-1.x86_64.rpm
 #
 # Same asset layout as the .deb. /etc/seadog/config.yaml is flagged
 # config(noreplace) — the rpm analog of the dpkg conffile. Scriptlets in
@@ -94,7 +95,7 @@ assets = [
 # install=1, upgrade=2, final-removal=0).
 # ====================================================================
 [package.metadata.generate-rpm]
-summary = "Unprivileged login-shell front-end + root helper for the seadog ephemeral PVE test-env provisioner."
+summary = "Unprivileged login-shell front-end + root helper for the seadog ephemeral test-env provisioner (kento-native)."
 # Static-musl: no auto-detected shared-lib requires; only systemd matters.
 auto-req = "no"
 requires = { systemd = "*" }

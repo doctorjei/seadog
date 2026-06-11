@@ -32,11 +32,18 @@ pub struct Config {
     /// Allowlist: image name -> {ref, modes}. Never empty (validated).
     #[serde(default)]
     pub images: BTreeMap<String, Image>,
+    /// The login user injected ssh keys authorize for, when an image entry
+    /// does not pin its own `user`. Defaults to `"root"` (fail-open).
+    #[serde(default = "default_user")]
+    pub default_user: String,
+    /// Absolute path to the `kento` binary. `None` → spawn the bare `"kento"`
+    /// name (resolved via the helper's pinned PATH). Set when kento is not on
+    /// the default PATH (e.g. a pipx install under `/root/.local/bin`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kento_path: Option<String>,
     /// Per-owner cap overrides (optional).
     #[serde(default)]
     pub owners: BTreeMap<String, OwnerOverride>,
-    #[serde(default)]
-    pub identity: Identity,
     #[serde(default)]
     pub lifecycle: Lifecycle,
     #[serde(default)]
@@ -66,14 +73,11 @@ impl Default for Cadence {
     }
 }
 
-/// vmid / ip / cap allocation policy.
+/// name / ip / cap allocation policy.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Allocation {
-    /// Inclusive `[low, high]` vmid scan + allocate range.
-    #[serde(default = "default_vmid_range")]
-    pub vmid_range: [u32; 2],
-    /// The PVE bridge kento attaches guests to (e.g. `vmbr0`). Passed to
+    /// The bridge kento attaches guests to (e.g. `vmbr0`). Passed to
     /// `kento create` as `--network bridge=<this>`.
     #[serde(default = "default_bridge")]
     pub bridge: String,
@@ -86,7 +90,6 @@ pub struct Allocation {
 impl Default for Allocation {
     fn default() -> Self {
         Allocation {
-            vmid_range: default_vmid_range(),
             bridge: default_bridge(),
             ip_pool: IpPool::default(),
             caps: Caps::default(),
@@ -146,6 +149,18 @@ pub struct Image {
     /// Allowed modes; the first is the default for `create` without
     /// `--mode`.
     pub modes: Vec<Mode>,
+    /// Optional login user the owner's ssh key is authorized for in guests
+    /// of this image. When unset, the top-level `default_user` applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Whether nesting is permitted for guests served from this catalog
+    /// entry — mode-agnostic (VM→VM nesting / nested virt, container→
+    /// container nesting). `None`/absent ⇒ false (kento's default applies).
+    /// Selected per-alias by the front-end and re-validated against the
+    /// allowlist via [`Config::nesting_ok_for_ref`] (the same OCI ref may be
+    /// listed under two aliases with different `allow_nesting`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_nesting: Option<bool>,
 }
 
 /// Per-owner cap override block (all fields optional).
@@ -156,53 +171,6 @@ pub struct OwnerOverride {
     pub max_lxc: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_vm: Option<u32>,
-}
-
-/// Hardware-fingerprint tie-breaker config (flag-only; never reaps).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Identity {
-    #[serde(default = "default_threshold")]
-    pub threshold: f64,
-    #[serde(default)]
-    pub weights: IdentityWeights,
-}
-
-impl Default for Identity {
-    fn default() -> Self {
-        Identity {
-            threshold: default_threshold(),
-            weights: IdentityWeights::default(),
-        }
-    }
-}
-
-/// Per-field fingerprint weights (high-info fields carry weight).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IdentityWeights {
-    #[serde(default = "weight_3")]
-    pub network: u32,
-    #[serde(default = "weight_3")]
-    pub disk: u32,
-    #[serde(default = "weight_2")]
-    pub machine: u32,
-    #[serde(default)]
-    pub memory: u32,
-    #[serde(default)]
-    pub cores: u32,
-}
-
-impl Default for IdentityWeights {
-    fn default() -> Self {
-        IdentityWeights {
-            network: 3,
-            disk: 3,
-            machine: 2,
-            memory: 0,
-            cores: 0,
-        }
-    }
 }
 
 /// Deadline / grace / herd-cap lifecycle policy. All duration fields.
@@ -303,23 +271,9 @@ impl Config {
 
     /// Validate semantic invariants the type system can't enforce.
     ///
-    /// Errors on: inverted/degenerate `vmid_range` (low >= high) or out
-    /// of the `[10000, 10999]` window; an empty `images` allowlist; an
-    /// inverted/degenerate IP-pool range; an identity threshold outside
-    /// `[0, 1]`.
+    /// Errors on: an empty `images` allowlist; an inverted/degenerate
+    /// IP-pool range.
     pub fn validate(&self) -> Result<(), Error> {
-        let [vlo, vhi] = self.allocation.vmid_range;
-        if vlo >= vhi {
-            return Err(Error::ConfigValidation(format!(
-                "vmid_range low ({vlo}) must be < high ({vhi})"
-            )));
-        }
-        if vlo < 10000 || vhi > 10999 {
-            return Err(Error::ConfigValidation(format!(
-                "vmid_range [{vlo}, {vhi}] must lie within [10000, 10999]"
-            )));
-        }
-
         if self.images.is_empty() {
             return Err(Error::ConfigValidation(
                 "images allowlist must not be empty".to_string(),
@@ -340,14 +294,57 @@ impl Config {
             )));
         }
 
-        let t = self.identity.threshold;
-        if !(0.0..=1.0).contains(&t) {
-            return Err(Error::ConfigValidation(format!(
-                "identity.threshold ({t}) must be within [0.0, 1.0]"
-            )));
+        // `kento_path`, when set, must be a non-empty path. The user fields
+        // are free-form (no constraint) and intentionally fail-open.
+        if let Some(p) = &self.kento_path {
+            if p.trim().is_empty() {
+                return Err(Error::ConfigValidation(
+                    "kento_path, when set, must not be empty".to_string(),
+                ));
+            }
         }
 
         Ok(())
+    }
+
+    /// Resolve the login user the owner's ssh key should authorize for when
+    /// creating a guest from image *name*: the image entry's `user` if it
+    /// pins one, else the top-level `default_user` (itself `"root"` by
+    /// default). Never errors — an unknown image name falls back to
+    /// `default_user`, so this is fail-open by construction.
+    pub fn login_user_for_image(&self, name: &str) -> String {
+        self.images
+            .get(name)
+            .and_then(|img| img.user.clone())
+            .unwrap_or_else(|| self.default_user.clone())
+    }
+
+    /// Like [`Config::login_user_for_image`] but keyed on the resolved OCI
+    /// *ref* (what `seadog-priv provision` carries, since it never trusts a
+    /// bare image name from the front-end). Matches the first image entry
+    /// whose `ref` equals `image_ref` and returns its pinned `user`, else the
+    /// top-level `default_user`. Fail-open: an unmatched ref → `default_user`.
+    pub fn login_user_for_ref(&self, image_ref: &str) -> String {
+        self.images
+            .values()
+            .find(|img| img.image_ref == image_ref)
+            .and_then(|img| img.user.clone())
+            .unwrap_or_else(|| self.default_user.clone())
+    }
+
+    /// Re-validate a requested `allow_nesting` value across the privilege
+    /// boundary: the front-end resolves nesting from the served *alias* but
+    /// passes only the OCI *ref* to `seadog-priv`, and the same ref may be
+    /// listed under two aliases with different `allow_nesting`. So the helper
+    /// cannot trust the requested value alone — it confirms SOME image entry
+    /// exists whose `ref` equals `image_ref` AND whose effective
+    /// `allow_nesting` (absent ⇒ false) equals `requested`. Returns true iff
+    /// such an entry exists. This is the gate `provision` checks before
+    /// setting `ProvisionSpec.allow_nesting`.
+    pub fn nesting_ok_for_ref(&self, image_ref: &str, requested: bool) -> bool {
+        self.images.values().any(|img| {
+            img.image_ref == image_ref && img.allow_nesting.unwrap_or(false) == requested
+        })
     }
 }
 
@@ -357,6 +354,9 @@ impl Config {
 
 fn default_true() -> bool {
     true
+}
+fn default_user() -> String {
+    "root".to_string()
 }
 fn secs_60() -> Duration {
     Duration::from_secs(60)
@@ -375,9 +375,6 @@ fn mins_60() -> Duration {
 }
 fn days_7() -> Duration {
     Duration::from_secs(7 * 24 * 60 * 60)
-}
-fn default_vmid_range() -> [u32; 2] {
-    [10000, 10999]
 }
 fn default_bridge() -> String {
     "vmbr0".to_string()
@@ -399,15 +396,6 @@ fn max_lxc_default() -> u32 {
     8
 }
 fn max_vm_default() -> u32 {
-    3
-}
-fn default_threshold() -> f64 {
-    0.6
-}
-fn weight_2() -> u32 {
-    2
-}
-fn weight_3() -> u32 {
     3
 }
 fn herd_cap_default() -> u32 {

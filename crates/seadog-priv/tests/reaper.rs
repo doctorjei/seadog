@@ -51,11 +51,12 @@ fn sweep_one_shot_mixes_fixtures_and_routes_each() {
     let cfg = config();
     let now = 2_000_000i64;
 
-    // expired + unanimous → reaped
+    // expired + agreeing → reaped
     insert_active(&conn, "expired", 10010, now - 3600, now - 100);
-    // anomaly: row present, but live desc-GUID clobbered → flagged, NOT reaped
+    // anomaly: row present, but the live instance's name is clobbered →
+    // flagged, NOT reaped
     insert_active(&conn, "anomaly", 10011, now - 3600, now - 100);
-    // a foreign in-range guest with no DB row → heads-up, never touched
+    // a foreign kento instance (no SEADOG_GUID anchor) → ignored, never touched
     // a live but NOT-yet-expired env (deadline in the future) → survives
     insert_active(&conn, "live", 10013, now - 3600, now + 10_000);
     // an OLD terminal row (reaped long ago) → pruned by prune_terminal
@@ -70,7 +71,7 @@ fn sweep_one_shot_mixes_fixtures_and_routes_each() {
     );
 
     let k = FakeKento::new();
-    k.set_guests(vec![
+    k.set_instances(vec![
         signals_for(&conn, "expired", 10010),
         clobbered_signals_for(&conn, "anomaly", 10011),
         foreign_signals(10012),
@@ -80,7 +81,7 @@ fn sweep_one_shot_mixes_fixtures_and_routes_each() {
     let v = sweep::run_with_db(&conn, &k, &cfg, now).unwrap();
     assert_eq!(v["ok"], true);
 
-    // expired+unanimous → reaped (teardown called + row marked).
+    // expired+agreeing → reaped (teardown called + row marked).
     assert_eq!(v["reaped"], 1);
     assert_eq!(
         k.teardowns(),
@@ -98,8 +99,8 @@ fn sweep_one_shot_mixes_fixtures_and_routes_each() {
         EnvStatus::Active
     );
 
-    // foreign-in-range → heads-up, never touched.
-    assert_eq!(v["heads_up"], 1);
+    // foreign (no anchor) → ignored: not flagged, never touched.
+    assert!(v.get("heads_up").is_none());
 
     // live (future deadline) survives untouched.
     assert_eq!(
@@ -144,7 +145,7 @@ fn watch_loop_reaps_one_then_self_extinguishes() {
 
     insert_active(&conn, "g1", 10010, now - 3600, now - 100);
     let k = FakeKento::new();
-    k.set_guests(vec![signals_for(&conn, "g1", 10010)]);
+    k.set_instances(vec![signals_for(&conn, "g1", 10010)]);
 
     let summary = watch::run_loop(
         &conn,
@@ -193,7 +194,7 @@ fn watch_tick_is_callable_directly() {
     let now = 2_000_000i64;
     insert_active(&conn, "g1", 10010, now - 3600, now - 100);
     let k = FakeKento::new();
-    k.set_guests(vec![signals_for(&conn, "g1", 10010)]);
+    k.set_instances(vec![signals_for(&conn, "g1", 10010)]);
 
     let r = watch::tick(&conn, &k, &cfg, now).unwrap();
     assert_eq!(r.reaped, 1);

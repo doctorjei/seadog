@@ -58,13 +58,12 @@ jobs:
       - name: Build release (static musl)
         run: cargo build --release --target x86_64-unknown-linux-musl
 
-      # Lint shell scripts. The fake-PVE shims have bash shebangs but no .sh
-      # extension, so they are listed explicitly.
+      # Lint shell scripts. The fake `kento` shim + its lib have bash shebangs
+      # but no .sh extension, so they are listed explicitly.
       - name: Shellcheck
         run: |
           shellcheck deploy/*.sh test/*.sh \
-            test/fake-pve/qm test/fake-pve/pct test/fake-pve/kento \
-            test/fake-pve/pvesh test/fake-pve/_lib.sh
+            test/fake-kento/kento test/fake-kento/_lib.sh
 
       # The :edge-equivalent artifact: both static binaries.
       - name: Upload musl binaries
@@ -79,10 +78,10 @@ jobs:
   # unit-test signal from `test`.
   #
   # WARNING: this job is GitHub-hosted-ephemeral-ONLY. The pseudo-soak
-  # `sudo ln -sf`s fake qm/pct/kento/pvesh into /usr/sbin and runs seadog-priv
-  # as real root. It MUST NEVER run on a self-hosted runner or a real PVE node
-  # — only on a disposable GitHub-hosted runner. The script also self-guards
-  # (refuses to run if a real qm/pct/pvesh is present).
+  # `sudo ln -sf`s a fake `kento` into /usr/local/bin and runs seadog-priv as
+  # real root. It MUST NEVER run on a self-hosted runner or a real seadog/kento
+  # host — only on a disposable GitHub-hosted runner. The script also
+  # self-guards (refuses to run if a real `kento` is already present).
   pseudo-soak:
     runs-on: ubuntu-latest
     steps:

@@ -27,6 +27,7 @@ pub mod store;
 pub mod validate;
 
 pub use config::Config;
+pub use kento::InstanceSignals;
 pub use models::{Env, EnvStatus, Mode, NotifyState};
 
 use thiserror::Error as ThisError;

@@ -11,7 +11,7 @@
 //! anyway WITHOUT the lock — preserving the failure-domain-diverse backstop
 //! (a wedged watcher must never be able to stop reaping). It opens the DB,
 //! calls the shared [`core::reap::sweep`](seadog_core::reap::sweep) **once**
-//! (which writes the heartbeat + routes every reap/flag/heads-up), prunes
+//! (which writes the heartbeat + routes every reap/flag/re-adoption), prunes
 //! terminal rows past the retention window, and prints the [`SweepOutcome`]
 //! as JSON.
 //!
@@ -130,7 +130,7 @@ fn skipped_json(reason: &str) -> Value {
         "ok": true,
         "reaped": 0,
         "flagged": 0,
-        "heads_up": 0,
+        "readopted": 0,
         "deferred": 0,
         "vanished": 0,
         "pruned": 0,
@@ -145,7 +145,7 @@ fn outcome_json(outcome: &SweepOutcome, pruned: usize) -> Value {
         "ok": true,
         "reaped": outcome.reaped,
         "flagged": outcome.flagged,
-        "heads_up": outcome.heads_up,
+        "readopted": outcome.readopted,
         "deferred": outcome.deferred,
         "vanished": outcome.vanished,
         "pruned": pruned,
@@ -168,7 +168,7 @@ mod tests {
         let now = 1_000_000i64;
         insert_active(&conn, "g1", 10010, now - 3600, now - 100);
         let k = FakeKento::new();
-        k.set_guests(vec![signals_for(&conn, "g1", 10010)]);
+        k.set_instances(vec![signals_for(&conn, "g1", 10010)]);
 
         let v = run_with_db(&conn, &k, &cfg, now).unwrap();
         assert_eq!(v["ok"], true);
@@ -217,7 +217,7 @@ mod tests {
         let now = 1_000_000i64;
         insert_active(&conn, "g1", 10010, now - 3600, now - 100);
         let k = FakeKento::new();
-        k.set_guests(vec![signals_for(&conn, "g1", 10010)]);
+        k.set_instances(vec![signals_for(&conn, "g1", 10010)]);
 
         let path = tempdir().join("watcher.lock");
         let v = run_gated(&conn, &k, &cfg, now, &path).unwrap();
@@ -242,7 +242,7 @@ mod tests {
 
         insert_active(&conn, "g1", 10010, now - 3600, now - 100);
         let k = FakeKento::new();
-        k.set_guests(vec![signals_for(&conn, "g1", 10010)]);
+        k.set_instances(vec![signals_for(&conn, "g1", 10010)]);
 
         let v = run_gated(&conn, &k, &cfg, now, &path).unwrap();
         // Skipped: no reap, no teardown — the live watcher owns reaping.
@@ -268,7 +268,7 @@ mod tests {
 
         insert_active(&conn, "g1", 10010, now - 3600, now - 100);
         let k = FakeKento::new();
-        k.set_guests(vec![signals_for(&conn, "g1", 10010)]);
+        k.set_instances(vec![signals_for(&conn, "g1", 10010)]);
 
         let v = run_gated(&conn, &k, &cfg, now, &path).unwrap();
         // Backstop overrode the wedged watcher and reaped.

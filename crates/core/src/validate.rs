@@ -1,9 +1,8 @@
 //! Pure input validation for caller-supplied values.
 //!
-//! These checks run before anything touches PVE or the DB: a requested
-//! `vmid` must lie inside the configured allocation window, a guest
-//! `name` must be a strict DNS label of the `seadog-…` family, and an
-//! image must resolve through the **allowlist by bare name** only — a
+//! These checks run before anything touches the runtime or the DB: a
+//! guest `name` must be a strict DNS label of the `seadog-…` family, and
+//! an image must resolve through the **allowlist by bare name** only — a
 //! caller-supplied OCI ref must never resolve to a runnable image. All
 //! functions are side-effect-free and return [`Error::Validation`] on
 //! rejection so the front-end can surface a clear message.
@@ -15,18 +14,6 @@ use regex::Regex;
 use crate::config::Config;
 use crate::models::Mode;
 use crate::Error;
-
-/// Validate that `vmid` is within the configured (inclusive)
-/// `allocation.vmid_range`.
-pub fn validate_vmid(vmid: u32, config: &Config) -> Result<(), Error> {
-    let [lo, hi] = config.allocation.vmid_range;
-    if vmid < lo || vmid > hi {
-        return Err(Error::Validation(format!(
-            "vmid {vmid} outside allocation range [{lo}, {hi}]"
-        )));
-    }
-    Ok(())
-}
 
 /// Compiled `seadog-…` guest-name regex (lazily built once).
 ///
@@ -179,16 +166,6 @@ images:
         let c = Config::from_yaml_str(yaml).unwrap();
         c.validate().unwrap();
         c
-    }
-
-    #[test]
-    fn vmid_in_and_out_of_range() {
-        let c = config();
-        assert!(validate_vmid(10000, &c).is_ok());
-        assert!(validate_vmid(10500, &c).is_ok());
-        assert!(validate_vmid(10999, &c).is_ok());
-        assert!(validate_vmid(9999, &c).is_err());
-        assert!(validate_vmid(11000, &c).is_err());
     }
 
     #[test]

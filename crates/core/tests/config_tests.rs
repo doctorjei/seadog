@@ -21,7 +21,8 @@ fn parses_annotated_example() {
     cfg.validate().expect("example must validate");
 
     assert!(cfg.reaper_enabled);
-    assert_eq!(cfg.allocation.vmid_range, [10000, 10999]);
+    // removed: vmid_range assertion (vmid allocation dropped; the stale
+    // `vmid_range:` block is gone from the example and is now rejected).
     assert_eq!(
         cfg.allocation.ip_pool.range,
         [
@@ -38,22 +39,35 @@ fn parses_annotated_example() {
     assert_eq!(cfg.allocation.caps.max_lxc_per_owner, 8);
     assert_eq!(cfg.allocation.caps.max_vm_per_owner, 3);
 
-    // Image allowlist: name -> {ref, modes}.
+    // Image allowlist: name -> {ref, modes[, user]}.
     let loom = cfg.images.get("loom").expect("loom present");
-    assert_eq!(loom.image_ref, "ghcr.io/doctorjei/droste-loom:latest");
+    assert_eq!(loom.image_ref, "ghcr.io/doctorjei/droste-loom:1.2.0");
     assert_eq!(loom.modes, vec![Mode::Lxc]);
+    assert_eq!(loom.user.as_deref(), Some("droste"));
     let ci = cfg.images.get("ci").expect("ci present");
     assert_eq!(ci.modes, vec![Mode::Lxc, Mode::Vm]);
+    assert_eq!(ci.user.as_deref(), Some("agent"));
+
+    // Login-user resolution: per-image `user` wins; the top-level default is
+    // "root"; `kento_path` is commented out → None.
+    assert_eq!(cfg.default_user, "root");
+    assert_eq!(cfg.kento_path, None);
+    assert_eq!(cfg.login_user_for_image("loom"), "droste");
+    assert_eq!(cfg.login_user_for_image("ci"), "agent");
+    assert_eq!(
+        cfg.login_user_for_ref("ghcr.io/doctorjei/droste-loom:1.2.0"),
+        "droste"
+    );
 
     // Owner override.
     let o = cfg.owners.get("ci").expect("owner override");
     assert_eq!(o.max_lxc, Some(12));
     assert_eq!(o.max_vm, None);
 
-    // Identity weights.
-    assert_eq!(cfg.identity.threshold, 0.6);
-    assert_eq!(cfg.identity.weights.network, 3);
-    assert_eq!(cfg.identity.weights.memory, 0);
+    // removed: identity weight/threshold assertions — the hardware-
+    // fingerprint tie-breaker is gone (identity is now the injected
+    // SEADOG_GUID anchor + native confirmers). The stale `identity:` block is
+    // gone from the example and is now rejected.
 
     // notify nulls -> None.
     assert!(cfg.notify.journald);
@@ -87,7 +101,7 @@ images:
     assert!(cfg.reaper_enabled); // default true
     assert_eq!(cfg.cadence.fast, Duration::from_secs(60));
     assert_eq!(cfg.cadence.idle, Duration::from_secs(3600));
-    assert_eq!(cfg.allocation.vmid_range, [10000, 10999]);
+    // removed: vmid_range assertion (vmid allocation dropped).
     assert_eq!(
         cfg.allocation.ip_pool.range[0],
         Ipv4Addr::new(192, 168, 99, 192)
@@ -98,32 +112,130 @@ images:
     assert_eq!(cfg.lifecycle.herd_cap, 10);
     assert_eq!(cfg.retention.terminal, Duration::from_secs(7 * 24 * 3600));
     assert!(cfg.notify.journald);
-    assert_eq!(cfg.identity.threshold, 0.6);
+    // removed: identity.threshold assertion (fingerprint tie-breaker gone).
 }
 
 #[test]
-fn rejects_bad_vmid_range() {
+fn default_user_defaults_to_root_and_resolver_falls_back() {
+    // No `default_user`, no per-image `user`: both default to "root".
     let yaml = r#"
-allocation:
-  vmid_range: [10999, 10000]
 images:
   loom: { ref: ghcr.io/doctorjei/droste-loom:latest, modes: [lxc] }
 "#;
     let cfg = Config::from_yaml_str(yaml).expect("parse");
-    let err = cfg.validate().expect_err("inverted range must fail");
-    assert!(matches!(err, Error::ConfigValidation(_)), "{err:?}");
+    cfg.validate().expect("validates");
+    assert_eq!(cfg.default_user, "root");
+    assert_eq!(cfg.images.get("loom").unwrap().user, None);
+    // Image with no `user` falls back to default_user ("root").
+    assert_eq!(cfg.login_user_for_image("loom"), "root");
+    // Ultimate fallback: an unknown image name → default_user ("root").
+    assert_eq!(cfg.login_user_for_image("nope"), "root");
+    assert_eq!(cfg.login_user_for_ref("unmatched/ref:1"), "root");
 }
 
 #[test]
-fn rejects_out_of_window_vmid_range() {
+fn per_image_user_overrides_custom_default_user() {
     let yaml = r#"
-allocation:
-  vmid_range: [9000, 9999]
+default_user: agent
 images:
-  loom: { ref: ghcr.io/doctorjei/droste-loom:latest, modes: [lxc] }
+  loom:    { ref: r/loom:1, modes: [lxc], user: droste }
+  bare:    { ref: r/bare:1, modes: [vm] }
 "#;
     let cfg = Config::from_yaml_str(yaml).expect("parse");
-    assert!(matches!(cfg.validate(), Err(Error::ConfigValidation(_))));
+    cfg.validate().expect("validates");
+    assert_eq!(cfg.default_user, "agent");
+    // image.user wins.
+    assert_eq!(cfg.login_user_for_image("loom"), "droste");
+    // image without user falls back to the (custom) default_user.
+    assert_eq!(cfg.login_user_for_image("bare"), "agent");
+    assert_eq!(cfg.login_user_for_ref("r/bare:1"), "agent");
+}
+
+#[test]
+fn kento_path_parses_and_validates() {
+    // Default: absent → None.
+    let none = Config::from_yaml_str("images:\n  loom: { ref: r/loom:1, modes: [lxc] }\n").unwrap();
+    assert_eq!(none.kento_path, None);
+
+    // Set to an absolute path → Some, validates.
+    let some = Config::from_yaml_str(
+        "kento_path: /usr/local/bin/kento\nimages:\n  loom: { ref: r/loom:1, modes: [lxc] }\n",
+    )
+    .unwrap();
+    assert_eq!(some.kento_path.as_deref(), Some("/usr/local/bin/kento"));
+    some.validate().expect("non-empty kento_path validates");
+
+    // Empty kento_path is rejected by the validator (lenient otherwise).
+    let empty = Config::from_yaml_str(
+        "kento_path: \"\"\nimages:\n  loom: { ref: r/loom:1, modes: [lxc] }\n",
+    )
+    .unwrap();
+    assert!(matches!(empty.validate(), Err(Error::ConfigValidation(_))));
+}
+
+// removed: rejects_bad_vmid_range + rejects_out_of_window_vmid_range — vmid
+// allocation and its validation are gone (kento decouple). The accept-and-ignore
+// shims for `vmid_range:` and `identity:` were removed in P6, so a stale block of
+// either now fails to PARSE under `deny_unknown_fields` (confirmed below).
+#[test]
+fn stale_vmid_range_block_is_now_rejected() {
+    let yaml = r#"
+allocation:
+  vmid_range: [10000, 10999]
+images:
+  loom: { ref: ghcr.io/doctorjei/droste-loom:1.2.0, modes: [lxc] }
+"#;
+    assert!(
+        Config::from_yaml_str(yaml).is_err(),
+        "a stale vmid_range block must now be rejected as an unknown field"
+    );
+}
+
+#[test]
+fn stale_identity_block_is_now_rejected() {
+    let yaml = r#"
+identity:
+  threshold: 0.6
+  weights:
+    network: 3
+images:
+  loom: { ref: ghcr.io/doctorjei/droste-loom:1.2.0, modes: [lxc] }
+"#;
+    assert!(
+        Config::from_yaml_str(yaml).is_err(),
+        "a stale identity block must now be rejected as an unknown field"
+    );
+}
+
+#[test]
+fn nesting_ok_for_ref_revalidates_against_allowlist() {
+    // The same OCI ref listed under two aliases with DIFFERENT allow_nesting,
+    // plus a third entry that omits allow_nesting (⇒ false). The helper
+    // re-validates a requested value by (ref, allow_nesting) pair.
+    let yaml = r#"
+images:
+  plain:  { ref: r/stuff:1, modes: [vm], allow_nesting: false }
+  nested: { ref: r/nested:1, modes: [vm], allow_nesting: true }
+  bare:   { ref: r/bare:1, modes: [lxc] }
+"#;
+    let cfg = Config::from_yaml_str(yaml).expect("parse");
+    cfg.validate().expect("validates");
+
+    // allow_nesting: true entry — only `requested == true` matches its ref.
+    assert!(cfg.nesting_ok_for_ref("r/nested:1", true));
+    assert!(!cfg.nesting_ok_for_ref("r/nested:1", false));
+
+    // allow_nesting: false entry — only `requested == false` matches.
+    assert!(cfg.nesting_ok_for_ref("r/stuff:1", false));
+    assert!(!cfg.nesting_ok_for_ref("r/stuff:1", true));
+
+    // Omitted allow_nesting defaults to false: only false matches.
+    assert!(cfg.nesting_ok_for_ref("r/bare:1", false));
+    assert!(!cfg.nesting_ok_for_ref("r/bare:1", true));
+
+    // A ref that matches no entry never validates, for either request.
+    assert!(!cfg.nesting_ok_for_ref("r/unmatched:1", true));
+    assert!(!cfg.nesting_ok_for_ref("r/unmatched:1", false));
 }
 
 #[test]

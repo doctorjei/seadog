@@ -5,7 +5,7 @@
 use seadog_core::models::{Env, EnvStatus, Mode, NotifyState};
 use seadog_core::store;
 
-fn sample_env(guid: &str, vmid: u32, owner: &str) -> Env {
+fn sample_env(guid: &str, vmid: Option<u32>, owner: &str) -> Env {
     Env {
         guid: guid.to_string(),
         vmid,
@@ -15,6 +15,7 @@ fn sample_env(guid: &str, vmid: u32, owner: &str) -> Env {
         name: format!("seadog-{owner}-proj-tok"),
         ip: "192.168.99.192".to_string(),
         mac: "AA:BB:CC:DD:EE:FF".to_string(),
+        ssh_host_key_fps: vec!["SHA256:hk1".to_string(), "SHA256:hk2".to_string()],
         created_at: 1_000,
         ttl_deadline: 4_600,
         soft_deadline: 2_800,
@@ -57,14 +58,21 @@ fn cold_start_creates_db_wal_and_schema() {
 #[test]
 fn env_insert_get_roundtrip() {
     let conn = store::open_in_memory().unwrap();
-    let env = sample_env("g1", 10000, "alice");
+    let env = sample_env("g1", Some(10000), "alice");
     store::insert_env(&conn, &env).unwrap();
 
     let got = store::get_env(&conn, "g1").unwrap().expect("present");
     assert_eq!(got, env);
 
-    let by_vmid = store::get_env_by_vmid(&conn, 10000).unwrap().unwrap();
-    assert_eq!(by_vmid, env);
+    // removed: get_env_by_vmid lookup (vmid is no longer a query key after
+    // the kento decouple — the join key is GUID). Cover a None-vmid row
+    // round-trip instead, the new backend-neutral shape.
+    let mut nov = sample_env("g-nov", None, "alice");
+    nov.name = "seadog-alice-proj-nov".to_string();
+    store::insert_env(&conn, &nov).unwrap();
+    let got_nov = store::get_env(&conn, "g-nov").unwrap().expect("present");
+    assert_eq!(got_nov.vmid, None);
+    assert_eq!(got_nov, nov);
 
     assert!(store::get_env(&conn, "missing").unwrap().is_none());
 }
@@ -72,11 +80,11 @@ fn env_insert_get_roundtrip() {
 #[test]
 fn lookup_by_owner_and_status() {
     let conn = store::open_in_memory().unwrap();
-    let mut a = sample_env("ga", 10000, "alice");
+    let mut a = sample_env("ga", Some(10000), "alice");
     a.created_at = 100;
-    let mut b = sample_env("gb", 10001, "alice");
+    let mut b = sample_env("gb", Some(10001), "alice");
     b.created_at = 200;
-    let bob = sample_env("gc", 10002, "bob");
+    let bob = sample_env("gc", Some(10002), "bob");
     store::insert_env(&conn, &a).unwrap();
     store::insert_env(&conn, &b).unwrap();
     store::insert_env(&conn, &bob).unwrap();
@@ -97,8 +105,8 @@ fn lookup_by_owner_and_status() {
 #[test]
 fn mark_reaped_and_vanished_transition_status() {
     let conn = store::open_in_memory().unwrap();
-    store::insert_env(&conn, &sample_env("g1", 10000, "alice")).unwrap();
-    store::insert_env(&conn, &sample_env("g2", 10001, "alice")).unwrap();
+    store::insert_env(&conn, &sample_env("g1", Some(10000), "alice")).unwrap();
+    store::insert_env(&conn, &sample_env("g2", Some(10001), "alice")).unwrap();
 
     store::mark_reaped(&conn, "g1").unwrap();
     store::mark_vanished(&conn, "g2").unwrap();
@@ -119,7 +127,7 @@ fn mark_reaped_and_vanished_transition_status() {
 #[test]
 fn set_ttl_deadline_updates_and_errors_on_missing() {
     let conn = store::open_in_memory().unwrap();
-    let env = sample_env("g1", 10000, "alice");
+    let env = sample_env("g1", Some(10000), "alice");
     store::insert_env(&conn, &env).unwrap();
     assert_eq!(env.ttl_deadline, 4_600);
 
@@ -142,7 +150,7 @@ fn set_ttl_deadline_updates_and_errors_on_missing() {
 #[test]
 fn set_mac_updates_and_errors_on_missing() {
     let conn = store::open_in_memory().unwrap();
-    let env = sample_env("g1", 10000, "alice");
+    let env = sample_env("g1", Some(10000), "alice");
     store::insert_env(&conn, &env).unwrap();
 
     // Record the effective (kento-assigned) MAC read back after provision.
@@ -164,7 +172,7 @@ fn set_mac_updates_and_errors_on_missing() {
 #[test]
 fn notify_state_write_read() {
     let conn = store::open_in_memory().unwrap();
-    store::insert_env(&conn, &sample_env("g1", 10000, "alice")).unwrap();
+    store::insert_env(&conn, &sample_env("g1", Some(10000), "alice")).unwrap();
     assert!(store::get_notify_state(&conn, "g1").unwrap().is_none());
 
     let s = NotifyState {
@@ -214,7 +222,7 @@ fn deadline_is_db_authoritative() {
     let path = dir.join("seadog.db");
     let conn = store::open(&path).unwrap();
 
-    let mut env = sample_env("g1", 10000, "alice");
+    let mut env = sample_env("g1", Some(10000), "alice");
     env.ttl_deadline = 9_999;
     store::insert_env(&conn, &env).unwrap();
 

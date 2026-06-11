@@ -1,78 +1,109 @@
-//! The runtime bridge between seadog's logic and the live PVE node.
+//! The runtime bridge between seadog's logic and the `kento` runtime.
 //!
 //! [`Kento`] abstracts every operation the reaper/provisioner needs from
-//! `qm`/`pct`/`kento` so the business logic can be exercised against an
-//! in-memory [`FakeKento`] with **no real PVE host** in the loop. The
-//! shelling-out implementation, [`RealKento`], lives behind the
-//! `real-kento` cargo feature so the library builds and tests with zero
-//! external tools by default.
+//! `kento` so the business logic can be exercised against an in-memory
+//! [`FakeKento`] with **no real host** in the loop. The shelling-out
+//! implementation, [`RealKento`], lives behind the `real-kento` cargo
+//! feature so the library builds and tests with zero external tools by
+//! default.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::identity::{GuestSignals, GUID_MARKER_PREFIX, OWNER_MARKER_PREFIX};
 use crate::models::Mode;
 use crate::Error;
 
-/// Operations seadog needs from the PVE node.
+/// Operations seadog needs from the `kento` runtime.
 ///
-/// Only [`Kento::list_guests`] and [`Kento::teardown`] carry real
-/// behavior in this phase; the provisioning methods are declared with
-/// minimal signatures for later phases to implement. Implementors must
-/// surface a quorum-loss / pmxcfs-read-only condition as
+/// Implementors must surface a quorum-loss / pmxcfs-read-only condition as
 /// [`Error::QuorumLost`] so the reaper can stop cleanly instead of
-/// spinning.
+/// spinning. Identity is now backend-neutral: kento exposes every signal
+/// natively via `inspect --json`, so the bridge no longer reads PVE
+/// `description`/config fields or pokes guest metadata.
 pub trait Kento {
-    /// Enumerate every guest whose vmid falls in the inclusive
-    /// `vmid_range`, returning the signals the sweeper observes.
-    fn list_guests(&self, vmid_range: (u32, u32)) -> Result<Vec<GuestSignals>, Error>;
+    /// Enumerate every kento instance, returning the signals the sweeper
+    /// observes. `kento` only knows about kento-managed instances, so there
+    /// is no vmid-range scan: the live set IS the kento list.
+    fn list_instances(&self) -> Result<Vec<InstanceSignals>, Error>;
 
-    /// Destroy the guest named `name` (LXC via `kento lxc destroy`, VM via
-    /// `kento vm destroy`). `kento` removes **by instance name**, not vmid,
-    /// so its own overlay state is cleaned alongside the PVE guest. The
-    /// caller passes the name it read back from **live PVE** during
-    /// triangulation (never a caller-supplied name).
+    /// Destroy the instance named `name` (LXC via `kento lxc destroy`, VM
+    /// via `kento vm destroy`). `kento` removes **by instance name**, so its
+    /// own overlay state is cleaned alongside the backend guest. The caller
+    /// passes the name it read back from the **live instance list** during
+    /// classification (never a caller-supplied name).
     fn teardown(&self, name: &str, mode: Mode) -> Result<(), Error>;
 
-    /// Create a new guest from a fully-resolved [`ProvisionSpec`].
+    /// Create a new instance from a fully-resolved [`ProvisionSpec`].
     ///
     /// `kento` owns networking, ssh-host-key injection and the initial
-    /// start: `provision` shells `kento <mode> create --vmid … --name …
-    /// --network bridge=<bridge> --ip <ip>/<prefix> --gateway <gw>
-    /// --ssh-host-keys --start [--mac <mac> ONLY for vm] <image-ref>`.
+    /// start, and records the seadog identity anchor via injected env:
+    /// `provision` shells `kento <mode> create --name … --network
+    /// bridge=<bridge> --ip <ip>/<prefix> --gateway <gw> --env
+    /// SEADOG_GUID=<guid> --env SEADOG_OWNER=<owner> --start [--mac <mac>
+    /// ONLY for vm] <image-ref>`, then reads the realized signals back via
+    /// `inspect --json` for the [`ProvisionOutcome`].
     ///
-    /// `--mac` is **VM-only**. For a VM the realized guest carries the minted
-    /// MAC, so [`ProvisionOutcome::mac`] is `Some(spec.mac)`. For an LXC the
-    /// MAC is **unobservable via `pct config`** (the hwaddr lives only in the
-    /// raw lxc config and the runtime MAC need not match it), so the read-back
-    /// yields nothing and [`ProvisionOutcome::mac`] is `None`. The front-end
-    /// records `Some` → the real MAC, `None` → `""` ("no MAC recorded") on the
-    /// DB row, so identity/triangulation treat MAC as confirming-when-present.
+    /// `--mac` is **VM-only**: kento reports (and accepts) a MAC for VM
+    /// modes only — it writes the `kento-mac` meta at create time for VMs
+    /// and emits `mac` from `inspect --json` present-only, so an LXC has no
+    /// MAC at all. [`ProvisionOutcome::mac`] is therefore `Some` for a VM
+    /// (the passed `--mac`) and `None` for an LXC.
     fn provision(&self, spec: &ProvisionSpec) -> Result<ProvisionOutcome, Error>;
+}
 
-    /// Narrow metadata update on an **already-verified** seadog guest:
-    /// optionally set the description and/or the TTL-deadline marker. The
-    /// caller validates the target is in-range + seadog-marked first; this
-    /// is `qm set`/`pct set`, never a general passthrough.
-    fn set_meta(&self, vmid: u32, mode: Mode, meta: &MetaUpdate) -> Result<(), Error>;
-
-    /// Start the in-guest sshd inside an **already-verified** seadog CT
-    /// (loom ships sshd disabled). LXC-only — the caller validates the
-    /// target is an in-range, seadog-marked container first. This is a
-    /// narrow `pct exec … systemctl start ssh`, not a general
-    /// `pct exec` passthrough.
-    fn start_sshd(&self, vmid: u32) -> Result<(), Error>;
+/// What the sweeper observes about one live kento instance, all sourced
+/// from `kento inspect --json`. Replaces the PVE-era `GuestSignals`
+/// (description-marker + hardware-fingerprint) with kento's native,
+/// backend-neutral signal set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstanceSignals {
+    /// Instance name — kento's primary key (seadog controls it; encodes the
+    /// owner as `seadog-<owner>-<shortproj>-<token>`).
+    pub name: String,
+    /// Injected `SEADOG_GUID` env, read back via inspect. `None` ⇒ the
+    /// instance carries no seadog anchor and is **foreign** (ignored).
+    pub guid: Option<String>,
+    /// Injected `SEADOG_OWNER` env, read back via inspect.
+    pub owner: Option<String>,
+    /// Realized MAC, when kento reports one (confirming-when-present).
+    /// kento reports a MAC for **VM modes only** (it is written at create
+    /// time for VMs and emitted from `inspect` present-only), so this is
+    /// `None` for every LXC — that `None` is the designed sentinel
+    /// identity treats as "nothing to confirm".
+    pub mac: Option<String>,
+    /// SSH host-key fingerprints, when kento reports them
+    /// (confirming-when-present; a soft confirmer — regenerated keys must
+    /// not strand an env).
+    pub ssh_host_key_fps: Vec<String>,
+    /// Image ref/name kento reports for the instance.
+    pub image: String,
+    /// kento-reported status text (informational).
+    pub status: String,
+    /// Backend family, collapsed to the backend-neutral [`Mode`]
+    /// ([`Mode::Lxc`] / [`Mode::Vm`]). kento `inspect --json` emits an
+    /// authoritative `type` field ∈ {`LXC`, `VM`} (always present:
+    /// `info.py:97`) that is the unambiguous family signal: `VM` →
+    /// [`Mode::Vm`], `LXC` → [`Mode::Lxc`]. The accompanying `mode` string
+    /// (`inspect.mode` ∈ {`lxc`, `vm`, `pve`, `pve-vm`} — note a PVE-LXC is
+    /// promoted to bare `pve`, NOT `pve-lxc`) is informational and serves
+    /// only as a defensive fallback if `type` is ever missing/unrecognized.
+    /// Lets reap recover an orphan's family precisely instead of guessing
+    /// from the status text. Defaults to [`Mode::Lxc`] when kento reports
+    /// nothing recognizable.
+    pub mode: Mode,
+    /// Backend vmid when kento exposes one (PVE backends only);
+    /// informational, never an identity key.
+    pub vmid: Option<u32>,
 }
 
 /// A fully-resolved provisioning request: every field has already been
 /// re-validated by `seadog-priv` against its own config load. The MAC,
-/// IP, vmid, name and GUID were allocated by the (untrusted) front-end but
+/// IP, name and GUID were allocated by the (untrusted) front-end but
 /// re-checked here; `image_ref` is the allowlisted ref the server picked,
-/// never a raw caller ref.
+/// never a raw caller ref. No vmid: kento auto-assigns where the backend
+/// has one (PVE), and seadog no longer allocates it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionSpec {
-    /// Allocated Proxmox guest id (re-validated in-range).
-    pub vmid: u32,
     /// LXC or VM.
     pub mode: Mode,
     /// Allowlisted OCI image ref (server-resolved, never caller-supplied).
@@ -89,60 +120,55 @@ pub struct ProvisionSpec {
     pub gateway: String,
     /// PVE bridge `kento` attaches the guest to (config `allocation.bridge`).
     pub bridge: String,
-    /// Instance GUID minted by the front-end (written into the desc marker).
+    /// Instance GUID minted by the front-end (injected as the
+    /// `SEADOG_GUID` env — the create-time-immutable identity anchor).
     pub guid: String,
-    /// Resolved owner (trusted from the front-end; written into the desc
-    /// marker so teardown can verify ownership against live PVE).
+    /// Resolved owner (trusted from the front-end; injected as the
+    /// `SEADOG_OWNER` env so the instance carries its owner natively).
     pub owner: String,
+    /// Path to a root-owned file of the OWNER's authorized ssh pubkey line(s)
+    /// (one `ssh-…` per line) to inject into the guest so the owner can log
+    /// in. `None` → no key injection (`--ssh-key` omitted); the create still
+    /// proceeds. The helper materializes this from its OWN authorized_keys by
+    /// owner name and removes it after provision — it is never long-lived.
+    pub ssh_key_file: Option<std::path::PathBuf>,
+    /// The login user the injected key authorizes (`--ssh-key-user`). Ignored
+    /// when `ssh_key_file` is `None`.
+    pub ssh_key_user: String,
+    /// Whether nesting is permitted for this instance — mode-agnostic (VM→VM
+    /// nesting / nested virt, container→container nesting). Resolved by the
+    /// front-end from the served image entry's `allow_nesting` and
+    /// re-validated by the helper against the allowlist; pushed as
+    /// `--allow-nesting` to `kento <mode> create` (UNCONDITIONAL on mode)
+    /// when true, omitted when false.
+    pub allow_nesting: bool,
 }
 
-/// What [`Kento::provision`] reports back: the **effective** MAC the guest
-/// actually carries after create, or `None` when it is unobservable. For a
-/// VM this is `Some` the MAC seadog passed (`--mac`). For an LXC it is `None`
-/// — a kento LXC's MAC is not exposed by `pct config` (the hwaddr lives only
-/// in the raw lxc config), so there is no real MAC to read back. The
-/// front-end records `Some` → the MAC, `None` → `""` on the DB row, so
-/// identity treats MAC as confirming-when-present.
+/// What [`Kento::provision`] reports back, read from kento's `inspect
+/// --json` after create: the realized MAC (kento reports it for **VM
+/// modes only** — `Some` for a VM, `None` for an LXC), the SSH host-key
+/// fingerprints, and the backend vmid when one exists (PVE backends;
+/// `None` otherwise). The front-end records these on the DB row; identity
+/// treats MAC and host-key fps as confirming-when-present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionOutcome {
-    /// The MAC the realized guest actually carries, or `None` when it is
-    /// unobservable (the kento LXC path).
+    /// The MAC the realized instance carries: `Some` for a VM, `None` for
+    /// an LXC (kento reports a MAC for VM modes only).
     pub mac: Option<String>,
-}
-
-impl ProvisionSpec {
-    /// The guest `description` body seadog writes at create: the GUID and
-    /// owner marker lines [`crate::identity`] greps back out. Kept here so
-    /// `FakeKento` (markers in-memory) and `RealKento` (markers via
-    /// `qm`/`pct set --description`) build an identical block.
-    pub fn description_marker(&self) -> String {
-        format!(
-            "{GUID_MARKER_PREFIX}{guid}\n{OWNER_MARKER_PREFIX}{owner}",
-            guid = self.guid,
-            owner = self.owner,
-        )
-    }
-}
-
-/// A narrow metadata update for [`Kento::set_meta`]: any combination of a
-/// new description and/or a TTL-deadline (unix epoch seconds). Both are
-/// optional so a caller can touch just one.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MetaUpdate {
-    /// Replacement description body, if updating it.
-    pub description: Option<String>,
-    /// TTL-deadline as a unix epoch second, if updating it.
-    pub ttl_deadline: Option<i64>,
+    /// The realized SSH host-key fingerprints (empty if kento reports none).
+    pub ssh_host_key_fps: Vec<String>,
+    /// Backend vmid when kento exposes one (PVE backends); `None` otherwise.
+    pub vmid: Option<u32>,
 }
 
 /// In-memory [`Kento`] for tests. Always compiled (not `#[cfg(test)]`) so
 /// later integration tests in sibling crates can drive it too.
 ///
-/// Tests populate [`FakeKento::guests`], then assert on
-/// [`FakeKento::teardowns`] to see exactly what got reaped. Priming
-/// [`FakeKento::quorum_lost`] makes both `list_guests` and `teardown`
-/// return [`Error::QuorumLost`], so the reaper's stop-on-quorum-loss path
-/// is testable without a cluster.
+/// Tests populate [`FakeKento::instances`] via [`FakeKento::set_instances`],
+/// then assert on [`FakeKento::teardowns`] to see exactly what got reaped.
+/// Priming [`FakeKento::quorum_lost`] makes both `list_instances` and
+/// `teardown` return [`Error::QuorumLost`], so the reaper's
+/// stop-on-quorum-loss path is testable without a cluster.
 #[derive(Default)]
 pub struct FakeKento {
     inner: Mutex<FakeState>,
@@ -150,15 +176,14 @@ pub struct FakeKento {
 
 #[derive(Default)]
 struct FakeState {
-    guests: Vec<GuestSignals>,
+    instances: Vec<InstanceSignals>,
     /// Teardown calls recorded as `(name, mode)` — `kento` destroys by name.
     teardowns: Vec<(String, Mode)>,
     /// Provision calls recorded so tests can assert exact params.
     provisions: Vec<ProvisionSpec>,
-    /// `set_meta` calls recorded, in order.
-    set_metas: Vec<(u32, Mode, MetaUpdate)>,
-    /// vmids `start_sshd` was called on, in order.
-    sshd_starts: Vec<u32>,
+    /// `allow_nesting` recorded per provision call, in order — mirrors
+    /// `provisions` so tests can assert the boundary value reached the spec.
+    provision_allow_nesting: Vec<bool>,
     /// When set, every op returns this quorum-loss message.
     quorum_lost: Option<String>,
     /// Optional per-name teardown failures (non-quorum), to test errors.
@@ -166,14 +191,14 @@ struct FakeState {
 }
 
 impl FakeKento {
-    /// A fresh fake with no guests.
+    /// A fresh fake with no instances.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Replace the live guest list the sweeper will observe.
-    pub fn set_guests(&self, guests: Vec<GuestSignals>) {
-        self.inner.lock().unwrap().guests = guests;
+    /// Replace the live instance list the sweeper will observe.
+    pub fn set_instances(&self, instances: Vec<InstanceSignals>) {
+        self.inner.lock().unwrap().instances = instances;
     }
 
     /// Prime a quorum-loss condition: every subsequent op fails with
@@ -201,30 +226,23 @@ impl FakeKento {
         self.inner.lock().unwrap().provisions.clone()
     }
 
-    /// The `set_meta` calls recorded so far, in order.
-    pub fn set_metas(&self) -> Vec<(u32, Mode, MetaUpdate)> {
-        self.inner.lock().unwrap().set_metas.clone()
-    }
-
-    /// The vmids `start_sshd` was called on, in order.
-    pub fn sshd_starts(&self) -> Vec<u32> {
-        self.inner.lock().unwrap().sshd_starts.clone()
+    /// The `allow_nesting` flag recorded per provision call, in order —
+    /// parallel to [`FakeKento::provisions`]. Lets tests assert the
+    /// boundary-crossing nesting value reached the spec.
+    pub fn provision_allow_nesting(&self) -> Vec<bool> {
+        self.inner.lock().unwrap().provision_allow_nesting.clone()
     }
 }
 
 impl Kento for FakeKento {
-    fn list_guests(&self, vmid_range: (u32, u32)) -> Result<Vec<GuestSignals>, Error> {
+    fn list_instances(&self) -> Result<Vec<InstanceSignals>, Error> {
         let st = self.inner.lock().unwrap();
         if let Some(msg) = &st.quorum_lost {
             return Err(Error::QuorumLost(msg.clone()));
         }
-        let (lo, hi) = vmid_range;
-        Ok(st
-            .guests
-            .iter()
-            .filter(|g| g.vmid >= lo && g.vmid <= hi)
-            .cloned()
-            .collect())
+        // kento only knows kento instances — return the set list as-is, no
+        // vmid-range filter.
+        Ok(st.instances.clone())
     }
 
     fn teardown(&self, name: &str, mode: Mode) -> Result<(), Error> {
@@ -236,9 +254,9 @@ impl Kento for FakeKento {
             return Err(Error::Kento(msg));
         }
         st.teardowns.push((name.to_string(), mode));
-        // Remove the guest by name so a subsequent list_guests reflects the
-        // destroy (kento removes by instance name, not vmid).
-        st.guests.retain(|g| g.name.as_deref() != Some(name));
+        // Remove the instance by name so a subsequent list_instances
+        // reflects the destroy (kento removes by instance name).
+        st.instances.retain(|i| i.name != name);
         Ok(())
     }
 
@@ -247,47 +265,45 @@ impl Kento for FakeKento {
         if let Some(msg) = &st.quorum_lost {
             return Err(Error::QuorumLost(msg.clone()));
         }
-        // Model REALITY: `--mac` is VM-only. For a VM the realized guest
-        // carries the passed MAC (`Some`). For an LXC the MAC is unobservable
-        // via `pct config` (kento LXC), so the realized guest carries NO MAC
-        // (`None`) and the outcome reports `None`. A later teardown still
-        // triangulates the LXC via the GUID/owner desc markers + seadog- name.
+        // kento reports the realized MAC for VM modes ONLY: a VM keeps the
+        // passed `--mac`; an LXC has no MAC at all (kento writes the
+        // `kento-mac` meta only for VMs and emits `mac` from inspect
+        // present-only), so an LXC yields `None` — the designed sentinel.
         let effective_mac = match spec.mode {
             Mode::Vm => Some(spec.mac.clone()),
             Mode::Lxc => None,
         };
-        st.guests.push(GuestSignals {
-            vmid: spec.vmid,
-            name: Some(spec.name.clone()),
-            description: Some(spec.description_marker()),
+        // Synthesize a couple of stable host-key fingerprints.
+        let fps = vec![
+            format!("SHA256:fp-ed25519-{}", spec.name),
+            format!("SHA256:fp-rsa-{}", spec.name),
+        ];
+        st.instances.push(InstanceSignals {
+            name: spec.name.clone(),
+            guid: Some(spec.guid.clone()),
+            owner: Some(spec.owner.clone()),
             mac: effective_mac.clone(),
-            fingerprint: Default::default(),
+            ssh_host_key_fps: fps.clone(),
+            image: spec.image_ref.clone(),
+            status: "running".to_string(),
+            // The realized instance carries the spec's mode (kento reports
+            // it via inspect.mode).
+            mode: spec.mode,
+            // FakeKento has no PVE backend → no vmid.
+            vmid: None,
         });
         st.provisions.push(spec.clone());
-        Ok(ProvisionOutcome { mac: effective_mac })
-    }
-
-    fn set_meta(&self, vmid: u32, mode: Mode, meta: &MetaUpdate) -> Result<(), Error> {
-        let mut st = self.inner.lock().unwrap();
-        if let Some(msg) = &st.quorum_lost {
-            return Err(Error::QuorumLost(msg.clone()));
-        }
-        st.set_metas.push((vmid, mode, meta.clone()));
-        Ok(())
-    }
-
-    fn start_sshd(&self, vmid: u32) -> Result<(), Error> {
-        let mut st = self.inner.lock().unwrap();
-        if let Some(msg) = &st.quorum_lost {
-            return Err(Error::QuorumLost(msg.clone()));
-        }
-        st.sshd_starts.push(vmid);
-        Ok(())
+        st.provision_allow_nesting.push(spec.allow_nesting);
+        Ok(ProvisionOutcome {
+            mac: effective_mac,
+            ssh_host_key_fps: fps,
+            vmid: None,
+        })
     }
 }
 
 // --- RealKento: behind the `real-kento` feature so the lib builds with
-//     zero external tools by default. Not exercised by tests (no real PVE host),
+//     zero external tools by default. Not exercised by tests (no real host),
 //     but it MUST compile under `--features real-kento`. ---
 #[cfg(feature = "real-kento")]
 pub use real::RealKento;
@@ -300,21 +316,27 @@ mod real {
     use wait_timeout::ChildExt;
 
     use super::*;
-    use crate::identity::Fingerprint;
 
-    /// Per-op hard timeout. `qm`/`pct` are Perl and can wedge on a sick
-    /// cluster; we kill on expiry rather than block the sweep forever.
+    /// Per-op hard timeout. `kento` (Python) shells out to lxc/qemu/pct/qm
+    /// underneath and can wedge on a sick cluster; we kill on expiry rather
+    /// than block the sweep forever.
     const OP_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// Fixed PATH set before exec. `qm`/`pct` honor `PATH`/`PERL5LIB`, so
-    /// we `env_clear()` and pin a known-good search path to avoid
-    /// hijacking via the ambient environment. `kento` installs to
-    /// `/usr/local/bin` (while `qm`/`pct`/`pvesh` live in `/usr/sbin`/
-    /// `/usr/bin`), so the pinned path mirrors root's standard PATH and
-    /// includes the `/usr/local` bins — all root-owned system dirs.
+    /// Fixed PATH set before exec. We `env_clear()` and pin a known-good
+    /// search path to avoid hijacking via the ambient environment. `kento`
+    /// installs to `/usr/local/bin`, so the pinned path mirrors root's
+    /// standard PATH and includes the `/usr/local` bins — all root-owned
+    /// system dirs. (kento itself reaches the backend tools — pct/qm/lxc/
+    /// qemu — so seadog only ever spawns `kento`.)
     const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
     /// Substrings that mark a pmxcfs quorum-loss / read-only condition.
+    /// kento runs on PVE backends (kento-mode `pve`/`pve-vm`), where a corosym
+    /// partition still drops pmxcfs to read-only and surfaces the same
+    /// kernel/cluster wording through the failing `kento` invocation, so we
+    /// keep mapping these to [`Error::QuorumLost`] (the sweep stops cleanly
+    /// instead of spinning). On non-PVE backends these markers simply never
+    /// appear, so the check is harmless there.
     const QUORUM_MARKERS: &[&str] = &[
         "no quorum",
         "cluster not ready",
@@ -322,22 +344,50 @@ mod real {
         "permission denied - not part of cluster",
     ];
 
-    /// The shelling-out [`Kento`]: runs `qm`/`pct`/`kento` as argv
-    /// vectors (never a shell string), with a cleared environment, a
-    /// pinned PATH, and a per-op hard timeout.
-    #[derive(Debug, Default)]
-    pub struct RealKento;
+    /// The shelling-out [`Kento`]: runs `kento` as an argv vector (never a
+    /// shell string), with a cleared environment, a pinned PATH, and a
+    /// per-op hard timeout. No `pvesh`/`qm`/`pct` — every backend op goes
+    /// through `kento`.
+    #[derive(Debug)]
+    pub struct RealKento {
+        /// The program name/path used to invoke `kento`. Bare `"kento"`
+        /// (resolved via [`SAFE_PATH`]) unless the config pins an absolute
+        /// `kento_path`.
+        kento_bin: String,
+    }
+
+    impl Default for RealKento {
+        fn default() -> Self {
+            RealKento {
+                kento_bin: "kento".to_string(),
+            }
+        }
+    }
 
     impl RealKento {
-        /// Construct a `RealKento`.
+        /// Construct a `RealKento` invoking the bare `"kento"` (resolved via
+        /// the pinned PATH).
         pub fn new() -> Self {
-            RealKento
+            Self::default()
         }
 
-        /// Run `program argv…` to completion under the safety harness,
+        /// Construct a `RealKento` honoring `config.kento_path`: when set, the
+        /// `kento` binary is invoked by that absolute path; otherwise the bare
+        /// `"kento"` name is used (resolved via [`SAFE_PATH`]).
+        pub fn from_config(config: &crate::config::Config) -> Self {
+            match &config.kento_path {
+                Some(p) if !p.trim().is_empty() => RealKento {
+                    kento_bin: p.clone(),
+                },
+                _ => Self::default(),
+            }
+        }
+
+        /// Run `kento argv…` to completion under the safety harness,
         /// returning stdout. Maps a quorum-loss signature to
         /// [`Error::QuorumLost`] and a timeout to [`Error::Kento`].
-        fn run(&self, program: &str, argv: &[&str]) -> Result<String, Error> {
+        fn run(&self, argv: &[&str]) -> Result<String, Error> {
+            let program = &self.kento_bin;
             let mut cmd = Command::new(program);
             cmd.args(argv)
                 .env_clear()
@@ -393,73 +443,128 @@ mod real {
         }
     }
 
-    impl Kento for RealKento {
-        fn list_guests(&self, vmid_range: (u32, u32)) -> Result<Vec<GuestSignals>, Error> {
-            // Strategy (proven against the fake-PVE harness):
-            //   1. `pvesh get /cluster/resources --output-format json` gives
-            //      the authoritative vmid + type (qemu|lxc) list for the
-            //      whole cluster. A quorum-loss surfaces here.
-            //   2. For each in-range guest, read its full config via
-            //      `qm config <vmid>` (VM) / `pct config <vmid>` (LXC) and
-            //      parse it into the `GuestSignals` the sweeper triangulates
-            //      on (name, description marker block, net0 MAC, fingerprint
-            //      hardware fields).
-            // The parsing is split into pure functions
-            // (`parse_resources` / `parse_guest_config`) so it is unit-tested
-            // on sample strings with no real command in the loop.
-            let resources_json = self.run(
-                "pvesh",
-                &["get", "/cluster/resources", "--output-format", "json"],
-            )?;
-            let (lo, hi) = vmid_range;
-            let entries = parse_resources(&resources_json)
-                .map_err(|e| Error::Kento(format!("parsing /cluster/resources: {e}")))?;
+    /// The decision for a failing per-instance `kento inspect` in
+    /// [`RealKento::list_instances`]: keep the sweep going (skip the one bad
+    /// instance) or abort it (a global condition).
+    enum PerInstance {
+        /// A GLOBAL condition — propagate and abort the whole sweep.
+        Propagate(Error),
+        /// A per-instance fault — log it and skip just this instance.
+        Skip(Error),
+    }
 
-            let mut out = Vec::new();
-            for entry in entries {
-                if entry.vmid < lo || entry.vmid > hi {
-                    continue;
-                }
-                let vmid_s = entry.vmid.to_string();
-                let config_text = match entry.mode {
-                    Mode::Lxc => self.run("pct", &["config", &vmid_s])?,
-                    Mode::Vm => self.run("qm", &["config", &vmid_s])?,
+    /// Classify a per-instance `inspect` exec error into propagate-vs-skip.
+    ///
+    /// [`Error::QuorumLost`] is a GLOBAL pmxcfs/cluster condition (not a fault
+    /// of the one instance), so continuing the sweep would be wrong — it
+    /// propagates and aborts. Every OTHER error (a `kento inspect` exec
+    /// failure — e.g. a "ghost" instance present in `kento list` with no
+    /// backing guest, whose inspect exits non-zero) is per-instance: it is
+    /// skipped so a single broken instance can't blind the reaper to every
+    /// other env. Pure (no I/O) so the resilience contract is unit-testable
+    /// without a real `kento` in the loop.
+    fn classify_per_instance_error(e: Error) -> PerInstance {
+        match e {
+            Error::QuorumLost(_) => PerInstance::Propagate(e),
+            _ => PerInstance::Skip(e),
+        }
+    }
+
+    impl Kento for RealKento {
+        fn list_instances(&self) -> Result<Vec<InstanceSignals>, Error> {
+            // Strategy (kento-only — no pvesh/qm/pct):
+            //   1. `kento list` enumerates the kento-managed instances as a
+            //      columnar table (NAME col first). A quorum-loss surfaces
+            //      here. `kento` only sees its own instances, so the live set
+            //      IS the kento list — no vmid-range scan.
+            //   2. For each NAME, `kento inspect <name> --json` emits a stable
+            //      dict we parse into the `InstanceSignals` the sweeper
+            //      classifies on (guid/owner from the injected env, mac,
+            //      host-key fps, image, status, vmid).
+            // Parsing is split into pure functions (`parse_kento_list` /
+            // `parse_kento_inspect`) so they are unit-tested on sample output
+            // with no real command in the loop.
+            // Enumeration is GLOBAL: a failing `kento list` (incl. quorum
+            // loss) means we cannot see the live set at all, so it MUST
+            // propagate — the sweep aborts rather than reaping against an
+            // empty/partial view.
+            let list_out = self.run(&["list"])?;
+            let names = parse_kento_list(&list_out);
+
+            let mut out = Vec::with_capacity(names.len());
+            for name in names {
+                // Per-instance inspect/parse is RESILIENT: a single broken
+                // instance (a "ghost" in `kento list` with no backing guest
+                // whose `inspect` exits non-zero, or one emitting unparseable
+                // JSON) must NOT blind the reaper to every OTHER env. We log +
+                // skip such an instance and keep evaluating the rest.
+                //
+                // The ONE exception is `Error::QuorumLost`: that is a GLOBAL
+                // pmxcfs/cluster condition, not a per-instance fault, so
+                // continuing would be wrong — it propagates and aborts the
+                // sweep just like a failing `list`.
+                let json = match self.run(&["inspect", &name, "--json"]) {
+                    Ok(json) => json,
+                    // `classify_per_instance_error` is the single point that
+                    // decides propagate (QuorumLost) vs skip (everything
+                    // else); it is unit-tested without shelling out.
+                    Err(e) => match classify_per_instance_error(e) {
+                        PerInstance::Propagate(e) => return Err(e),
+                        PerInstance::Skip(e) => {
+                            tracing::warn!(
+                                instance = %name,
+                                "skipping instance: kento inspect failed: {e}"
+                            );
+                            continue;
+                        }
+                    },
                 };
-                let signals = parse_guest_config(entry.vmid, &config_text);
-                out.push(signals);
+                match parse_kento_inspect(&json) {
+                    Ok(signals) => out.push(signals),
+                    Err(e) => {
+                        // A parse failure is always per-instance (it never
+                        // carries a global quorum signal), so it is always
+                        // log+skip.
+                        tracing::warn!(
+                            instance = %name,
+                            "skipping instance: failed to parse kento inspect output: {e}"
+                        );
+                        continue;
+                    }
+                }
             }
             Ok(out)
         }
 
         fn teardown(&self, name: &str, mode: Mode) -> Result<(), Error> {
             // `kento` destroys BY INSTANCE NAME (not vmid), so its overlay
-            // state is cleaned alongside the PVE guest. `-f` forces a running
-            // instance. The name is the one teardown read from live PVE.
+            // state is cleaned alongside the backend guest. `-f` forces a
+            // running instance. The name is the one teardown read from the
+            // live `kento list`.
             let mode = mode.as_str();
-            self.run("kento", &[mode, "destroy", "-f", name])
-                .map(|_| ())
+            self.run(&[mode, "destroy", "-f", name]).map(|_| ())
         }
 
         fn provision(&self, spec: &ProvisionSpec) -> Result<ProvisionOutcome, Error> {
             // kento OWNS networking/ssh/start: one `kento <mode> create`
-            // attaches the bridge, assigns the IP/gateway, injects ssh host
-            // keys, and starts the guest. `--mac` is VM-ONLY (LXC auto-
-            // assigns and does not expose the MAC via `pct config`), so we
-            // only pass it for a VM; for an LXC the read-back yields no MAC.
-            // Then we stamp the seadog markers
-            // (name is already set by --name; description via qm/pct set) so
-            // teardown can later triangulate. Not exercised by tests (no real
-            // PVE host) but MUST compile under `--features real-kento`.
+            // attaches the bridge, assigns the IP/gateway, generates ssh host
+            // keys, injects the owner key, and starts the guest. The seadog
+            // identity anchor rides as injected env (`--env SEADOG_GUID=… --env
+            // SEADOG_OWNER=…`) — create-time-immutable, replacing the old PVE
+            // description marker. `--vmid` is omitted entirely (kento auto-
+            // assigns where the backend has one). `--mac` is VM-ONLY (kento
+            // rejects it for LXC). Then we read the realized signals back via
+            // `kento inspect --json`. Not exercised by tests (no real host) but
+            // MUST compile under `--features real-kento`.
             let mode = spec.mode.as_str();
-            let vmid = spec.vmid.to_string();
             let network = format!("bridge={}", spec.bridge);
             let ip_cidr = format!("{}/{}", spec.ip, spec.prefix);
+            let guid_env = format!("SEADOG_GUID={}", spec.guid);
+            let owner_env = format!("SEADOG_OWNER={}", spec.owner);
 
             let mut argv: Vec<&str> = vec![
                 mode,
                 "create",
-                "--vmid",
-                &vmid,
                 "--name",
                 &spec.name,
                 "--network",
@@ -470,473 +575,515 @@ mod real {
                 &spec.gateway,
                 "--ssh-host-keys",
                 "--start",
+                "--env",
+                &guid_env,
+                "--env",
+                &owner_env,
             ];
-            // VM-only MAC: LXC rejects --mac (kento auto-assigns it).
+            // Inject the OWNER's pubkey(s) so they can SSH into their env.
+            // `--config-mode auto` lets kento pick injection (lxc) vs
+            // cloud-init (vm). Omitted entirely when no key was materialized
+            // (fail-open: the create still proceeds).
+            let ssh_key_file = spec
+                .ssh_key_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned());
+            if let Some(key_file) = &ssh_key_file {
+                argv.push("--ssh-key");
+                argv.push(key_file);
+                argv.push("--ssh-key-user");
+                argv.push(&spec.ssh_key_user);
+                argv.push("--config-mode");
+                argv.push("auto");
+            }
+            // VM-only MAC: kento accepts --mac for VM modes only (it rejects
+            // it for LXC) and likewise reports a `mac` from inspect for VMs
+            // only — an LXC has no MAC, so the outcome MAC is None there.
             if spec.mode == Mode::Vm {
                 argv.push("--mac");
                 argv.push(&spec.mac);
             }
+            // Nesting: push `--allow-nesting` UNCONDITIONALLY on mode (unlike
+            // the VM-only `--mac` block) — it is mode-agnostic (VM→VM nesting /
+            // nested virt, container→container nesting). The helper already
+            // re-validated `allow_nesting` against the allowlist; when false we
+            // omit it and kento's own default applies.
+            if spec.allow_nesting {
+                argv.push("--allow-nesting");
+            }
             // The image ref is the final positional argument.
             argv.push(&spec.image_ref);
-            self.run("kento", &argv)?;
+            self.run(&argv)?;
 
-            // Stamp the seadog description marker block (qm/pct set). --name
-            // already set the guest name at create.
-            let desc = spec.description_marker();
-            match spec.mode {
-                Mode::Lxc => self.run("pct", &["set", &vmid, "--description", &desc])?,
-                Mode::Vm => self.run("qm", &["set", &vmid, "--description", &desc])?,
-            };
-
-            // Effective MAC: `Some` the minted MAC for a VM. For an LXC the
-            // MAC is unobservable via `pct config` (kento LXC), so the
-            // read-back parser yields `None` — and we record exactly that
-            // (no fabricated fallback). The front-end maps `None` → `""`.
-            let effective_mac = match spec.mode {
-                Mode::Vm => Some(spec.mac.clone()),
-                Mode::Lxc => {
-                    let cfg = self.run("pct", &["config", &vmid])?;
-                    parse_guest_config(spec.vmid, &cfg).mac
-                }
-            };
-            Ok(ProvisionOutcome { mac: effective_mac })
-        }
-
-        fn set_meta(&self, vmid: u32, mode: Mode, meta: &MetaUpdate) -> Result<(), Error> {
-            let vmid = vmid.to_string();
-            let mut args: Vec<String> = vec!["set".to_string(), vmid];
-            if let Some(desc) = &meta.description {
-                args.push("--description".to_string());
-                args.push(desc.clone());
-            }
-            if let Some(ttl) = meta.ttl_deadline {
-                // Carried in a tag so it survives PVE round-tripping.
-                args.push("--tags".to_string());
-                args.push(format!("seadog-ttl-{ttl}"));
-            }
-            if args.len() == 2 {
-                // Nothing to set.
-                return Ok(());
-            }
-            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-            match mode {
-                Mode::Lxc => self.run("pct", &argv).map(|_| ()),
-                Mode::Vm => self.run("qm", &argv).map(|_| ()),
-            }
-        }
-
-        fn start_sshd(&self, vmid: u32) -> Result<(), Error> {
-            let vmid = vmid.to_string();
-            // Narrow exec: start the in-CT sshd only. LXC-only by contract.
-            self.run("pct", &["exec", &vmid, "--", "systemctl", "start", "ssh"])
-                .map(|_| ())
+            // Read the realized signals back. kento reports the MAC for VM
+            // modes only (absent ⇒ None for an LXC), the host-key fps it
+            // generated, and the vmid on PVE backends — exactly the fields the
+            // front-end records.
+            let json = self.run(&["inspect", &spec.name, "--json"])?;
+            let signals = parse_kento_inspect(&json)
+                .map_err(|e| Error::Kento(format!("parsing inspect {}: {e}", spec.name)))?;
+            Ok(ProvisionOutcome {
+                mac: signals.mac,
+                ssh_host_key_fps: signals.ssh_host_key_fps,
+                vmid: signals.vmid,
+            })
         }
     }
 
     // --- Pure parsers (no exec): unit-testable on sample strings. ---
 
-    /// One in-range guest the resource enumeration found: its vmid and
-    /// whether it is a VM (`qemu`) or a container (`lxc`), which selects
-    /// `qm config` vs `pct config` for the per-guest read.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct ResourceEntry {
-        /// Proxmox guest id.
-        pub vmid: u32,
-        /// LXC or VM, mapped from the resource `type` field.
-        pub mode: Mode,
-    }
-
-    /// Parse the JSON `pvesh get /cluster/resources --output-format json`
-    /// emits into the (vmid, mode) list seadog needs. Only `type` ∈
-    /// {`qemu`, `lxc`} rows that carry a `vmid` are kept; storage/node rows
-    /// and any other type are skipped. Robust to extra fields PVE adds.
-    pub fn parse_resources(json: &str) -> Result<Vec<ResourceEntry>, String> {
-        let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
-        let arr = value
-            .as_array()
-            .ok_or_else(|| "expected a top-level JSON array".to_string())?;
+    /// Parse the NAME column out of `kento list`'s columnar output.
+    ///
+    /// `kento list` prints a header row (`NAME  TYPE  IMAGE  STATUS  UPPER
+    /// SIZE`), a separator row of dashes, then one space-padded row per
+    /// instance — NAME is the first column. When there are no instances it
+    /// prints a single `(no instances found)` line. seadog names never
+    /// contain whitespace (`seadog-<owner>-<shortproj>-<token>`, a DNS
+    /// label), so the first whitespace-delimited token of each data row is
+    /// the instance name. We skip the header, the dash separator, and the
+    /// empty-set sentinel.
+    pub fn parse_kento_list(text: &str) -> Vec<String> {
         let mut out = Vec::new();
-        for item in arr {
-            let ty = match item.get("type").and_then(|v| v.as_str()) {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Empty-set sentinel.
+            if trimmed == "(no instances found)" {
+                continue;
+            }
+            let first = match trimmed.split_whitespace().next() {
                 Some(t) => t,
                 None => continue,
             };
-            let mode = match ty {
-                "qemu" => Mode::Vm,
-                "lxc" => Mode::Lxc,
-                // node / storage / sdn / pool rows have no vmid we care about.
-                _ => continue,
-            };
-            // `vmid` is a number in the API output.
-            let vmid = match item.get("vmid").and_then(|v| v.as_u64()) {
-                Some(n) => n as u32,
-                None => continue,
-            };
-            out.push(ResourceEntry { vmid, mode });
-        }
-        Ok(out)
-    }
-
-    /// Parse the `key: value` text `qm config <vmid>` / `pct config <vmid>`
-    /// emit into [`GuestSignals`]. The two tools share enough of this format
-    /// that one parser handles both:
-    ///
-    /// - **name**: `name:` (VM) or `hostname:` (CT).
-    /// - **description**: `description:` — PVE URL-encodes newlines as `%0A`
-    ///   when set via `--description`, so we percent-decode it back so the
-    ///   `seadog-guid:`/`seadog-owner:` marker lines re-appear on their own
-    ///   lines for [`crate::identity::extract_desc_guid`] etc.
-    /// - **mac**: from `net0:` — the `hwaddr=<mac>` (CT) or the
-    ///   `<model>=<mac>` leading token (VM).
-    /// - **fingerprint**: bridge/vlan/model from `net0:`; disk geometry+size
-    ///   from `scsi0:`/`rootfs:`; machine/bios/scsihw/memory/cores from their
-    ///   own keys. Absent fields stay `None` (never read as a match).
-    pub fn parse_guest_config(vmid: u32, text: &str) -> GuestSignals {
-        let mut name = None;
-        let mut hostname = None;
-        let mut description = None;
-        let mut net0 = None;
-        let mut scsi0 = None;
-        let mut rootfs = None;
-        let mut fp = Fingerprint::default();
-
-        for line in text.lines() {
-            let line = line.trim_end();
-            let (key, val) = match line.split_once(':') {
-                Some((k, v)) => (k.trim(), v.trim()),
-                None => continue,
-            };
-            match key {
-                "name" => name = nonempty(val),
-                "hostname" => hostname = nonempty(val),
-                "description" => description = nonempty(val).map(|v| pve_unescape(&v)),
-                "net0" => net0 = nonempty(val),
-                "scsi0" | "virtio0" | "sata0" | "ide0" => {
-                    if scsi0.is_none() {
-                        scsi0 = nonempty(val);
-                    }
-                }
-                "rootfs" => rootfs = nonempty(val),
-                "machine" => fp.machine_type = nonempty(val),
-                "bios" => fp.bios = nonempty(val),
-                "scsihw" => fp.scsihw = nonempty(val),
-                "memory" => fp.memory = val.trim().parse::<u64>().ok(),
-                "cores" => fp.cores = val.trim().parse::<u32>().ok(),
-                _ => {}
-            }
-        }
-
-        // Fill the network fingerprint + MAC from net0.
-        let mut mac = None;
-        if let Some(n) = &net0 {
-            let parsed = parse_net0(n);
-            mac = parsed.mac;
-            fp.net_bridge = parsed.bridge;
-            fp.net_vlan = parsed.vlan;
-            fp.net_model = parsed.model;
-        }
-
-        // Disk geometry + size from the first disk-ish key we saw (VM) or
-        // the rootfs (CT).
-        if let Some(disk) = scsi0.as_ref().or(rootfs.as_ref()) {
-            let parsed = parse_disk(disk);
-            fp.disk_geometry = parsed.geometry;
-            fp.disk_size = parsed.size_bytes;
-        }
-
-        GuestSignals {
-            vmid,
-            name: name.or(hostname),
-            description,
-            mac,
-            fingerprint: fp,
-        }
-    }
-
-    /// `Some(trimmed)` unless the value is empty.
-    fn nonempty(v: &str) -> Option<String> {
-        let v = v.trim();
-        if v.is_empty() {
-            None
-        } else {
-            Some(v.to_string())
-        }
-    }
-
-    /// Decode the small set of percent-escapes PVE applies to a
-    /// `--description` body (notably `%0A` for newline) so the marker lines
-    /// split back out. Unknown/short escapes are left verbatim.
-    fn pve_unescape(s: &str) -> String {
-        let bytes = s.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%' && i + 2 < bytes.len() {
-                let hex = &s[i + 1..i + 3];
-                if let Ok(b) = u8::from_str_radix(hex, 16) {
-                    out.push(b);
-                    i += 3;
-                    continue;
-                }
-            }
-            out.push(bytes[i]);
-            i += 1;
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    }
-
-    /// The pieces we pull out of a `net0:` line.
-    struct Net0 {
-        mac: Option<String>,
-        bridge: Option<String>,
-        vlan: Option<u32>,
-        model: Option<String>,
-    }
-
-    /// Parse a PVE `net0:` value. Two shapes:
-    /// - VM: `virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,tag=10`
-    /// - CT: `name=eth0,bridge=vmbr0,hwaddr=AA:BB:..,ip=...,tag=10,type=veth`
-    fn parse_net0(val: &str) -> Net0 {
-        let mut mac = None;
-        let mut bridge = None;
-        let mut vlan = None;
-        let mut model = None;
-        for part in val.split(',') {
-            let part = part.trim();
-            let (k, v) = match part.split_once('=') {
-                Some((k, v)) => (k.trim(), v.trim()),
-                None => continue,
-            };
-            match k {
-                "bridge" => bridge = nonempty(v),
-                "tag" => vlan = v.parse::<u32>().ok(),
-                "hwaddr" => mac = normalize_mac(v),
-                // VM model token: `<model>=<mac>` (e.g. `virtio=AA:..`).
-                "virtio" | "e1000" | "rtl8139" | "vmxnet3" | "i82551" | "i82557b" => {
-                    model = nonempty(k);
-                    if mac.is_none() {
-                        mac = normalize_mac(v);
-                    }
-                }
-                // CT NIC model is the `type=` (veth); record it as the model
-                // only if we have not already learned a VM model token.
-                "type" if model.is_none() => model = nonempty(v),
-                _ => {}
-            }
-        }
-        Net0 {
-            mac,
-            bridge,
-            vlan,
-            model,
-        }
-    }
-
-    /// Lowercase a MAC if it looks like one, else `None`.
-    fn normalize_mac(v: &str) -> Option<String> {
-        let v = v.trim();
-        if v.split(':').count() == 6 && v.chars().all(|c| c.is_ascii_hexdigit() || c == ':') {
-            Some(v.to_ascii_lowercase())
-        } else {
-            None
-        }
-    }
-
-    /// What we read off a disk line.
-    struct Disk {
-        geometry: Option<String>,
-        size_bytes: Option<u64>,
-    }
-
-    /// Parse a disk line like
-    /// `local-lvm:vm-10010-disk-0,size=20G` (VM) or
-    /// `local:10010/vm-10010-disk-0.raw,size=8G` (CT rootfs). The volume id
-    /// (the first comma-field) is the geometry signature; `size=` is decoded
-    /// to bytes.
-    fn parse_disk(val: &str) -> Disk {
-        let mut geometry = None;
-        let mut size_bytes = None;
-        for (i, part) in val.split(',').enumerate() {
-            let part = part.trim();
-            if i == 0 {
-                geometry = nonempty(part);
+            // Header row: first column is the literal "NAME".
+            if first == "NAME" {
                 continue;
             }
-            if let Some(sz) = part.strip_prefix("size=") {
-                size_bytes = parse_size(sz);
+            // Separator row: all dashes.
+            if first.chars().all(|c| c == '-') {
+                continue;
             }
+            out.push(first.to_string());
         }
-        Disk {
-            geometry,
-            size_bytes,
-        }
+        out
     }
 
-    /// Decode a PVE size string (`512`, `8G`, `20480M`, `1T`, `100K`) to
-    /// bytes. A bare number is bytes.
-    fn parse_size(s: &str) -> Option<u64> {
-        let s = s.trim();
-        if s.is_empty() {
-            return None;
-        }
-        let (num, mult): (&str, u64) = match s.chars().last() {
-            Some('K') | Some('k') => (&s[..s.len() - 1], 1024),
-            Some('M') | Some('m') => (&s[..s.len() - 1], 1024 * 1024),
-            Some('G') | Some('g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
-            Some('T') | Some('t') => (&s[..s.len() - 1], 1024 * 1024 * 1024 * 1024),
-            _ => (s, 1),
+    /// Parse `kento inspect <name> --json` into [`InstanceSignals`].
+    ///
+    /// kento emits a stable dict (`json.dumps(data, indent=2)`); fields that
+    /// are unset are simply absent (kento never emits an empty `mac`/`vmid`),
+    /// so absence maps cleanly to `None`/empty. Mapping:
+    /// - `guid` / `owner` ← the `environment[]` `KEY=VALUE` lines, keyed on
+    ///   `SEADOG_GUID` / `SEADOG_OWNER`. Absent `SEADOG_GUID` ⇒ `None` ⇒ the
+    ///   instance is **foreign** (no seadog anchor).
+    /// - `mac` ← `.mac` (absent ⇒ `None`).
+    /// - `ssh_host_key_fps` ← the values of the
+    ///   `.ssh_host_key_fingerprints` `{type: fp}` dict, sorted for a stable
+    ///   order (the map is unordered in JSON).
+    /// - `image` ← `.image`; `status` ← `.status`.
+    /// - family ← the authoritative `.type` ∈ {`LXC`, `VM`} (ALWAYS present:
+    ///   kento `info.py:97`): `VM` → [`Mode::Vm`], `LXC` → [`Mode::Lxc`].
+    ///   That `type` is the unambiguous family signal — immune to the
+    ///   `pve`/`pve-vm` mode-string nuance below. `.mode` (the raw kento-mode
+    ///   ∈ {`lxc`, `vm`, `pve`, `pve-vm`} — kento `info.py:96`; note a
+    ///   PVE-LXC is promoted to bare `pve`, NOT `pve-lxc`, at kento
+    ///   `create.py:410-421`/`628`, and `pve-lxc` exists ONLY in the `list`
+    ///   TYPE column, never in `inspect --json`) is read as a DEFENSIVE
+    ///   fallback used ONLY when `type` is missing/unrecognized: `vm`/`pve-vm`
+    ///   → [`Mode::Vm`], everything else → [`Mode::Lxc`]. reap uses the
+    ///   collapsed family to recover an orphan's mode precisely.
+    /// - `vmid` ← `.vmid` (present only on PVE backends; informational).
+    pub fn parse_kento_inspect(json: &str) -> Result<InstanceSignals, String> {
+        let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| "expected a top-level JSON object".to_string())?;
+
+        let str_field = |key: &str| -> Option<String> {
+            obj.get(key)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
         };
-        num.trim().parse::<u64>().ok().map(|n| n * mult)
+
+        let name = str_field("name").unwrap_or_default();
+        let image = str_field("image").unwrap_or_default();
+        let status = str_field("status").unwrap_or_default();
+        let mac = str_field("mac");
+
+        // Collapse the backend family to the neutral Mode on the AUTHORITATIVE
+        // `.type` field (kento info.py:97 — ALWAYS present, ∈ {LXC, VM}): it is
+        // the unambiguous family signal, immune to the raw `.mode` string's
+        // pve/pve-vm nuance (a PVE-LXC reports bare `pve`, NOT `pve-lxc`, so a
+        // mode-only match would be fragile). `.type` is the primary path.
+        //
+        // DEFENSIVE fallback ONLY when `.type` is missing/unrecognized (kento
+        // would have to break its own contract): fall back to the `.mode`
+        // string — vm-family (`vm`/`pve-vm`) → Vm, everything else → Lxc.
+        let mode = match str_field("type").as_deref() {
+            Some("VM") => Mode::Vm,
+            Some("LXC") => Mode::Lxc,
+            _ => match str_field("mode").as_deref() {
+                Some("vm") | Some("pve-vm") => Mode::Vm,
+                _ => Mode::Lxc,
+            },
+        };
+
+        // vmid is emitted as a JSON number (int) on PVE backends, absent
+        // otherwise. Be lenient about a stringified vmid too.
+        let vmid = obj.get("vmid").and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                .map(|n| n as u32)
+        });
+
+        // environment[] is a list of "KEY=VALUE" strings (absent when no env
+        // was injected). Pull SEADOG_GUID / SEADOG_OWNER out of it.
+        let mut guid = None;
+        let mut owner = None;
+        if let Some(env) = obj.get("environment").and_then(|v| v.as_array()) {
+            for item in env {
+                let entry = match item.as_str() {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let (key, val) = match entry.split_once('=') {
+                    Some((k, v)) => (k, v),
+                    None => continue,
+                };
+                match key {
+                    "SEADOG_GUID" if !val.is_empty() => guid = Some(val.to_string()),
+                    "SEADOG_OWNER" if !val.is_empty() => owner = Some(val.to_string()),
+                    _ => {}
+                }
+            }
+        }
+
+        // ssh_host_key_fingerprints is a {type: fingerprint} map. Flatten its
+        // values; sort for a deterministic order (JSON object order is not
+        // guaranteed) so identity comparison and tests are stable.
+        let mut ssh_host_key_fps = Vec::new();
+        if let Some(fps) = obj
+            .get("ssh_host_key_fingerprints")
+            .and_then(|v| v.as_object())
+        {
+            for v in fps.values() {
+                if let Some(s) = v.as_str() {
+                    if !s.is_empty() {
+                        ssh_host_key_fps.push(s.to_string());
+                    }
+                }
+            }
+            ssh_host_key_fps.sort();
+        }
+
+        Ok(InstanceSignals {
+            name,
+            guid,
+            owner,
+            mac,
+            ssh_host_key_fps,
+            image,
+            status,
+            mode,
+            vmid,
+        })
     }
 
     #[cfg(test)]
     mod parser_tests {
         use super::*;
-        use crate::identity::{extract_desc_guid, extract_desc_owner};
 
         #[test]
-        fn parse_resources_keeps_guests_skips_other_rows() {
-            let json = r#"[
-                {"type":"node","node":"pve","status":"online"},
-                {"type":"storage","storage":"local","node":"pve"},
-                {"type":"qemu","vmid":10010,"node":"pve","name":"seadog-a"},
-                {"type":"lxc","vmid":10011,"node":"pve","name":"seadog-b"},
-                {"type":"qemu","vmid":105,"node":"pve","name":"prod"},
-                {"type":"pool","pool":"p"}
-            ]"#;
-            let entries = parse_resources(json).unwrap();
+        fn parse_list_extracts_name_column_skips_header_and_separator() {
+            // The exact shape `kento list` prints: header, dash separator,
+            // then space-padded rows. NAME is the first column. (`pve-lxc` in
+            // the TYPE column is the LIST-table display label — the only place
+            // kento ever renders that string; `inspect --json` reports bare
+            // `pve` + `type:"LXC"` instead. Only the NAME column is parsed.)
+            let text = "\
+NAME                       TYPE     IMAGE              STATUS   UPPER SIZE
+-------------------------  -------  -----------------  -------  ----------
+seadog-alice-proj-ab12     pve-lxc  registry/loom:1    running  1.2M
+seadog-bob-proj-cd34       vm       registry/stuff:2   stopped  512K
+foreign-thing              lxc      some/other:img     running  0
+";
+            let names = parse_kento_list(text);
             assert_eq!(
-                entries,
+                names,
                 vec![
-                    ResourceEntry {
-                        vmid: 10010,
-                        mode: Mode::Vm
-                    },
-                    ResourceEntry {
-                        vmid: 10011,
-                        mode: Mode::Lxc
-                    },
-                    ResourceEntry {
-                        vmid: 105,
-                        mode: Mode::Vm
-                    },
+                    "seadog-alice-proj-ab12".to_string(),
+                    "seadog-bob-proj-cd34".to_string(),
+                    "foreign-thing".to_string(),
                 ]
             );
         }
 
         #[test]
-        fn parse_resources_rejects_non_array() {
-            assert!(parse_resources("{}").is_err());
-            assert!(parse_resources("not json").is_err());
+        fn parse_list_empty_set_sentinel_yields_no_names() {
+            assert!(parse_kento_list("(no instances found)\n").is_empty());
+            assert!(parse_kento_list("").is_empty());
+            // Header + separator with no data rows.
+            let text = "NAME  TYPE\n----  ----\n";
+            assert!(parse_kento_list(text).is_empty());
         }
 
         #[test]
-        fn parse_vm_config_populates_signals_and_fingerprint() {
-            // A `qm config` dump, with the description percent-encoded the way
-            // PVE round-trips a `--description` set with embedded newlines.
-            let text = "\
-boot: order=scsi0
-cores: 2
-description: seadog-guid%3Aguid-abc%0Aseadog-owner%3Aalice
-machine: q35
-memory: 2048
-name: seadog-alice-proj-ab12
-net0: virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,tag=10
-scsihw: virtio-scsi-pci
-bios: seabios
-scsi0: local-lvm:vm-10010-disk-0,size=20G
-smbios1: uuid=...
-";
-            let g = parse_guest_config(10010, text);
-            assert_eq!(g.vmid, 10010);
-            assert_eq!(g.name.as_deref(), Some("seadog-alice-proj-ab12"));
-            assert_eq!(g.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
-            // Description decoded so the markers triangulate.
+        fn parse_inspect_ours_maps_guid_owner_mac_fps() {
+            // A kento instance seadog provisioned: SEADOG_GUID/SEADOG_OWNER in
+            // environment[], a realized mac, a vmid (PVE backend), and two
+            // host-key fingerprints.
+            let json = r#"{
+                "name": "seadog-alice-proj-ab12",
+                "image": "registry/loom:1",
+                "mode": "pve",
+                "type": "LXC",
+                "status": "running",
+                "directory": "/var/lib/kento/lxc/10010",
+                "state_directory": "/var/lib/kento/lxc/10010",
+                "config_mode": "injection",
+                "vmid": 10010,
+                "network": "bridge=vmbr0",
+                "mac": "aa:bb:cc:dd:ee:ff",
+                "ssh_user": "root",
+                "environment": [
+                    "SEADOG_GUID=guid-abc",
+                    "SEADOG_OWNER=alice",
+                    "TERM=xterm"
+                ],
+                "layer_count": 3,
+                "created": "2026-06-06 12:00:00",
+                "ssh_host_key_fingerprints": {
+                    "ecdsa": "SHA256:bbb",
+                    "ed25519": "SHA256:aaa",
+                    "rsa": "SHA256:ccc"
+                },
+                "qemu_args": [],
+                "pve_args": []
+            }"#;
+            let s = parse_kento_inspect(json).unwrap();
+            assert_eq!(s.name, "seadog-alice-proj-ab12");
+            assert_eq!(s.guid.as_deref(), Some("guid-abc"));
+            assert_eq!(s.owner.as_deref(), Some("alice"));
+            assert_eq!(s.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+            assert_eq!(s.image, "registry/loom:1");
+            assert_eq!(s.status, "running");
             assert_eq!(
-                extract_desc_guid(g.description.as_deref()).as_deref(),
-                Some("guid-abc")
+                s.mode,
+                Mode::Lxc,
+                "bare `pve` mode + type LXC collapses to Lxc"
             );
+            assert_eq!(s.vmid, Some(10010));
+            // Flattened + sorted fingerprint values (map order not trusted).
             assert_eq!(
-                extract_desc_owner(g.description.as_deref()).as_deref(),
-                Some("alice")
+                s.ssh_host_key_fps,
+                vec![
+                    "SHA256:aaa".to_string(),
+                    "SHA256:bbb".to_string(),
+                    "SHA256:ccc".to_string(),
+                ]
             );
-            // Fingerprint fields.
-            assert_eq!(g.fingerprint.net_bridge.as_deref(), Some("vmbr0"));
-            assert_eq!(g.fingerprint.net_vlan, Some(10));
-            assert_eq!(g.fingerprint.net_model.as_deref(), Some("virtio"));
-            assert_eq!(g.fingerprint.machine_type.as_deref(), Some("q35"));
-            assert_eq!(g.fingerprint.bios.as_deref(), Some("seabios"));
-            assert_eq!(g.fingerprint.scsihw.as_deref(), Some("virtio-scsi-pci"));
-            assert_eq!(g.fingerprint.memory, Some(2048));
-            assert_eq!(g.fingerprint.cores, Some(2));
-            assert_eq!(
-                g.fingerprint.disk_geometry.as_deref(),
-                Some("local-lvm:vm-10010-disk-0")
-            );
-            assert_eq!(g.fingerprint.disk_size, Some(20 * 1024 * 1024 * 1024));
         }
 
         #[test]
-        fn parse_ct_config_uses_hostname_and_hwaddr() {
-            // A `pct config` dump: hostname (not name), net0 with hwaddr,
-            // rootfs (not scsi0).
-            let text = "\
-arch: amd64
-cores: 2
-description: seadog-guid%3Ag-ct%0Aseadog-owner%3Aalice
-hostname: seadog-alice-proj-cd34
-memory: 1024
-net0: name=eth0,bridge=vmbr0,hwaddr=12:34:56:78:9A:BC,ip=dhcp,tag=20,type=veth
-rootfs: local:10011/vm-10011-disk-0.raw,size=8G
-";
-            let g = parse_guest_config(10011, text);
-            assert_eq!(g.name.as_deref(), Some("seadog-alice-proj-cd34"));
-            assert_eq!(g.mac.as_deref(), Some("12:34:56:78:9a:bc"));
+        fn parse_inspect_foreign_has_no_guid() {
+            // A kento instance NOT created by seadog: no SEADOG_GUID env ⇒
+            // guid None ⇒ classified Foreign. Also no mac, no vmid (a non-PVE
+            // backend), and no host keys.
+            let json = r#"{
+                "name": "someones-box",
+                "image": "docker.io/library/alpine:3",
+                "mode": "lxc",
+                "type": "LXC",
+                "status": "stopped",
+                "directory": "/var/lib/kento/lxc/someones-box",
+                "state_directory": "/var/lib/kento/lxc/someones-box",
+                "ssh_user": "root",
+                "environment": ["FOO=bar"],
+                "layer_count": 1,
+                "created": "2026-06-06 09:00:00",
+                "ssh_host_key_fingerprints": {},
+                "qemu_args": [],
+                "pve_args": []
+            }"#;
+            let s = parse_kento_inspect(json).unwrap();
+            assert_eq!(s.name, "someones-box");
+            assert_eq!(s.guid, None, "no SEADOG_GUID ⇒ foreign");
+            assert_eq!(s.owner, None);
+            assert_eq!(s.mac, None, "absent mac ⇒ None");
+            assert!(s.ssh_host_key_fps.is_empty());
+            assert_eq!(s.vmid, None, "non-PVE backend ⇒ no vmid");
+            assert_eq!(s.status, "stopped");
+            assert_eq!(s.mode, Mode::Lxc, "lxc mode ⇒ Lxc");
+        }
+
+        #[test]
+        fn parse_inspect_no_environment_key_is_foreign() {
+            // Some instances may carry no environment[] key at all (no env
+            // ever injected). That must read as foreign, not error.
+            let json = r#"{
+                "name": "bare",
+                "image": "img:1",
+                "mode": "vm",
+                "type": "VM",
+                "status": "running",
+                "directory": "/d",
+                "state_directory": "/d",
+                "ssh_user": "root",
+                "layer_count": 0,
+                "created": "2026-06-06 09:00:00",
+                "ssh_host_key_fingerprints": {},
+                "qemu_args": [],
+                "pve_args": []
+            }"#;
+            let s = parse_kento_inspect(json).unwrap();
+            assert_eq!(s.guid, None);
+            assert_eq!(s.owner, None);
+            assert_eq!(s.mode, Mode::Vm, "vm mode ⇒ Vm");
+        }
+
+        #[test]
+        fn parse_inspect_type_drives_family_collapse() {
+            // The authoritative `.type` field decides the family — even when
+            // the `.mode` string is unrecognized or would point the other way.
+            // type=VM ⇒ Vm regardless of an unknown/contradictory mode.
+            let vm_by_type = r#"{"name":"n","mode":"weird-future-vm","type":"VM","environment":["SEADOG_GUID=g"]}"#;
             assert_eq!(
-                extract_desc_owner(g.description.as_deref()).as_deref(),
-                Some("alice")
+                parse_kento_inspect(vm_by_type).unwrap().mode,
+                Mode::Vm,
+                "type=VM drives the collapse to Vm even with an unknown mode string"
             );
-            assert_eq!(g.fingerprint.net_bridge.as_deref(), Some("vmbr0"));
-            assert_eq!(g.fingerprint.net_vlan, Some(20));
-            assert_eq!(g.fingerprint.memory, Some(1024));
+            // type=LXC ⇒ Lxc.
+            let lxc_by_type = r#"{"name":"n","mode":"weird-future-lxc","type":"LXC","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(parse_kento_inspect(lxc_by_type).unwrap().mode, Mode::Lxc);
+            // Bare `pve` (the REAL PVE-LXC kento-mode) + type=LXC ⇒ Lxc.
+            let pve_lxc =
+                r#"{"name":"n","mode":"pve","type":"LXC","environment":["SEADOG_GUID=g"]}"#;
             assert_eq!(
-                g.fingerprint.disk_geometry.as_deref(),
-                Some("local:10011/vm-10011-disk-0.raw")
+                parse_kento_inspect(pve_lxc).unwrap().mode,
+                Mode::Lxc,
+                "bare `pve` mode + type=LXC ⇒ Lxc (kento never emits `pve-lxc` from inspect)"
             );
-            assert_eq!(g.fingerprint.disk_size, Some(8 * 1024 * 1024 * 1024));
+            // PVE-VM: mode `pve-vm` + type=VM ⇒ Vm.
+            let pve_vm =
+                r#"{"name":"n","mode":"pve-vm","type":"VM","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(parse_kento_inspect(pve_vm).unwrap().mode, Mode::Vm);
         }
 
         #[test]
-        fn parse_config_absent_fields_stay_none() {
-            // A bare config with no markers, no net, no disk: everything
-            // optional must be None so absence never reads as a match.
-            let text = "cores: 1\nmemory: 512\n";
-            let g = parse_guest_config(10010, text);
-            assert_eq!(g.name, None);
-            assert_eq!(g.description, None);
-            assert_eq!(g.mac, None);
-            assert_eq!(g.fingerprint.net_bridge, None);
-            assert_eq!(g.fingerprint.disk_size, None);
-            assert_eq!(g.fingerprint.memory, Some(512));
-            assert_eq!(g.fingerprint.cores, Some(1));
+        fn parse_inspect_mode_fallback_when_type_missing() {
+            // DEFENSIVE fallback: if kento ever omits/garbles the authoritative
+            // `.type`, we fall back to the `.mode` string. No `.type` and no
+            // `.mode` ⇒ safe Lxc default.
+            let absent = r#"{"name":"n","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(parse_kento_inspect(absent).unwrap().mode, Mode::Lxc);
+            // No `.type`, unrecognized `.mode` ⇒ Lxc default.
+            let weird = r#"{"name":"n","mode":"podman","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(parse_kento_inspect(weird).unwrap().mode, Mode::Lxc);
+            // No `.type`, `.mode`=vm ⇒ Vm via the fallback.
+            let vm = r#"{"name":"n","mode":"vm","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(parse_kento_inspect(vm).unwrap().mode, Mode::Vm);
+            // No `.type`, `.mode`=pve-vm ⇒ Vm via the fallback.
+            let pve_vm = r#"{"name":"n","mode":"pve-vm","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(parse_kento_inspect(pve_vm).unwrap().mode, Mode::Vm);
+            // No `.type`, `.mode`=pve (the real PVE-LXC mode) ⇒ Lxc via fallback.
+            let pve = r#"{"name":"n","mode":"pve","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(parse_kento_inspect(pve).unwrap().mode, Mode::Lxc);
+            // Unrecognized `.type` value also drops to the mode fallback.
+            let bad_type =
+                r#"{"name":"n","mode":"vm","type":"CONTAINER","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(
+                parse_kento_inspect(bad_type).unwrap().mode,
+                Mode::Vm,
+                "unrecognized type ⇒ fall back to mode string (vm ⇒ Vm)"
+            );
         }
 
         #[test]
-        fn parse_size_handles_units_and_bytes() {
-            assert_eq!(parse_size("512"), Some(512));
-            assert_eq!(parse_size("8G"), Some(8 * 1024 * 1024 * 1024));
-            assert_eq!(parse_size("20480M"), Some(20480 * 1024 * 1024));
-            assert_eq!(parse_size("1T"), Some(1024u64.pow(4)));
-            assert_eq!(parse_size(""), None);
-            assert_eq!(parse_size("notasize"), None);
+        fn parse_inspect_empty_mac_is_none() {
+            // Defensive: even if kento ever emitted an empty-string mac, it
+            // must map to None (the confirming-when-present contract), not
+            // Some("").
+            let json = r#"{
+                "name": "n",
+                "image": "i",
+                "mode": "vm",
+                "type": "VM",
+                "status": "running",
+                "directory": "/d",
+                "state_directory": "/d",
+                "mac": "",
+                "environment": ["SEADOG_GUID=g1", "SEADOG_OWNER="],
+                "ssh_host_key_fingerprints": {"ed25519": "SHA256:only"}
+            }"#;
+            let s = parse_kento_inspect(json).unwrap();
+            assert_eq!(s.mac, None, "empty mac ⇒ None");
+            assert_eq!(s.guid.as_deref(), Some("g1"));
+            assert_eq!(s.owner, None, "empty SEADOG_OWNER value ⇒ None");
+            assert_eq!(s.ssh_host_key_fps, vec!["SHA256:only".to_string()]);
         }
 
         #[test]
-        fn unparseable_description_without_markers_is_kept_verbatim() {
-            let text = "description: just a plain note\nname: seadog-x\n";
-            let g = parse_guest_config(10010, text);
-            assert_eq!(g.description.as_deref(), Some("just a plain note"));
-            assert_eq!(extract_desc_guid(g.description.as_deref()), None);
+        fn parse_inspect_vm_carries_passed_mac() {
+            // A VM seadog created with --mac: kento reports it back.
+            let json = r#"{
+                "name": "seadog-bob-proj-cd34",
+                "image": "registry/stuff:2",
+                "mode": "vm",
+                "type": "VM",
+                "status": "running",
+                "directory": "/d",
+                "state_directory": "/d",
+                "vmid": 10011,
+                "mac": "12:34:56:78:9a:bc",
+                "environment": ["SEADOG_OWNER=bob", "SEADOG_GUID=g-bob"],
+                "ssh_host_key_fingerprints": {
+                    "rsa": "SHA256:r",
+                    "ed25519": "SHA256:e"
+                }
+            }"#;
+            let s = parse_kento_inspect(json).unwrap();
+            assert_eq!(s.guid.as_deref(), Some("g-bob"));
+            assert_eq!(s.owner.as_deref(), Some("bob"));
+            assert_eq!(s.mac.as_deref(), Some("12:34:56:78:9a:bc"));
+            assert_eq!(s.mode, Mode::Vm);
+            assert_eq!(s.vmid, Some(10011));
+            assert_eq!(
+                s.ssh_host_key_fps,
+                vec!["SHA256:e".to_string(), "SHA256:r".to_string()]
+            );
+        }
+
+        #[test]
+        fn parse_inspect_rejects_non_object() {
+            assert!(parse_kento_inspect("[]").is_err());
+            assert!(parse_kento_inspect("not json").is_err());
+        }
+
+        #[test]
+        fn per_instance_kento_error_is_skipped() {
+            // A ghost/broken instance whose `kento inspect` exits non-zero
+            // surfaces as Error::Kento — it must be skipped (not propagated)
+            // so one bad instance can't blind the sweep to every other env.
+            let e = Error::Kento("kento exited Some(255): no such guest".into());
+            assert!(matches!(
+                classify_per_instance_error(e),
+                PerInstance::Skip(_)
+            ));
+        }
+
+        #[test]
+        fn per_instance_quorum_loss_propagates() {
+            // QuorumLost is a GLOBAL condition, never a per-instance fault:
+            // continuing the sweep would be wrong, so it must propagate and
+            // abort even though it surfaced through a per-instance inspect.
+            let e = Error::QuorumLost("kento reported quorum loss".into());
+            assert!(matches!(
+                classify_per_instance_error(e),
+                PerInstance::Propagate(_)
+            ));
         }
     }
 }
@@ -946,36 +1093,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fake_filters_by_range_and_records_teardowns() {
+    fn fake_lists_set_instances_and_records_teardowns() {
         let k = FakeKento::new();
-        k.set_guests(vec![
-            GuestSignals {
-                vmid: 9999,
+        k.set_instances(vec![
+            InstanceSignals {
+                name: "seadog-a".into(),
+                guid: Some("g-a".into()),
                 ..Default::default()
             },
-            GuestSignals {
-                vmid: 10010,
-                ..Default::default()
-            },
-            GuestSignals {
-                vmid: 11000,
+            InstanceSignals {
+                name: "seadog-b".into(),
+                guid: Some("g-b".into()),
                 ..Default::default()
             },
         ]);
-        let listed = k.list_guests((10000, 10999)).unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].vmid, 10010);
+        // No vmid-range filter: the set list IS the live list.
+        let listed = k.list_instances().unwrap();
+        assert_eq!(listed.len(), 2);
 
-        k.teardown("seadog-some-guest", Mode::Vm).unwrap();
-        assert_eq!(
-            k.teardowns(),
-            vec![("seadog-some-guest".to_string(), Mode::Vm)]
-        );
+        k.teardown("seadog-a", Mode::Vm).unwrap();
+        assert_eq!(k.teardowns(), vec![("seadog-a".to_string(), Mode::Vm)]);
+        // The torn-down instance is gone from a subsequent list.
+        let listed = k.list_instances().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "seadog-b");
     }
 
     fn sample_spec(mode: Mode) -> ProvisionSpec {
         ProvisionSpec {
-            vmid: 10010,
             mode,
             image_ref: "registry/loom:1".into(),
             name: "seadog-alice-proj-ab12".into(),
@@ -986,76 +1131,107 @@ mod tests {
             bridge: "vmbr0".into(),
             guid: "guid-abc".into(),
             owner: "alice".into(),
+            ssh_key_file: None,
+            ssh_key_user: "root".into(),
+            allow_nesting: false,
         }
     }
 
     #[test]
-    fn fake_provision_realizes_triangulatable_guest() {
-        use crate::identity::{extract_desc_guid, extract_desc_owner};
+    fn fake_provision_realizes_classifiable_instance() {
         let k = FakeKento::new();
         let spec = sample_spec(Mode::Lxc);
         let outcome = k.provision(&spec).unwrap();
         assert_eq!(k.provisions(), vec![spec.clone()]);
 
-        // The realized guest carries every marker teardown triangulates on.
-        let listed = k.list_guests((10000, 10999)).unwrap();
+        // The realized instance carries the injected GUID/owner anchor +
+        // host-key fps. This spec is an LXC, so kento reports NO MAC: the
+        // live signals and the outcome both carry `None` (the designed
+        // LXC sentinel — kento reports a MAC for VM modes only).
+        let listed = k.list_instances().unwrap();
         assert_eq!(listed.len(), 1);
-        let g = &listed[0];
-        assert_eq!(g.name.as_deref(), Some("seadog-alice-proj-ab12"));
-        // LXC: the MAC is unobservable via pct config, so the outcome MAC is
-        // None and the realized guest carries no MAC. It still triangulates
-        // via the GUID/owner desc markers + the seadog- name (below).
-        assert_eq!(outcome.mac, None);
-        assert_eq!(g.mac, None);
-        assert_eq!(
-            extract_desc_guid(g.description.as_deref()),
-            Some("guid-abc".into())
-        );
-        assert_eq!(
-            extract_desc_owner(g.description.as_deref()),
-            Some("alice".into())
-        );
+        let i = &listed[0];
+        assert_eq!(i.name, "seadog-alice-proj-ab12");
+        assert_eq!(i.guid.as_deref(), Some("guid-abc"));
+        assert_eq!(i.owner.as_deref(), Some("alice"));
+        assert_eq!(i.mac, None, "LXC has no kento-reported MAC");
+        assert_eq!(i.mac, outcome.mac);
+        assert!(!i.ssh_host_key_fps.is_empty());
+        assert_eq!(i.ssh_host_key_fps, outcome.ssh_host_key_fps);
+        assert_eq!(i.mode, Mode::Lxc, "realized instance carries the spec mode");
+        assert_eq!(outcome.vmid, None);
 
         // Teardown by the realized name removes it.
         k.teardown(&spec.name, Mode::Lxc).unwrap();
-        assert!(k.list_guests((10000, 10999)).unwrap().is_empty());
+        assert!(k.list_instances().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fake_provision_records_allow_nesting() {
+        // The boundary-crossing nesting flag is recorded per provision so a
+        // test can assert it reached the spec. Default false; set true here.
+        let k = FakeKento::new();
+        let mut spec = sample_spec(Mode::Lxc);
+        spec.allow_nesting = true;
+        k.provision(&spec).unwrap();
+        assert_eq!(k.provision_allow_nesting(), vec![true]);
+        assert!(k.provisions()[0].allow_nesting);
+
+        // A second, non-nesting provision appends a `false`, in order.
+        let plain = sample_spec(Mode::Vm);
+        k.provision(&plain).unwrap();
+        assert_eq!(k.provision_allow_nesting(), vec![true, false]);
     }
 
     #[test]
     fn fake_provision_vm_keeps_passed_mac() {
-        // VM path: --mac is honored, so the effective MAC is Some(spec's).
+        // VM path: --mac is honored, so the effective MAC is the spec's.
         let k = FakeKento::new();
         let spec = sample_spec(Mode::Vm);
         let outcome = k.provision(&spec).unwrap();
         assert_eq!(outcome.mac.as_deref(), Some(spec.mac.as_str()));
-        let listed = k.list_guests((10000, 10999)).unwrap();
+        let listed = k.list_instances().unwrap();
         assert_eq!(listed[0].mac.as_deref(), Some(spec.mac.as_str()));
     }
 
     #[test]
-    fn fake_records_set_meta_and_sshd() {
+    fn fake_provision_lxc_reports_no_mac() {
+        // kento reports a MAC for VM modes only: an LXC provision yields
+        // `None` (the designed sentinel), both in the outcome and on the
+        // realized live instance.
         let k = FakeKento::new();
-        let meta = MetaUpdate {
-            description: Some("d".into()),
-            ttl_deadline: Some(5000),
-        };
-        k.set_meta(10010, Mode::Vm, &meta).unwrap();
-        k.start_sshd(10010).unwrap();
-        assert_eq!(k.set_metas(), vec![(10010, Mode::Vm, meta)]);
-        assert_eq!(k.sshd_starts(), vec![10010]);
+        let lxc = sample_spec(Mode::Lxc);
+        let out = k.provision(&lxc).unwrap();
+        assert_eq!(out.mac, None, "LXC has no MAC");
+        let listed = k.list_instances().unwrap();
+        assert_eq!(listed[0].mac, None, "LXC live instance has no MAC");
     }
 
     #[test]
     fn fake_signals_quorum_loss() {
         let k = FakeKento::new();
         k.set_quorum_lost("no quorum");
-        assert!(matches!(
-            k.list_guests((10000, 10999)),
-            Err(Error::QuorumLost(_))
-        ));
+        assert!(matches!(k.list_instances(), Err(Error::QuorumLost(_))));
         assert!(matches!(
             k.teardown("seadog-x", Mode::Vm),
             Err(Error::QuorumLost(_))
         ));
+    }
+
+    #[test]
+    fn fake_teardown_failure_hook() {
+        let k = FakeKento::new();
+        k.set_instances(vec![InstanceSignals {
+            name: "seadog-x".into(),
+            guid: Some("g-x".into()),
+            ..Default::default()
+        }]);
+        k.fail_teardown("seadog-x", "boom");
+        assert!(matches!(
+            k.teardown("seadog-x", Mode::Lxc),
+            Err(Error::Kento(_))
+        ));
+        // The instance is still present (teardown failed).
+        assert_eq!(k.list_instances().unwrap().len(), 1);
     }
 }
