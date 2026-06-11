@@ -1,6 +1,6 @@
 //! The root-privilege **bridge seam**.
 //!
-//! Root operations (`create`/`destroy` → PVE `qm`/`pct` via kento) cannot
+//! Root operations (`create`/`destroy` via kento) cannot
 //! run from this unprivileged binary. They are reached by shelling
 //! `sudo /usr/lib/seadog/seadog-priv <verb> ...` — but the *front-end*
 //! only ever calls [`elevate`], so the elevation primitive stays swappable

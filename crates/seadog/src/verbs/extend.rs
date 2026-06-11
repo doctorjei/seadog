@@ -26,8 +26,12 @@ pub fn run(ctx: &Ctx, env_id: &str, duration: std::time::Duration) -> Result<Val
         ));
     }
 
-    let add = duration.as_secs() as i64;
-    let new_deadline = env.ttl_deadline + add;
+    let add =
+        i64::try_from(duration.as_secs()).map_err(|_| anyhow!("duration is too large to add"))?;
+    let new_deadline = env
+        .ttl_deadline
+        .checked_add(add)
+        .ok_or_else(|| anyhow!("resulting deadline overflows"))?;
     store::set_ttl_deadline(ctx.conn, env_id, new_deadline)?;
 
     Ok(json!({

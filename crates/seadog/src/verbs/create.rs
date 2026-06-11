@@ -71,8 +71,14 @@ pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
         Some(s) => parse_secs(s)?,
         None => ctx.config.lifecycle.default_duration.as_secs() as i64,
     };
-    let ttl_deadline = ctx.now_unix + ttl_secs;
-    let soft_deadline = ctx.now_unix + dur_secs;
+    let ttl_deadline = ctx
+        .now_unix
+        .checked_add(ttl_secs)
+        .ok_or_else(|| anyhow!("ttl deadline overflows"))?;
+    let soft_deadline = ctx
+        .now_unix
+        .checked_add(dur_secs)
+        .ok_or_else(|| anyhow!("soft deadline overflows"))?;
 
     // 3. Cap check: count the owner's Active envs of this mode against the
     //    per-owner cap (with any config override). Reject BEFORE allocating
@@ -224,7 +230,7 @@ fn mode_cap(ctx: &Ctx, mode: Mode) -> u32 {
 /// Parse a humantime duration string into whole seconds (i64).
 fn parse_secs(s: &str) -> Result<i64> {
     let d = humantime::parse_duration(s).map_err(|e| anyhow!("invalid duration '{s}': {e}"))?;
-    Ok(d.as_secs() as i64)
+    i64::try_from(d.as_secs()).map_err(|_| anyhow!("duration '{s}' is too large"))
 }
 
 /// Mint a locally-administered unicast MAC (`x2:..` — the

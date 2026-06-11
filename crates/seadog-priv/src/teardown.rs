@@ -27,6 +27,7 @@ use serde_json::{json, Value};
 use seadog_core::config::Config;
 use seadog_core::kento::Kento;
 use seadog_core::store;
+use seadog_core::validate::validate_owner_name;
 
 use crate::parse_mode;
 use seadog_priv::sweep::open_db;
@@ -50,6 +51,11 @@ pub struct TeardownArgs {
 /// destroying. Idempotent when the instance is already gone.
 pub fn run(args: &TeardownArgs, kento: &dyn Kento, _config: &Config) -> Result<Value> {
     let mode = parse_mode(&args.mode)?;
+
+    // Re-validate the owner's shape against our own rules (don't trust the
+    // front-end). A malformed owner can't match a DB row anyway, but the
+    // helper validates every arg.
+    validate_owner_name(&args.owner).map_err(anyhow::Error::from)?;
 
     // (1) DB row must exist. The helper opens its OWN store (same env-driven
     //     path the reaper uses); it never trusts a relayed row.

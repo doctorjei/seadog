@@ -11,7 +11,7 @@ use super::Ctx;
 /// `created_at` falls within the last `window_secs`. A `None` window means
 /// "all history". Newest first.
 pub fn run(ctx: &Ctx, window_secs: Option<i64>) -> Result<Value> {
-    let cutoff = window_secs.map(|w| ctx.now_unix - w);
+    let cutoff = window_secs.map(|w| ctx.now_unix.saturating_sub(w));
 
     let mut envs = Vec::new();
     for st in [EnvStatus::Reaped, EnvStatus::Vanished] {

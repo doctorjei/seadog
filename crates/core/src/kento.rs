@@ -736,6 +736,7 @@ mod real {
         let vmid = obj.get("vmid").and_then(|v| {
             v.as_u64()
                 .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                .filter(|n| *n <= u32::MAX as u64)
                 .map(|n| n as u32)
         });
 

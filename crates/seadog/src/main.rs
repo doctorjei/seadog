@@ -107,6 +107,14 @@ enum Verb {
 }
 
 fn main() -> ExitCode {
+    // This front-end parses untrusted SSH input and must NEVER run as root
+    // (it shells to seadog-priv via sudo for any privileged op). Refuse a
+    // root euid outright — the inverse of seadog-priv's `ensure_root`.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("{{\"error\":\"seadog must not run as root\"}}");
+        return ExitCode::FAILURE;
+    }
+
     // Keep the SQLite WAL/SHM sidecars group-writable (shared `seadog`
     // group) so the root reaper and this front-end can both write the DB.
     // Mirrors seadog-priv; must run before the DB is opened.
@@ -212,7 +220,7 @@ fn dispatch(ctx: &Ctx, verb: Verb) -> anyhow::Result<serde_json::Value> {
 fn parse_duration_secs(s: &str) -> anyhow::Result<i64> {
     let d =
         humantime::parse_duration(s).map_err(|e| anyhow::anyhow!("invalid duration '{s}': {e}"))?;
-    Ok(d.as_secs() as i64)
+    i64::try_from(d.as_secs()).map_err(|_| anyhow::anyhow!("duration '{s}' is too large"))
 }
 
 /// Load the config (path from `$SEADOG_CONFIG`, else the default). A

@@ -51,6 +51,10 @@ fn init(conn: Connection) -> Result<Connection, Error> {
         )));
     }
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // Concurrent writers (front-end + root reaper, separate processes on WAL)
+    // should wait briefly for the write lock rather than fail immediately with
+    // SQLITE_BUSY. Per-connection; harmless on the in-memory test DB.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     migrate(&conn)?;
     Ok(conn)
 }
@@ -453,9 +457,12 @@ pub fn prune_terminal(
     retention_secs: i64,
 ) -> Result<usize, Error> {
     let cutoff = now_unix - retention_secs;
+    // Both deletes in one transaction so the notify_state cleanup and the env
+    // prune commit atomically (they emulate the dropped FK cascade).
+    let tx = conn.unchecked_transaction()?;
     // Replace the dropped FK cascade: clear notify_state for exactly the
     // terminal envs we're about to prune (env-keyed rows only).
-    conn.execute(
+    tx.execute(
         "DELETE FROM notify_state \
          WHERE guid IN ( \
              SELECT guid FROM envs \
@@ -463,11 +470,12 @@ pub fn prune_terminal(
          )",
         params![cutoff],
     )?;
-    let n = conn.execute(
+    let n = tx.execute(
         "DELETE FROM envs \
          WHERE status IN ('reaped', 'vanished') AND created_at < ?1",
         params![cutoff],
     )?;
+    tx.commit()?;
     Ok(n)
 }
 

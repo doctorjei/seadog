@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 use seadog_core::config::Config;
 use seadog_core::kento::{Kento, ProvisionSpec};
 use seadog_core::models::Mode;
-use seadog_core::validate::validate_guest_name;
+use seadog_core::validate::{validate_guest_name, validate_owner_name};
 
 use crate::owners::owner_key_bodies;
 use crate::parse_mode;
@@ -166,9 +166,7 @@ pub fn run(args: &ProvisionArgs, kento: &dyn Kento, config: &Config) -> Result<V
     if args.guid.trim().is_empty() {
         bail!("guid must not be empty");
     }
-    if args.owner.trim().is_empty() {
-        bail!("owner must not be empty");
-    }
+    validate_owner_name(&args.owner).map_err(|e| anyhow!(e))?;
     validate_image_ref(&args.image_ref, mode, config)?;
 
     // Privilege-boundary re-validation of the nesting request: the front-end
