@@ -19,6 +19,7 @@
 //! DB-open-and-wiring shell, so there is zero version-skew with the watch
 //! loop, which calls the exact same `core::reap::sweep`.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
@@ -36,12 +37,93 @@ use crate::watch::LockOutcome;
 /// Default DB path; overridable by `$SEADOG_DB` (tests).
 pub const DEFAULT_DB: &str = "/var/lib/seadog/seadog.db";
 
+/// The front-end's run-as user — the DB's intended owner. Matches
+/// `deploy/rpm/post.sh`'s `USER_NAME` (the install contract).
+const DB_OWNER_USER: &str = "testenv";
+/// The shared group on `/var/lib/seadog`. Matches `deploy/rpm/post.sh`'s
+/// `GROUP_NAME` (the setgid group the front-end belongs to).
+const DB_OWNER_GROUP: &str = "seadog";
+
 /// Resolve the DB path (`$SEADOG_DB` override, else the default) and open
 /// (or create) it. This is seadog-priv's first DB access — the deadlines
 /// and heartbeat live here.
+///
+/// After the open/migration (which may run as root — e.g. a manual `sweep`
+/// or the `watch` loop), [`normalize_db_perms`] restores `testenv:seadog`
+/// `0664` on the DB so the unprivileged front-end can always write it.
 pub fn open_db() -> Result<Connection> {
     let path = std::env::var("SEADOG_DB").unwrap_or_else(|_| DEFAULT_DB.to_string());
-    store::open(&path).map_err(|e| anyhow!("opening seadog DB {path}: {e}"))
+    let conn = store::open(&path).map_err(|e| anyhow!("opening seadog DB {path}: {e}"))?;
+    normalize_db_perms(&path);
+    Ok(conn)
+}
+
+/// Restore `testenv:seadog` ownership and mode `0664` on the DB file and its
+/// `-wal`/`-shm` sidecars after a root-invoked open/migration, so the
+/// unprivileged front-end (the `testenv` user, group `seadog`) can always
+/// write it.
+///
+/// This closes a footgun: a **manual root** DB-touching invocation (e.g. a
+/// 0.5→0.7 schema migration run by hand) leaves the DB `root:seadog 0644`,
+/// after which the front-end hits "readonly database" because group `seadog`
+/// only has read. The automated systemd sweeper avoids it (umask 0002 +
+/// setgid dir), but any root-run open re-trips it — so we re-assert the
+/// intended perms here regardless of caller. Root keeps access either way.
+///
+/// Purely best-effort and non-fatal: if `testenv`/`seadog` don't resolve
+/// (dev boxes, tests) we skip; a non-root caller EPERMs on the `chown` and
+/// that's fine. Every failure is debug-logged and ignored — never propagated.
+fn normalize_db_perms(path: &str) {
+    use std::ffi::CString;
+
+    // Resolve the target uid/gid by name; either missing ⇒ no-op (this is
+    // what makes it inert on dev boxes / in tests with no such accounts).
+    let user_c = match CString::new(DB_OWNER_USER) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let group_c = match CString::new(DB_OWNER_GROUP) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let pw = unsafe { libc::getpwnam(user_c.as_ptr()) };
+    if pw.is_null() {
+        tracing::debug!("normalize_db_perms: user '{DB_OWNER_USER}' not found, skipping");
+        return;
+    }
+    let gr = unsafe { libc::getgrnam(group_c.as_ptr()) };
+    if gr.is_null() {
+        tracing::debug!("normalize_db_perms: group '{DB_OWNER_GROUP}' not found, skipping");
+        return;
+    }
+    let uid = unsafe { (*pw).pw_uid };
+    let gid = unsafe { (*gr).gr_gid };
+
+    // The DB plus the WAL/SHM sidecars SQLite leaves alongside it.
+    for p in [
+        path.to_string(),
+        format!("{path}-wal"),
+        format!("{path}-shm"),
+    ] {
+        if !Path::new(&p).exists() {
+            continue;
+        }
+        let c_path = match CString::new(p.as_str()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // Best-effort chown; a non-root caller EPERMs here (expected/fine).
+        let rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+        if rc != 0 {
+            tracing::debug!(
+                "normalize_db_perms: chown {DB_OWNER_USER}:{DB_OWNER_GROUP} on {p} skipped: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        if let Err(e) = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o664)) {
+            tracing::debug!("normalize_db_perms: set mode 0664 on {p} skipped: {e}");
+        }
+    }
 }
 
 /// Run one sweep + prune over an already-open DB, returning the JSON the
@@ -208,6 +290,23 @@ mod tests {
         let dir = base.join(unique);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// `normalize_db_perms` is best-effort: against a real temp file run as a
+    /// non-root caller it must never panic/error — it silently no-ops because
+    /// either the `testenv`/`seadog` lookup fails or the `chown` EPERMs. We
+    /// assert only that it returns and the file survives (no ownership check —
+    /// the test box has no `testenv` user).
+    #[test]
+    fn normalize_db_perms_is_best_effort_noop() {
+        let dir = tempdir();
+        let db = dir.join("seadog.db");
+        std::fs::write(&db, b"not-really-a-db").unwrap();
+        let path = db.to_str().unwrap();
+
+        // Must return without panicking and leave the file intact.
+        normalize_db_perms(path);
+        assert!(db.exists());
     }
 
     #[test]
