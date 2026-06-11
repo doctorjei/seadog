@@ -9,31 +9,72 @@
 //!
 //! **Phase 2b status:** wired. [`elevate`] actually shells the helper and
 //! parses its JSON stdout; [`spawn_watcher`] fires the reaper detached.
-//! All exec targets are env-overridable so tests drive a fake `seadog-priv`
-//! with no real sudo (`$SEADOG_SUDO=""`).
 //!
-//! ## Exec target env knobs (defaults are the prod values)
-//! - `$SEADOG_SUDO` — sudo program, default `"sudo"`. **Empty ⇒ skip sudo**
-//!   (call the helper directly; how tests run unprivileged).
-//! - `$SEADOG_PRIV_BIN` — helper path, default `/usr/lib/seadog/seadog-priv`.
+//! ## Security: the exec target is NOT caller-overridable in production
+//!
+//! This binary is the unprivileged `testenv` login shell parsing untrusted
+//! `$SSH_ORIGINAL_COMMAND`. Whatever it spawns under `sudo` MUST be a fixed,
+//! compiled-in target — a caller who could steer `$SEADOG_SUDO` /
+//! `$SEADOG_PRIV_BIN` / `$SEADOG_SETSID` would otherwise choose what runs as
+//! root. So in production (default build):
+//! - the sudo / helper / setsid programs are the hardcoded
+//!   [`PROD_SUDO`] / [`PROD_PRIV_BIN`] / [`PROD_SETSID`] consts (absolute
+//!   paths, no env override),
+//! - every spawned [`Command`] is [`Command::env_clear`]ed and given a pinned
+//!   [`SAFE_PATH`] (mirrors `core::kento`'s harness; MUST include
+//!   `/usr/local/bin` — kento lives there). Crossing `sudo` (which is
+//!   configured `env_reset` + `secure_path` in `deploy/sudoers.d/seadog`)
+//!   already strips the env a second time before the helper sees it, so the
+//!   helper falls back to its own compiled defaults for `$SEADOG_CONFIG` /
+//!   `$SEADOG_DB` / `$SEADOG_AUTHKEYS` / `$SEADOG_WATCHER_LOCK` — the correct
+//!   production paths.
+//!
+//! ## Test bridge (`--features test-bridge`, OFF by default)
+//!
+//! The integration suite spawns the compiled `seadog` binary (it is a
+//! separate process, so a `#[cfg(test)]` gate cannot reach it) and injects a
+//! fake `seadog-priv` with `$SEADOG_SUDO=""` + `$SEADOG_PRIV_BIN=…`. The
+//! `test-bridge` feature re-enables those exec-target knobs and lets the
+//! spawned helper inherit the ambient env so the fake sees the test fixtures.
+//! It is OFF by default: a plain `cargo build --release` is hardened with no
+//! flag. `cargo test`/CI for this crate MUST pass `--features test-bridge`.
+//!
+//! ### Exec-target env knobs (test-bridge builds ONLY)
+//! - `$SEADOG_SUDO` — sudo program, default [`PROD_SUDO`]. **Empty ⇒ skip
+//!   sudo** (call the helper directly; how tests run unprivileged).
+//! - `$SEADOG_PRIV_BIN` — helper path, default [`PROD_PRIV_BIN`].
 //! - `$SEADOG_SETSID` — setsid program for the detached watcher, default
-//!   `"setsid"`. Empty ⇒ skip the setsid prefix.
+//!   [`PROD_SETSID`]. Empty ⇒ skip the setsid prefix.
 //! - `$SEADOG_WATCHER_LOCK` — flock path the watcher singleton-guards on,
-//!   default `/run/seadog/watcher.lock`. The front-end may pre-check it to
+//!   default [`DEFAULT_WATCHER_LOCK`]. The front-end may pre-check it to
 //!   avoid a needless spawn, but the authoritative guard is the helper's
 //!   own flock (Phase 3b).
 
 use std::fmt;
 use std::process::{Command, Stdio};
 
-/// Default helper path; overridable by `$SEADOG_PRIV_BIN`.
-const DEFAULT_PRIV_BIN: &str = "/usr/lib/seadog/seadog-priv";
-/// Default sudo program; overridable by `$SEADOG_SUDO` (empty ⇒ skip).
-const DEFAULT_SUDO: &str = "sudo";
-/// Default setsid program; overridable by `$SEADOG_SETSID` (empty ⇒ skip).
-const DEFAULT_SETSID: &str = "setsid";
-/// Default watcher flock path; overridable by `$SEADOG_WATCHER_LOCK`.
+/// Fixed helper path the front-end shells under sudo. Not env-overridable in
+/// production (the `test-bridge` feature lets `$SEADOG_PRIV_BIN` override it
+/// for the fake helper).
+const PROD_PRIV_BIN: &str = "/usr/lib/seadog/seadog-priv";
+/// Fixed, absolute sudo program. Absolute so it never resolves via an
+/// attacker-influenced PATH. Not env-overridable in production.
+const PROD_SUDO: &str = "/usr/bin/sudo";
+/// Fixed, absolute setsid program for the detached watcher. Not
+/// env-overridable in production.
+const PROD_SETSID: &str = "/usr/bin/setsid";
+/// Default watcher flock path; overridable by `$SEADOG_WATCHER_LOCK` only in
+/// `test-bridge` builds.
 const DEFAULT_WATCHER_LOCK: &str = "/run/seadog/watcher.lock";
+
+/// Pinned PATH for every spawned privileged Command (production path). Mirrors
+/// `core::kento::tests::SAFE_PATH`: a known-good, all-root-owned search path
+/// so neither `sudo` nor the helper is hijacked via the ambient environment.
+/// MUST include `/usr/local/bin` — `kento` (which the helper shells) lives
+/// there. (sudo re-resets the env across the boundary, but pinning here closes
+/// the window before sudo and covers the no-sudo watcher edge.)
+#[cfg(not(feature = "test-bridge"))]
+const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Arguments handed to the privileged helper for one elevated verb.
 ///
@@ -121,9 +162,53 @@ pub struct ElevateOutcome {
     pub result: serde_json::Value,
 }
 
-/// Read an env var, falling back to `default`.
+/// Read an env var, falling back to `default`. Only the `test-bridge` exec
+/// knobs use this; production paths are the compiled-in consts.
+#[cfg(feature = "test-bridge")]
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Resolve the (sudo, priv_bin) exec target.
+///
+/// Production: the fixed consts, never env-overridable. test-bridge: honor
+/// the `$SEADOG_SUDO` / `$SEADOG_PRIV_BIN` knobs so the suite injects a fake.
+#[cfg(not(feature = "test-bridge"))]
+fn resolve_exec_target() -> (String, String) {
+    (PROD_SUDO.to_string(), PROD_PRIV_BIN.to_string())
+}
+#[cfg(feature = "test-bridge")]
+fn resolve_exec_target() -> (String, String) {
+    (
+        env_or("SEADOG_SUDO", PROD_SUDO),
+        env_or("SEADOG_PRIV_BIN", PROD_PRIV_BIN),
+    )
+}
+
+/// Resolve the setsid program for the detached watcher. Production: fixed
+/// const. test-bridge: honor `$SEADOG_SETSID`.
+#[cfg(not(feature = "test-bridge"))]
+fn resolve_setsid() -> String {
+    PROD_SETSID.to_string()
+}
+#[cfg(feature = "test-bridge")]
+fn resolve_setsid() -> String {
+    env_or("SEADOG_SETSID", PROD_SETSID)
+}
+
+/// Apply the production privilege-boundary env hardening to a spawned
+/// `Command`: clear the inherited environment and pin a known-good PATH.
+///
+/// In `test-bridge` builds this is a NO-OP: the spawned (fake) helper must
+/// inherit the test's `$SEADOG_*` fixtures (DB / CONFIG / WATCHER_LOCK / …) to
+/// behave, and no real privilege boundary is crossed.
+#[cfg(not(feature = "test-bridge"))]
+fn harden_env(cmd: &mut Command) -> &mut Command {
+    cmd.env_clear().env("PATH", SAFE_PATH)
+}
+#[cfg(feature = "test-bridge")]
+fn harden_env(cmd: &mut Command) -> &mut Command {
+    cmd
 }
 
 /// Build the full argv for one helper verb:
@@ -145,10 +230,10 @@ fn build_argv_with(sudo: &str, priv_bin: &str, req: &ElevateArgs) -> Vec<String>
     argv
 }
 
-/// Build the helper argv, reading the sudo + helper-path env knobs.
+/// Build the helper argv. Production: fixed `/usr/bin/sudo` + fixed helper
+/// path. test-bridge: the `$SEADOG_SUDO` / `$SEADOG_PRIV_BIN` knobs.
 fn build_argv(req: &ElevateArgs) -> Vec<String> {
-    let sudo = env_or("SEADOG_SUDO", DEFAULT_SUDO);
-    let priv_bin = env_or("SEADOG_PRIV_BIN", DEFAULT_PRIV_BIN);
+    let (sudo, priv_bin) = resolve_exec_target();
     build_argv_with(&sudo, &priv_bin, req)
 }
 
@@ -167,7 +252,9 @@ pub fn elevate(req: &ElevateArgs) -> Result<ElevateOutcome, ElevateError> {
     // pushed first.
     let (program, rest) = argv.split_first().expect("argv has the helper program");
 
-    let output = Command::new(program)
+    let mut cmd = Command::new(program);
+    harden_env(&mut cmd);
+    let output = cmd
         .args(rest)
         .stdin(Stdio::null())
         .output()
@@ -210,9 +297,8 @@ pub fn elevate(req: &ElevateArgs) -> Result<ElevateOutcome, ElevateError> {
 /// "opportunistic reap" hook: an unprivileged front-end can't reap, so it
 /// just ensures the root watcher is alive whenever the system is in use.
 pub fn spawn_watcher() -> Result<(), ElevateError> {
-    let setsid = env_or("SEADOG_SETSID", DEFAULT_SETSID);
-    let sudo = env_or("SEADOG_SUDO", DEFAULT_SUDO);
-    let priv_bin = env_or("SEADOG_PRIV_BIN", DEFAULT_PRIV_BIN);
+    let setsid = resolve_setsid();
+    let (sudo, priv_bin) = resolve_exec_target();
 
     let mut argv: Vec<String> = Vec::new();
     if !setsid.is_empty() {
@@ -228,7 +314,9 @@ pub fn spawn_watcher() -> Result<(), ElevateError> {
 
     // Detached: no wait, stdio to null so the child doesn't hold our
     // streams. We do not call `.wait()` — the watcher outlives this verb.
-    match Command::new(program)
+    let mut cmd = Command::new(program);
+    harden_env(&mut cmd);
+    match cmd
         .args(rest)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -250,9 +338,20 @@ pub fn spawn_watcher() -> Result<(), ElevateError> {
 
 /// The flock path the watcher singleton-guards on (for an optional
 /// front-end pre-check; the helper's own flock is authoritative).
+///
+/// Production: the fixed default — the pre-check is only an optimization, and
+/// the authoritative guard is the helper's own flock. test-bridge: honor
+/// `$SEADOG_WATCHER_LOCK` so the suite can point it at a temp path.
 #[allow(dead_code)]
 pub fn watcher_lock_path() -> String {
-    env_or("SEADOG_WATCHER_LOCK", DEFAULT_WATCHER_LOCK)
+    #[cfg(not(feature = "test-bridge"))]
+    {
+        DEFAULT_WATCHER_LOCK.to_string()
+    }
+    #[cfg(feature = "test-bridge")]
+    {
+        env_or("SEADOG_WATCHER_LOCK", DEFAULT_WATCHER_LOCK)
+    }
 }
 
 #[cfg(test)]

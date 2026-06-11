@@ -51,8 +51,23 @@ jobs:
       - name: Clippy (seadog-core real-kento)
         run: cargo clippy -p seadog-core --features real-kento --all-targets -- -D warnings
 
-      - name: Test (workspace)
-        run: cargo test --workspace
+      # Lint the seadog `test-bridge` code path (the relaxed elevation seam).
+      # The default `--workspace` pass above lints the HARDENED (feature-off)
+      # path; this pins the test-injection path so it can't rot.
+      - name: Clippy (seadog test-bridge)
+        run: cargo clippy -p seadog --features test-bridge --all-targets -- -D warnings
+
+      # The seadog integration suite (crates/seadog/tests/verbs.rs) SPAWNS the
+      # compiled `CARGO_BIN_EXE_seadog` and injects a fake `seadog-priv` via the
+      # `$SEADOG_SUDO`/`$SEADOG_PRIV_BIN` exec knobs. Those knobs (and the
+      # spawned helper's env inheritance) exist ONLY under the seadog crate's
+      # `test-bridge` feature — OFF by default so the shipped binary is hardened.
+      # So the seadog crate's tests MUST be run with `--features test-bridge`,
+      # which also rebuilds the spawned bin as the test-injectable build.
+      - name: Test (seadog, test-bridge)
+        run: cargo test -p seadog --features test-bridge
+      - name: Test (rest of workspace)
+        run: cargo test --workspace --exclude seadog
 
       # The deployable artifact: static-musl release binaries.
       - name: Build release (static musl)

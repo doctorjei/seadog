@@ -12,6 +12,19 @@ description = "Unprivileged login-shell front-end for the seadog ephemeral test-
 name = "seadog"
 path = "src/main.rs"
 
+[features]
+# `test-bridge` relaxes the elevation seam (crates/seadog/src/elevate.rs) so
+# the integration suite can inject a fake `seadog-priv`: it re-enables the
+# `$SEADOG_SUDO` / `$SEADOG_PRIV_BIN` / `$SEADOG_SETSID` exec-target knobs and
+# lets the spawned helper inherit the ambient env (so the fake sees the
+# test's `$SEADOG_*` fixtures). OFF BY DEFAULT — a plain
+# `cargo build --release` produces the HARDENED binary (absolute `/usr/bin/sudo`,
+# fixed helper path, `env_clear()` + pinned PATH, no overridable exec target)
+# with no special flag. CI/`cargo test` for this crate MUST pass
+# `--features test-bridge` so the spawned `CARGO_BIN_EXE_seadog` is the
+# test-injectable build. NEVER ship a binary built with this feature.
+test-bridge = []
+
 [dependencies]
 seadog-core = { path = "../core" }
 rusqlite = { workspace = true }
