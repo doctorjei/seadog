@@ -180,7 +180,12 @@ pub struct LoopSummary {
 /// Self-extinguish: after each tick, if the active-env count is zero we
 /// release (return) immediately. On quorum loss we do **not** tight-spin —
 /// we record it and continue on the normal cadence (the bound still applies
-/// in tests). The flock is released when the caller drops the
+/// in tests). A **transient tick error** (e.g. `SQLITE_BUSY`, a flaky
+/// `kento list`) is likewise log-and-continue: it is logged to journald
+/// (escalating after consecutive failures) and the loop sleeps the cadence
+/// and retries, rather than exiting and leaving only the 60-min systemd
+/// backstop. Process exit is reserved for the idle-exit and the
+/// `MaxIterations` bound. The flock is released when the caller drops the
 /// [`WatcherLock`].
 pub fn run_loop<C, S>(
     conn: &Connection,
@@ -197,6 +202,10 @@ where
     let mut ticks = 0u32;
     let mut reaped = 0u32;
     let mut quorum_lost = None;
+    // Count consecutive tick errors so the log escalates if a transient
+    // fault becomes persistent — but a tick error NEVER exits the loop (the
+    // 60-min systemd sweep is the only backstop after this process dies).
+    let mut consecutive_errors = 0u32;
 
     loop {
         if let Some(max) = max_iterations {
@@ -211,7 +220,38 @@ where
         }
 
         let now = now_fn();
-        let result = tick(conn, kento, config, now)?;
+        // A transient tick error (e.g. SQLITE_BUSY, a flaky `kento list`)
+        // must NOT kill the fast reaper while envs are still active. Log it
+        // to journald and continue to the next cadence sleep — mirroring how
+        // quorum loss is handled (recorded, loop continues). Process exit is
+        // reserved for the idle-exit and the MaxIterations bound only.
+        let result = match tick(conn, kento, config, now) {
+            Ok(r) => {
+                consecutive_errors = 0;
+                r
+            }
+            Err(e) => {
+                consecutive_errors += 1;
+                ticks += 1;
+                if consecutive_errors >= 3 {
+                    tracing::error!(
+                        "watch tick failed ({consecutive_errors} consecutive): {e:#}; \
+                         continuing on the fast cadence"
+                    );
+                } else {
+                    tracing::warn!("watch tick failed (transient): {e:#}; continuing");
+                }
+                // Continue on the normal cadence rather than exiting. A tick
+                // error tells us nothing about idleness, so we can't trust an
+                // active-env count here — keep watching until a clean tick
+                // observes idle or the bound stops us.
+                let fast = config.cadence.fast;
+                if !fast.is_zero() {
+                    sleep_fn(fast);
+                }
+                continue;
+            }
+        };
         ticks += 1;
         reaped += result.reaped;
         if result.quorum_lost.is_some() {
@@ -430,6 +470,44 @@ mod tests {
         assert_eq!(summary.stop, StopReason::MaxIterations);
         // One sleep after each of the two non-terminal ticks.
         assert_eq!(sleeps.get(), 2);
+    }
+
+    #[test]
+    fn tick_error_does_not_exit_loop_and_recovers() {
+        // A transient list failure makes the FIRST tick error. The loop must
+        // NOT exit on it: it logs, sleeps the cadence, and continues. We clear
+        // the failure inside the sleep hook so the next tick succeeds — and an
+        // active env keeps the loop alive long enough to prove recovery (the
+        // bound stops it, not a tick error).
+        let cfg = config(); // non-zero fast cadence so the sleep hook runs
+        let conn = store::open_in_memory().unwrap();
+        let now = 1_000_000i64;
+        // Active, not-yet-expired env: never idle, never reaped within bound.
+        insert_active(&conn, "g1", 10010, now - 3600, now + 10_000);
+        let k = FakeKento::new();
+        k.set_instances(vec![signals_for(&conn, "g1", 10010)]);
+        // First tick errors; recover after the first sleep.
+        k.fail_list("kento list: transient backend error");
+
+        let cleared = Cell::new(false);
+        let summary = run_loop(&conn, &k, &cfg, || now, Some(3), |_d| {
+            // Clear the failure after the first (erroring) tick's sleep so the
+            // remaining ticks succeed.
+            if !cleared.get() {
+                k.clear_list_fail();
+                cleared.set(true);
+            }
+        })
+        .unwrap();
+
+        // The loop survived the erroring tick and ran to the bound (3 ticks:
+        // one error + two clean), never exiting on the error.
+        assert_eq!(summary.stop, StopReason::MaxIterations);
+        assert_eq!(summary.ticks, 3, "errored tick counts and does not exit");
+        // The recovered ticks observed the not-yet-expired env (no reaps).
+        assert_eq!(summary.reaped, 0);
+        // Heartbeat written by the clean ticks (the erroring tick wrote none).
+        assert_eq!(store::read_heartbeat(&conn).unwrap(), Some(now));
     }
 
     /// A unique temp dir under the system tempdir (no external deps).

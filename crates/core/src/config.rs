@@ -190,7 +190,8 @@ pub struct Lifecycle {
     /// Warning window before the hard kill (warn at ttl - grace).
     #[serde(with = "humantime_serde", default = "mins_10")]
     pub grace: Duration,
-    /// Max reaps per sweep; remainder carried to the next tick.
+    /// Max reaps per sweep; remainder carried to the next tick. `0` =
+    /// unlimited (no throttle).
     #[serde(default = "herd_cap_default")]
     pub herd_cap: u32,
 }

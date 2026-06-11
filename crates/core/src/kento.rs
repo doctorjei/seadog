@@ -161,6 +161,89 @@ pub struct ProvisionOutcome {
     pub vmid: Option<u32>,
 }
 
+// --- Pure argv builders (ALWAYS compiled, NOT behind `real-kento`) ---
+//
+// The shelling-out `RealKento` spawn path (gated behind `real-kento`) calls
+// these to assemble its argv, but the builders themselves are pure (no exec,
+// no feature gate) so the EXACT emitted argv is type-checked and unit-testable
+// in the default build — the spawn path stays the ONLY feature-gated piece.
+
+/// Build the argv for `kento <mode> create …` from a [`ProvisionSpec`].
+///
+/// Single source of truth for the create argv: the `real-kento` spawn path
+/// calls this and runs the result verbatim. Ordering, the optional
+/// `--ssh-key …` block (omitted when no key file), the VM-only `--mac` block,
+/// the unconditional-on-mode `--allow-nesting` flag, and the trailing image
+/// positional are all fixed here.
+pub fn provision_argv(spec: &ProvisionSpec) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
+        spec.mode.as_str().to_string(),
+        "create".to_string(),
+        "--name".to_string(),
+        spec.name.clone(),
+        "--network".to_string(),
+        format!("bridge={}", spec.bridge),
+        "--ip".to_string(),
+        format!("{}/{}", spec.ip, spec.prefix),
+        "--gateway".to_string(),
+        spec.gateway.clone(),
+        "--ssh-host-keys".to_string(),
+        "--start".to_string(),
+        "--env".to_string(),
+        format!("SEADOG_GUID={}", spec.guid),
+        "--env".to_string(),
+        format!("SEADOG_OWNER={}", spec.owner),
+    ];
+    // Inject the OWNER's pubkey(s) so they can SSH into their env.
+    // `--config-mode auto` lets kento pick injection (lxc) vs cloud-init (vm).
+    // Omitted entirely when no key was materialized (fail-open).
+    if let Some(key_file) = &spec.ssh_key_file {
+        argv.push("--ssh-key".to_string());
+        argv.push(key_file.to_string_lossy().into_owned());
+        argv.push("--ssh-key-user".to_string());
+        argv.push(spec.ssh_key_user.clone());
+        argv.push("--config-mode".to_string());
+        argv.push("auto".to_string());
+    }
+    // VM-only MAC: kento accepts --mac for VM modes only (it rejects it for
+    // LXC) and likewise reports a `mac` from inspect for VMs only.
+    if spec.mode == Mode::Vm {
+        argv.push("--mac".to_string());
+        argv.push(spec.mac.clone());
+    }
+    // Nesting: push `--allow-nesting` UNCONDITIONALLY on mode (unlike the
+    // VM-only `--mac` block) — it is mode-agnostic. Omitted when false so
+    // kento's own default applies.
+    if spec.allow_nesting {
+        argv.push("--allow-nesting".to_string());
+    }
+    // The image ref is the final positional argument.
+    argv.push(spec.image_ref.clone());
+    argv
+}
+
+/// Build the argv for `kento <mode> destroy -f <name>`.
+///
+/// `kento` destroys BY INSTANCE NAME (not vmid); `-f` forces a running
+/// instance. `mode` selects the `lxc`/`vm` subcommand.
+pub fn teardown_argv(name: &str, mode: Mode) -> Vec<String> {
+    vec![
+        mode.as_str().to_string(),
+        "destroy".to_string(),
+        "-f".to_string(),
+        name.to_string(),
+    ]
+}
+
+/// Build the argv for `kento inspect <name> --json`.
+pub fn inspect_argv(name: &str) -> Vec<String> {
+    vec![
+        "inspect".to_string(),
+        name.to_string(),
+        "--json".to_string(),
+    ]
+}
+
 /// In-memory [`Kento`] for tests. Always compiled (not `#[cfg(test)]`) so
 /// later integration tests in sibling crates can drive it too.
 ///
@@ -188,6 +271,16 @@ struct FakeState {
     quorum_lost: Option<String>,
     /// Optional per-name teardown failures (non-quorum), to test errors.
     teardown_fail: HashMap<String, String>,
+    /// When set, `provision` returns this non-quorum [`Error::Kento`] message
+    /// (e.g. the image-not-found / "kento does NOT auto-pull" class).
+    /// Symmetric to `teardown_fail`; the quorum flag takes precedence (it is
+    /// the global condition checked first).
+    provision_fail: Option<String>,
+    /// When set, `list_instances` returns this non-quorum [`Error::Kento`]
+    /// message (a flaky `kento list`), to exercise the transient-failure path
+    /// (e.g. the watch loop's log-and-continue). The quorum flag takes
+    /// precedence (the global condition is checked first).
+    list_fail: Option<String>,
 }
 
 impl FakeKento {
@@ -216,6 +309,33 @@ impl FakeKento {
             .insert(name.into(), msg.into());
     }
 
+    /// Make `provision(_)` fail with a non-quorum [`Error::Kento`] carrying
+    /// `msg` — the symmetric counterpart to [`FakeKento::fail_teardown`]. Use
+    /// it to exercise the provision-failure path (e.g. the image-not-found /
+    /// "kento does NOT auto-pull" class) without a real host. A primed
+    /// quorum-loss still takes precedence (it is the global condition checked
+    /// first), so [`FakeKento::set_quorum_lost`] surfaces on `provision` too.
+    pub fn fail_provision(&self, msg: impl Into<String>) {
+        self.inner.lock().unwrap().provision_fail = Some(msg.into());
+    }
+
+    /// Make `list_instances()` fail with a non-quorum [`Error::Kento`]
+    /// carrying `msg` (a flaky `kento list`) — the symmetric counterpart to
+    /// [`FakeKento::fail_teardown`] / [`FakeKento::fail_provision`]. Use it to
+    /// exercise the transient list-failure path (e.g. the watch loop's
+    /// log-and-continue) without a real host. A primed quorum-loss still takes
+    /// precedence (it is the global condition checked first).
+    pub fn fail_list(&self, msg: impl Into<String>) {
+        self.inner.lock().unwrap().list_fail = Some(msg.into());
+    }
+
+    /// Clear a primed [`FakeKento::fail_list`] so a subsequent
+    /// `list_instances()` succeeds — lets a test drive an error-then-recover
+    /// sequence.
+    pub fn clear_list_fail(&self) {
+        self.inner.lock().unwrap().list_fail = None;
+    }
+
     /// The teardown calls recorded so far, in order, as `(name, mode)`.
     pub fn teardowns(&self) -> Vec<(String, Mode)> {
         self.inner.lock().unwrap().teardowns.clone()
@@ -239,6 +359,12 @@ impl Kento for FakeKento {
         let st = self.inner.lock().unwrap();
         if let Some(msg) = &st.quorum_lost {
             return Err(Error::QuorumLost(msg.clone()));
+        }
+        // Non-quorum list failure hook (a flaky `kento list`). Checked AFTER
+        // quorum so the global condition still wins; symmetric to
+        // `teardown_fail` / `provision_fail`.
+        if let Some(msg) = &st.list_fail {
+            return Err(Error::Kento(msg.clone()));
         }
         // kento only knows kento instances — return the set list as-is, no
         // vmid-range filter.
@@ -264,6 +390,12 @@ impl Kento for FakeKento {
         let mut st = self.inner.lock().unwrap();
         if let Some(msg) = &st.quorum_lost {
             return Err(Error::QuorumLost(msg.clone()));
+        }
+        // Non-quorum provision failure hook (e.g. image-not-found / kento
+        // does NOT auto-pull). Checked AFTER quorum so the global condition
+        // still wins; symmetric to `teardown_fail`.
+        if let Some(msg) = &st.provision_fail {
+            return Err(Error::Kento(msg.clone()));
         }
         // kento reports the realized MAC for VM modes ONLY: a VM keeps the
         // passed `--mac`; an LXC has no MAC at all (kento writes the
@@ -503,7 +635,9 @@ mod real {
                 // pmxcfs/cluster condition, not a per-instance fault, so
                 // continuing would be wrong — it propagates and aborts the
                 // sweep just like a failing `list`.
-                let json = match self.run(&["inspect", &name, "--json"]) {
+                let inspect = inspect_argv(&name);
+                let inspect: Vec<&str> = inspect.iter().map(String::as_str).collect();
+                let json = match self.run(&inspect) {
                     Ok(json) => json,
                     // `classify_per_instance_error` is the single point that
                     // decides propagate (QuorumLost) vs skip (everything
@@ -540,9 +674,11 @@ mod real {
             // `kento` destroys BY INSTANCE NAME (not vmid), so its overlay
             // state is cleaned alongside the backend guest. `-f` forces a
             // running instance. The name is the one teardown read from the
-            // live `kento list`.
-            let mode = mode.as_str();
-            self.run(&[mode, "destroy", "-f", name]).map(|_| ())
+            // live `kento list`. The argv is built by the pure (always-
+            // compiled) `teardown_argv` so the spawn path runs it verbatim.
+            let argv = teardown_argv(name, mode);
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            self.run(&argv).map(|_| ())
         }
 
         fn provision(&self, spec: &ProvisionSpec) -> Result<ProvisionOutcome, Error> {
@@ -556,70 +692,23 @@ mod real {
             // rejects it for LXC). Then we read the realized signals back via
             // `kento inspect --json`. Not exercised by tests (no real host) but
             // MUST compile under `--features real-kento`.
-            let mode = spec.mode.as_str();
-            let network = format!("bridge={}", spec.bridge);
-            let ip_cidr = format!("{}/{}", spec.ip, spec.prefix);
-            let guid_env = format!("SEADOG_GUID={}", spec.guid);
-            let owner_env = format!("SEADOG_OWNER={}", spec.owner);
-
-            let mut argv: Vec<&str> = vec![
-                mode,
-                "create",
-                "--name",
-                &spec.name,
-                "--network",
-                &network,
-                "--ip",
-                &ip_cidr,
-                "--gateway",
-                &spec.gateway,
-                "--ssh-host-keys",
-                "--start",
-                "--env",
-                &guid_env,
-                "--env",
-                &owner_env,
-            ];
-            // Inject the OWNER's pubkey(s) so they can SSH into their env.
-            // `--config-mode auto` lets kento pick injection (lxc) vs
-            // cloud-init (vm). Omitted entirely when no key was materialized
-            // (fail-open: the create still proceeds).
-            let ssh_key_file = spec
-                .ssh_key_file
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned());
-            if let Some(key_file) = &ssh_key_file {
-                argv.push("--ssh-key");
-                argv.push(key_file);
-                argv.push("--ssh-key-user");
-                argv.push(&spec.ssh_key_user);
-                argv.push("--config-mode");
-                argv.push("auto");
-            }
-            // VM-only MAC: kento accepts --mac for VM modes only (it rejects
-            // it for LXC) and likewise reports a `mac` from inspect for VMs
-            // only — an LXC has no MAC, so the outcome MAC is None there.
-            if spec.mode == Mode::Vm {
-                argv.push("--mac");
-                argv.push(&spec.mac);
-            }
-            // Nesting: push `--allow-nesting` UNCONDITIONALLY on mode (unlike
-            // the VM-only `--mac` block) — it is mode-agnostic (VM→VM nesting /
-            // nested virt, container→container nesting). The helper already
-            // re-validated `allow_nesting` against the allowlist; when false we
-            // omit it and kento's own default applies.
-            if spec.allow_nesting {
-                argv.push("--allow-nesting");
-            }
-            // The image ref is the final positional argument.
-            argv.push(&spec.image_ref);
+            //
+            // The create argv is built by the pure (always-compiled)
+            // `provision_argv` so the spawn path runs it verbatim — the exact
+            // ordering, the VM-only `--mac` block, the optional `--ssh-key`
+            // block, and the `--allow-nesting` flag all live there.
+            let argv = provision_argv(spec);
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
             self.run(&argv)?;
 
             // Read the realized signals back. kento reports the MAC for VM
             // modes only (absent ⇒ None for an LXC), the host-key fps it
             // generated, and the vmid on PVE backends — exactly the fields the
-            // front-end records.
-            let json = self.run(&["inspect", &spec.name, "--json"])?;
+            // front-end records. The inspect argv is likewise the pure
+            // `inspect_argv`.
+            let inspect = inspect_argv(&spec.name);
+            let inspect: Vec<&str> = inspect.iter().map(String::as_str).collect();
+            let json = self.run(&inspect)?;
             let signals = parse_kento_inspect(&json)
                 .map_err(|e| Error::Kento(format!("parsing inspect {}: {e}", spec.name)))?;
             Ok(ProvisionOutcome {
@@ -1234,5 +1323,255 @@ mod tests {
         ));
         // The instance is still present (teardown failed).
         assert_eq!(k.list_instances().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fake_provision_failure_hook() {
+        // The symmetric counterpart to `fake_teardown_failure_hook`: a primed
+        // `fail_provision` makes `provision` return Error::Kento (the
+        // image-not-found / "kento does NOT auto-pull" class) and records NO
+        // provision / realizes NO instance.
+        let k = FakeKento::new();
+        k.fail_provision("image not found: kento does not auto-pull");
+        let spec = sample_spec(Mode::Lxc);
+        assert!(matches!(k.provision(&spec), Err(Error::Kento(_))));
+        // Nothing was provisioned or realized.
+        assert!(k.provisions().is_empty());
+        assert!(k.list_instances().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fake_provision_surfaces_quorum_loss() {
+        // A primed quorum-loss surfaces on `provision` too (it is the global
+        // condition, checked before the non-quorum failure hook), and as
+        // QuorumLost — NOT mis-mapped to Error::Kento.
+        let k = FakeKento::new();
+        k.set_quorum_lost("no quorum");
+        let spec = sample_spec(Mode::Lxc);
+        assert!(matches!(k.provision(&spec), Err(Error::QuorumLost(_))));
+        assert!(k.provisions().is_empty());
+    }
+}
+
+// --- argv-builder regression guard ---
+//
+// REGRESSION GUARD ONLY. These tests pin the EXACT argv seadog emits TODAY,
+// sourced directly from the always-compiled `provision_argv`/`teardown_argv`/
+// `inspect_argv` builders (NOT from any doc comment — comments in this repo
+// have drifted before, notably on `--mac` and the `pve`/`pve-lxc` mode
+// strings). They do NOT verify the contract against real kento (e.g. 1.5.1):
+// that the flags/positions seadog emits are the ones kento actually accepts is
+// a SEPARATE validation against kento's own `--help`/source. Nothing here
+// asserts or implies the argv "matches kento" or is "verified against kento" —
+// it pins only what seadog emits, so an unintended change to the emitted argv
+// trips a test instead of silently shipping.
+//
+// Always compiled (no `real-kento` gate): the builders are pure and gate-free,
+// so this guard runs in the default build even though the spawn path that
+// consumes them is feature-gated.
+#[cfg(test)]
+mod argv_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn spec(mode: Mode) -> ProvisionSpec {
+        ProvisionSpec {
+            mode,
+            image_ref: "registry.example.com/loom:1.0".into(),
+            name: "seadog-alice-proj-ab12".into(),
+            mac: "aa:bb:cc:dd:ee:ff".into(),
+            ip: "192.168.99.200".into(),
+            prefix: 24,
+            gateway: "192.168.99.1".into(),
+            bridge: "vmbr0".into(),
+            guid: "guid-abc".into(),
+            owner: "alice".into(),
+            ssh_key_file: None,
+            ssh_key_user: "root".into(),
+            allow_nesting: false,
+        }
+    }
+
+    #[test]
+    fn provision_argv_lxc_no_key_no_nesting() {
+        // LXC, no ssh key, no nesting: NO `--mac` (VM-only), NO `--ssh-key`
+        // block, NO `--allow-nesting`. Image ref is the trailing positional.
+        let argv = provision_argv(&spec(Mode::Lxc));
+        assert_eq!(
+            argv,
+            vec![
+                "lxc",
+                "create",
+                "--name",
+                "seadog-alice-proj-ab12",
+                "--network",
+                "bridge=vmbr0",
+                "--ip",
+                "192.168.99.200/24",
+                "--gateway",
+                "192.168.99.1",
+                "--ssh-host-keys",
+                "--start",
+                "--env",
+                "SEADOG_GUID=guid-abc",
+                "--env",
+                "SEADOG_OWNER=alice",
+                "registry.example.com/loom:1.0",
+            ]
+        );
+    }
+
+    #[test]
+    fn provision_argv_vm_no_key_no_nesting() {
+        // VM, no ssh key, no nesting: same as LXC but with the VM-only `--mac`
+        // block before the image positional.
+        let argv = provision_argv(&spec(Mode::Vm));
+        assert_eq!(
+            argv,
+            vec![
+                "vm",
+                "create",
+                "--name",
+                "seadog-alice-proj-ab12",
+                "--network",
+                "bridge=vmbr0",
+                "--ip",
+                "192.168.99.200/24",
+                "--gateway",
+                "192.168.99.1",
+                "--ssh-host-keys",
+                "--start",
+                "--env",
+                "SEADOG_GUID=guid-abc",
+                "--env",
+                "SEADOG_OWNER=alice",
+                "--mac",
+                "aa:bb:cc:dd:ee:ff",
+                "registry.example.com/loom:1.0",
+            ]
+        );
+    }
+
+    #[test]
+    fn provision_argv_lxc_with_ssh_key() {
+        // LXC with an ssh key file: the `--ssh-key <file> --ssh-key-user <user>
+        // --config-mode auto` block is inserted (after the envs, before the
+        // image positional), still NO `--mac` (LXC).
+        let mut s = spec(Mode::Lxc);
+        s.ssh_key_file = Some(PathBuf::from("/run/seadog/ownerkey.tmp"));
+        let argv = provision_argv(&s);
+        assert_eq!(
+            argv,
+            vec![
+                "lxc",
+                "create",
+                "--name",
+                "seadog-alice-proj-ab12",
+                "--network",
+                "bridge=vmbr0",
+                "--ip",
+                "192.168.99.200/24",
+                "--gateway",
+                "192.168.99.1",
+                "--ssh-host-keys",
+                "--start",
+                "--env",
+                "SEADOG_GUID=guid-abc",
+                "--env",
+                "SEADOG_OWNER=alice",
+                "--ssh-key",
+                "/run/seadog/ownerkey.tmp",
+                "--ssh-key-user",
+                "root",
+                "--config-mode",
+                "auto",
+                "registry.example.com/loom:1.0",
+            ]
+        );
+    }
+
+    #[test]
+    fn provision_argv_vm_with_ssh_key_and_nesting() {
+        // VM with both an ssh key and nesting: the `--ssh-key` block, then the
+        // VM-only `--mac` block, then `--allow-nesting`, then the image
+        // positional — pinning the full ordered interaction of all three.
+        let mut s = spec(Mode::Vm);
+        s.ssh_key_file = Some(PathBuf::from("/run/seadog/ownerkey.tmp"));
+        s.allow_nesting = true;
+        let argv = provision_argv(&s);
+        assert_eq!(
+            argv,
+            vec![
+                "vm",
+                "create",
+                "--name",
+                "seadog-alice-proj-ab12",
+                "--network",
+                "bridge=vmbr0",
+                "--ip",
+                "192.168.99.200/24",
+                "--gateway",
+                "192.168.99.1",
+                "--ssh-host-keys",
+                "--start",
+                "--env",
+                "SEADOG_GUID=guid-abc",
+                "--env",
+                "SEADOG_OWNER=alice",
+                "--ssh-key",
+                "/run/seadog/ownerkey.tmp",
+                "--ssh-key-user",
+                "root",
+                "--config-mode",
+                "auto",
+                "--mac",
+                "aa:bb:cc:dd:ee:ff",
+                "--allow-nesting",
+                "registry.example.com/loom:1.0",
+            ]
+        );
+    }
+
+    #[test]
+    fn provision_argv_lxc_with_nesting_has_no_mac() {
+        // LXC with nesting: `--allow-nesting` is pushed (mode-agnostic) but
+        // still NO `--mac` (the VM-only block) — guards the two flags don't
+        // get conflated.
+        let mut s = spec(Mode::Lxc);
+        s.allow_nesting = true;
+        let argv = provision_argv(&s);
+        assert!(
+            argv.iter().any(|a| a == "--allow-nesting"),
+            "lxc nesting emits --allow-nesting"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--mac"),
+            "lxc never emits --mac"
+        );
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("registry.example.com/loom:1.0"),
+            "image ref stays the trailing positional"
+        );
+    }
+
+    #[test]
+    fn teardown_argv_lxc_and_vm() {
+        assert_eq!(
+            teardown_argv("seadog-alice-proj-ab12", Mode::Lxc),
+            vec!["lxc", "destroy", "-f", "seadog-alice-proj-ab12"]
+        );
+        assert_eq!(
+            teardown_argv("seadog-bob-proj-cd34", Mode::Vm),
+            vec!["vm", "destroy", "-f", "seadog-bob-proj-cd34"]
+        );
+    }
+
+    #[test]
+    fn inspect_argv_pins_json_form() {
+        assert_eq!(
+            inspect_argv("seadog-alice-proj-ab12"),
+            vec!["inspect", "seadog-alice-proj-ab12", "--json"]
+        );
     }
 }

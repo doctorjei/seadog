@@ -506,4 +506,41 @@ images:
         assert!(run(&a, &k, &cfg).is_err());
         assert!(k.provisions().is_empty());
     }
+
+    #[test]
+    fn provision_failure_from_kento_propagates_as_err() {
+        // The image-not-found / "kento does NOT auto-pull" class: all args are
+        // valid (re-validation passes, so the provision IS attempted), but
+        // kento itself fails the create. `run` must propagate the error — no
+        // panic — rather than report `ok: true`. This exercises the
+        // provision-failure path through real `run` code, not just FakeKento.
+        let _env = AuthkeysEnv::new();
+        let cfg = config();
+        let k = FakeKento::new();
+        k.fail_provision("image not found in root podman store (kento does not auto-pull)");
+        let err = run(&args(), &k, &cfg).unwrap_err();
+        // The kento failure message surfaces in the error chain.
+        assert!(
+            err.to_string().contains("image not found"),
+            "kento provision error should propagate, got: {err}"
+        );
+        // The provision WAS attempted (args were valid) but failed.
+        assert_eq!(k.provisions().len(), 1);
+    }
+
+    #[test]
+    fn provision_quorum_loss_propagates() {
+        // A quorum-loss on provision must propagate as an error (not be
+        // swallowed or mis-mapped) so the caller stops cleanly. Args are valid,
+        // so the provision is attempted and the global condition surfaces.
+        let _env = AuthkeysEnv::new();
+        let cfg = config();
+        let k = FakeKento::new();
+        k.set_quorum_lost("no quorum (pmxcfs read-only)");
+        let err = run(&args(), &k, &cfg).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("quorum"),
+            "quorum-loss should propagate, got: {err}"
+        );
+    }
 }

@@ -287,8 +287,9 @@ fn handle_reap_candidate(
     }
 
     // Past deadline → eligible. Herd cap: cap reaps per sweep, carry the
-    // remainder to the next tick (logged below via OverdueUnreaped).
-    if outcome.reaped >= herd_cap {
+    // remainder to the next tick (logged below via OverdueUnreaped). A
+    // `herd_cap` of 0 means UNLIMITED (no throttle) — never strand reaps.
+    if herd_cap != 0 && outcome.reaped >= herd_cap {
         outcome.deferred += 1;
         route(
             conn,
@@ -811,6 +812,58 @@ images:
         );
         // Deferred-but-still-live rows must NOT be counted vanished.
         assert_eq!(out.vanished, 0);
+    }
+
+    #[test]
+    fn herd_cap_zero_means_unlimited_reaps_all() {
+        // herd_cap = 0 is UNLIMITED (no throttle): with multiple eligible
+        // envs, ALL are reaped — none stranded/deferred forever.
+        let yaml = r#"
+lifecycle:
+  herd_cap: 0
+images:
+  loom:
+    ref: "r/loom:1"
+    modes: [vm]
+"#;
+        let c = Config::from_yaml_str(yaml).unwrap();
+        let conn = store::open_in_memory().unwrap();
+        let now = 1_000_000i64;
+        let mut instances = Vec::new();
+        for i in 0..5u32 {
+            let guid = format!("g{i}");
+            let env = Env {
+                guid: guid.clone(),
+                vmid: None,
+                mode: Mode::Vm,
+                owner: "alice".into(),
+                image: "loom".into(),
+                name: format!("seadog-alice-p-{guid}"),
+                ip: format!("192.168.99.{}", 200 + i),
+                mac: String::new(),
+                ssh_host_key_fps: Vec::new(),
+                created_at: now - 3600,
+                ttl_deadline: now - 100,
+                soft_deadline: now - 700,
+                status: EnvStatus::Active,
+            };
+            store::insert_env(&conn, &env).unwrap();
+            instances.push(signals_for(&conn, &guid));
+        }
+        let k = FakeKento::new();
+        k.set_instances(instances);
+
+        let out = sweep(&k, &conn, &c, now).unwrap();
+        assert_eq!(out.reaped, 5, "herd_cap 0 = unlimited: all eligible reaped");
+        assert_eq!(out.deferred, 0, "nothing stranded under unlimited cap");
+        assert_eq!(k.teardowns().len(), 5);
+        // No Active rows remain — none stranded.
+        assert_eq!(
+            store::list_by_status(&conn, EnvStatus::Active)
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[test]
