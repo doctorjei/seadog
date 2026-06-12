@@ -524,8 +524,16 @@ images:
             err.to_string().contains("image not found"),
             "kento provision error should propagate, got: {err}"
         );
-        // The provision WAS attempted (args were valid) but failed.
-        assert_eq!(k.provisions().len(), 1);
+        // A failed provision realizes no instance: FakeKento records only
+        // SUCCESSFUL provisions (the provision_fail hook returns before the
+        // record, symmetric to its teardown_fail contract). That run() reached
+        // kento at all is already proven above — the "image not found" text can
+        // only originate from that hook inside FakeKento::provision, which run()
+        // reaches only after re-validation passes.
+        assert!(
+            k.provisions().is_empty(),
+            "a failed provision must leave no recorded instance"
+        );
     }
 
     #[test]
