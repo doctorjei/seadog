@@ -53,13 +53,17 @@ fail() {
   FAIL=$((FAIL + 1))
 }
 
-# --- 1. Build the binaries (helper needs --features real-kento) ---
+# --- 1. Build the binaries (helper needs real-kento; front-end needs
+#        test-bridge so it honors the $SEADOG_SUDO/$SEADOG_PRIV_BIN/$SEADOG_SETSID
+#        exec-target knobs this script sets — a plain build hardcodes the prod
+#        /usr/bin/sudo + helper path (elevate.rs) and ignores them, so create
+#        would elevate to the wrong (real) helper and fail) ---
 build() {
   printf '== building binaries ==\n'
   # shellcheck source=/dev/null
   . "$HOME/.cargo/env"
   ( cd "$REPO_DIR" && cargo build --features real-kento -p seadog-priv )
-  ( cd "$REPO_DIR" && cargo build -p seadog )
+  ( cd "$REPO_DIR" && cargo build --features test-bridge -p seadog )
 }
 
 # --- 2. Sandbox: temp config/db/lock/state + fake kento on PATH ---
