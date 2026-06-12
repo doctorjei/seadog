@@ -358,14 +358,14 @@ fn push_payload(event: &Event, decision: &NotifyDecision) -> Result<String, Erro
         "key": event.key(),
         "event": event,
     });
-    serde_json::to_string(&v).map_err(|e| Error::Kento(format!("json: {e}")))
+    serde_json::to_string(&v).map_err(|e| Error::Notify(format!("json: {e}")))
 }
 
 /// Hard wall-clock bound on the operator's push command. emit() runs
 /// inside the sweep, so an unbounded `wait()` on a hanging hook (e.g. curl
 /// to a black-holed host) would stall ALL reaping. We kill + reap on expiry
 /// instead of blocking forever; the timeout is reported as a non-fatal
-/// [`Error::Kento`] that the caller logs and swallows.
+/// [`Error::Notify`] that the caller logs and swallows.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn run_command(cmd: &str, payload: &str) -> Result<(), Error> {
@@ -377,7 +377,7 @@ fn run_command(cmd: &str, payload: &str) -> Result<(), Error> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| Error::Kento(format!("spawn push command '{cmd}': {e}")))?;
+        .map_err(|e| Error::Notify(format!("spawn push command '{cmd}': {e}")))?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(payload.as_bytes());
     }
@@ -386,20 +386,20 @@ fn run_command(cmd: &str, payload: &str) -> Result<(), Error> {
     // a non-fatal error the caller logs + swallows.
     let status = match child
         .wait_timeout(PUSH_TIMEOUT)
-        .map_err(|e| Error::Kento(format!("wait push command: {e}")))?
+        .map_err(|e| Error::Notify(format!("wait push command: {e}")))?
     {
         Some(status) => status,
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(Error::Kento(format!(
+            return Err(Error::Notify(format!(
                 "push command '{cmd}' timed out after {}s",
                 PUSH_TIMEOUT.as_secs()
             )));
         }
     };
     if !status.success() {
-        return Err(Error::Kento(format!(
+        return Err(Error::Notify(format!(
             "push command exited {:?}",
             status.code()
         )));
@@ -407,14 +407,31 @@ fn run_command(cmd: &str, payload: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Sanitize a key-derived filename component: replace every character not
+/// in the allowlist `[A-Za-z0-9_-]` with `_`. Lossless for all legitimate
+/// keys (seadog GUIDs, numeric vmids, the literal "sweeper") and neutralizes
+/// path separators and `..` so an untrusted foreign marker
+/// ([`Event::ForeignHeadsUp`]'s `guid_or_vmid`) can't escape `notify.dir`.
+fn sanitize_key(key: &str) -> String {
+    key.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn drop_file(dir: &str, event: &Event, payload: &str) -> Result<(), Error> {
     let path = std::path::Path::new(dir).join(format!(
         "seadog-{}-{}.json",
-        event.key(),
+        sanitize_key(event.key()),
         crate::now_unix()
     ));
     std::fs::write(&path, payload)
-        .map_err(|e| Error::Kento(format!("write {}: {e}", path.display())))
+        .map_err(|e| Error::Notify(format!("write {}: {e}", path.display())))
 }
 
 /// Prune terminal env rows older than `retention.terminal`. Thin wrapper
@@ -587,6 +604,50 @@ images:
             elapsed < PUSH_TIMEOUT + Duration::from_secs(10),
             "run_command must return within the bound, took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn drop_file_sanitizes_traversal_key_into_a_safe_filename() {
+        // A foreign guest controls ForeignHeadsUp.guid_or_vmid: a crafted
+        // key with separators / `..` must NOT let the JSON drop escape the
+        // configured dir. drop_file sanitizes the key segment before joining.
+        let dir = std::env::temp_dir().join(format!("seadog-notify-test-{}", crate::now_unix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap();
+
+        let ev = Event::ForeignHeadsUp {
+            guid_or_vmid: "../../etc/evil".into(),
+            detail: "forged".into(),
+        };
+        drop_file(dir_str, &ev, "{}").unwrap();
+
+        // The written file is the single child of `dir` (nothing escaped).
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(entries.len(), 1, "exactly one file under dir: {entries:?}");
+        let name = &entries[0];
+
+        // Final component carries no separators or parent refs.
+        assert!(!name.contains('/'), "no '/' in {name}");
+        assert!(!name.contains('\\'), "no backslash in {name}");
+        assert!(!name.contains(".."), "no '..' in {name}");
+
+        // And the file resolves directly under `dir` (its parent is `dir`).
+        let written = dir.join(name);
+        assert_eq!(written.parent(), Some(dir.as_path()));
+        assert!(written.is_file());
+
+        // Direct sanitizer check on the allowlist boundary.
+        assert_eq!(sanitize_key("../../etc/evil"), "______etc_evil");
+        assert_eq!(sanitize_key("a/b"), "a_b");
+        // Legitimate keys are untouched (lossless).
+        assert_eq!(sanitize_key("9f8c-1a2b"), "9f8c-1a2b");
+        assert_eq!(sanitize_key("10010"), "10010");
+        assert_eq!(sanitize_key("sweeper"), "sweeper");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -63,6 +63,11 @@ pub enum Error {
     #[error("kento error: {0}")]
     Kento(String),
 
+    /// A notification-sink operation failed (push command, drop-file,
+    /// payload serialize). Logged-and-swallowed, never fatal to a sweep.
+    #[error("notify error: {0}")]
+    Notify(String),
+
     /// The pmxcfs quorum was lost / the cluster filesystem is read-only.
     /// Surfaced (not retried) so sweeps stop cleanly instead of spinning.
     #[error("quorum lost: {0}")]

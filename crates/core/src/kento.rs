@@ -862,6 +862,22 @@ mod real {
             for v in fps.values() {
                 if let Some(s) = v.as_str() {
                     if !s.is_empty() {
+                        // Ingest guard (defense-in-depth on kento-sourced data):
+                        // these values are persisted comma-delimited
+                        // (store::join_fps), so a comma would mis-split on read;
+                        // ASCII whitespace/control chars corrupt log lines. Drop
+                        // any value carrying a storage-hostile char and warn.
+                        // Algorithm-agnostic: we guard ONLY on those chars, not
+                        // on a SHA256: prefix or any base64 alphabet.
+                        if s.bytes()
+                            .any(|b| b == b',' || b.is_ascii_whitespace() || b.is_ascii_control())
+                        {
+                            tracing::warn!(
+                                fingerprint = ?s,
+                                "dropping ssh host-key fingerprint with storage-hostile char (comma/whitespace/control)"
+                            );
+                            continue;
+                        }
                         ssh_host_key_fps.push(s.to_string());
                     }
                 }
@@ -1143,6 +1159,36 @@ foreign-thing              lxc      some/other:img     running  0
             assert_eq!(
                 s.ssh_host_key_fps,
                 vec!["SHA256:e".to_string(), "SHA256:r".to_string()]
+            );
+        }
+
+        #[test]
+        fn parse_inspect_drops_storage_hostile_fingerprint() {
+            // A fingerprint value carrying a comma is storage-hostile: fps are
+            // persisted comma-delimited (store::join_fps), so it would mis-split
+            // on read. The ingest guard DROPS it (non-fatal) and keeps the clean
+            // values, sorted. Algorithm-agnostic: only the hostile char matters.
+            let json = r#"{
+                "name": "seadog-eve-proj-ef56",
+                "image": "registry/img:1",
+                "mode": "lxc",
+                "type": "LXC",
+                "status": "running",
+                "directory": "/d",
+                "state_directory": "/d",
+                "environment": ["SEADOG_GUID=g-eve"],
+                "ssh_host_key_fingerprints": {
+                    "ecdsa": "SHA256:bbb",
+                    "ed25519": "SHA256:aaa,bbb",
+                    "rsa": "SHA256:ccc"
+                }
+            }"#;
+            let s = parse_kento_inspect(json).unwrap();
+            // The comma-bearing value is dropped; the two clean values survive.
+            assert_eq!(
+                s.ssh_host_key_fps,
+                vec!["SHA256:bbb".to_string(), "SHA256:ccc".to_string()],
+                "comma-bearing fingerprint dropped; clean values retained and sorted"
             );
         }
 
@@ -1544,10 +1590,7 @@ mod argv_tests {
             argv.iter().any(|a| a == "--allow-nesting"),
             "lxc nesting emits --allow-nesting"
         );
-        assert!(
-            !argv.iter().any(|a| a == "--mac"),
-            "lxc never emits --mac"
-        );
+        assert!(!argv.iter().any(|a| a == "--mac"), "lxc never emits --mac");
         assert_eq!(
             argv.last().map(String::as_str),
             Some("registry.example.com/loom:1.0"),
