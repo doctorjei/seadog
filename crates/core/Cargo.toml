@@ -1,6 +1,6 @@
 [package]
 name = "seadog-core"
-version = "0.7.2"
+version = "0.7.3"
 description = "Shared data + logic layer for the seadog ephemeral test-env provisioner"
 edition.workspace = true
 license.workspace = true

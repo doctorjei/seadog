@@ -1,6 +1,6 @@
 [package]
 name = "seadog"
-version = "0.7.2"
+version = "0.7.3"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -47,7 +47,7 @@ tempfile = "3"
 #
 # Build:  cargo build --release --target x86_64-unknown-linux-musl
 #         cargo deb -p seadog --target x86_64-unknown-linux-musl
-# Output: target/debian/seadog_0.7.2-1_amd64.deb
+# Output: target/debian/seadog_0.7.3-1_amd64.deb
 #
 # ONE .deb holds BOTH binaries + every deploy/ asset. The explicit
 # `assets` list fully replaces cargo-deb's auto-include of this crate's
@@ -100,7 +100,7 @@ assets = [
 #            the musl release dir, so build the binaries with --target
 #            first, then run generate-rpm WITHOUT it. Passing --target here
 #            produced no artifact in testing.)
-# Output: target/generate-rpm/seadog-0.7.2-1.x86_64.rpm
+# Output: target/generate-rpm/seadog-0.7.3-1.x86_64.rpm
 #
 # Same asset layout as the .deb. /etc/seadog/config.yaml is flagged
 # config(noreplace) — the rpm analog of the dpkg conffile. Scriptlets in
