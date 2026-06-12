@@ -4,25 +4,28 @@
 //! ([`InstanceSignals`]) and the matching DB row (if any, looked up **by
 //! GUID**), decide what the instance **is** to seadog. Identity is now an
 //! injected anchor: kento carries the `SEADOG_GUID` env on every seadog
-//! instance and reports it back via `inspect --json`. The GUID is the sole
-//! identity key — there is no description-marker parsing, no name-prefix
-//! gate, and no hardware fingerprint anymore. A *present* GUID is trusted as
-//! seadog's only when it parses as a seadog-minted UUID (seadog mints GUIDs as
-//! `Uuid::new_v4()`); a matched DB row is itself corroboration (seadog wrote
-//! the row at provision), so the UUID gate applies only to the unmatched
-//! (no-row) case.
+//! instance and reports it back via `inspect --json`. The GUID is the primary
+//! identity key — there is no description-marker parsing or hardware
+//! fingerprint anymore. A matched DB row is itself corroboration (seadog wrote
+//! the row at provision), so a GUID that joins a row is trusted directly. The
+//! UNMATCHED (no-row) case feeds the destructive re-adopt path, so it demands
+//! two independent seadog signals: the GUID must parse as a seadog-minted UUID
+//! (`Uuid::new_v4()`) AND the name must pass [`crate::validate::validate_guest_name`]
+//! (the minted `seadog-<owner>-<proj>-<token>` label). Both come from the same
+//! create path, so a genuine orphan always satisfies both.
 //!
 //! ## Taxonomy
-//! - **Foreign** — no `SEADOG_GUID` at all, OR a GUID is present with no DB row
-//!   but it does **not** parse as a seadog-minted UUID. Either way it is not
-//!   ours; ignored — never re-adopted, never reaped. (kento only ever lists
-//!   kento instances, so a missing GUID is rare, but a non-seadog kento guest
-//!   would land here.) An unparseable present GUID is refused here precisely
-//!   because re-adoption is destructive (see Orphan) and must not act on an
-//!   unverifiable identity.
-//! - **Orphan** — a GUID is present, no DB row backs it, AND the GUID parses as
-//!   a canonical seadog-minted UUID. The DB was lost / the instance predates
-//!   the row; reap re-adopts it onto a fresh row.
+//! - **Foreign** — no `SEADOG_GUID` at all, OR a GUID present with no DB row
+//!   that fails either re-adopt gate (not a valid UUID, or a non-seadog name).
+//!   Either way it is not (verifiably) ours; ignored — never re-adopted, never
+//!   reaped. (kento only ever lists kento instances, so a missing GUID is rare,
+//!   but a non-seadog kento guest would land here.) The gates are enforced here
+//!   precisely because re-adoption is destructive (see Orphan) and must not act
+//!   on an unverifiable identity.
+//! - **Orphan** — a GUID is present, no DB row backs it, AND it clears both
+//!   re-adopt gates (canonical seadog-minted UUID + valid `seadog-…` name). The
+//!   DB was lost / the instance predates the row; reap re-adopts it onto a
+//!   fresh row.
 //! - **Anomaly** — a GUID-matched DB row exists but a **confirming-when-
 //!   present** signal disagrees (name or MAC). Flagged for a human, never
 //!   reaped.
@@ -68,13 +71,15 @@ pub enum Reason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Classification {
-    /// Not a seadog instance — ignored (never re-adopted, never reaped).
-    /// Either no `SEADOG_GUID` at all, or a GUID present with no DB row that
-    /// does not parse as a seadog-minted UUID (an unverifiable identity must
-    /// not enter the destructive re-adopt path; see [`Self::Orphan`]).
+    /// Not (verifiably) a seadog instance — ignored (never re-adopted, never
+    /// reaped). Either no `SEADOG_GUID` at all, or a GUID present with no DB
+    /// row that fails a re-adopt gate (not a canonical seadog-minted UUID, or
+    /// a name that is not a valid `seadog-…` label). An unverifiable identity
+    /// must not enter the destructive re-adopt path; see [`Self::Orphan`].
     Foreign,
-    /// A seadog-minted GUID (parses as a canonical UUID) is present but no DB
-    /// row backs it → re-adopt onto a fresh row.
+    /// A present GUID with no DB row that clears BOTH re-adopt gates — a
+    /// canonical seadog-minted UUID and a valid `seadog-…` name → re-adopt
+    /// onto a fresh row.
     Orphan {
         /// The instance's injected GUID.
         guid: String,
@@ -117,9 +122,10 @@ fn mac_eq(a: &str, b: &str) -> bool {
 ///
 /// `db_row`, when `Some`, is the row whose `guid` equals `signals.guid`
 /// (the caller looks it up by GUID). A `None` row with a present GUID is an
-/// orphan to re-adopt **only** when the GUID parses as a seadog-minted UUID;
-/// a present-but-unparseable GUID with no row is [`Classification::Foreign`]
-/// (re-adoption is destructive and must not act on an unverifiable identity).
+/// orphan to re-adopt **only** when it clears both gates — the GUID parses as
+/// a seadog-minted UUID AND the name is a valid `seadog-…` label; otherwise it
+/// is [`Classification::Foreign`] (re-adoption is destructive and must not act
+/// on an unverifiable identity).
 pub fn classify(signals: &InstanceSignals, db_row: Option<&Env>) -> Classification {
     // No injected GUID → not ours.
     let guid = match &signals.guid {
@@ -127,19 +133,25 @@ pub fn classify(signals: &InstanceSignals, db_row: Option<&Env>) -> Classificati
         None => return Classification::Foreign,
     };
 
-    // GUID present but no row backs it → re-adopt ONLY if the GUID is
-    // genuinely seadog-minted. Seadog mints GUIDs as `Uuid::new_v4()`
-    // (create.rs), so a real seadog GUID always parses as a canonical UUID.
-    // The re-adopt path is destructive (fresh row → reap at deadline →
-    // `kento destroy -f`) and has NO DB corroboration here, so we must refuse
-    // to act on an unverifiable identity: a present-but-unparseable GUID with
-    // no row cannot be seadog-minted and is treated as Foreign (never adopted,
-    // never reaped). A matched row (Anomaly/ReapEligible below) is already
-    // corroborated — seadog wrote that row at provision — so no UUID gate there.
+    // GUID present but no row backs it → re-adopt ONLY when the instance is
+    // unmistakably seadog's on TWO independent signals. The re-adopt path is
+    // destructive (fresh row → reap at deadline → `kento destroy -f`) and has
+    // NO DB corroboration here, so a single signal is not enough:
+    //   1. the GUID must parse as a canonical UUID — seadog mints GUIDs as
+    //      `Uuid::new_v4()` (create.rs), so a real seadog GUID always does; and
+    //   2. the name must pass `validate_guest_name` — the minted
+    //      `seadog-<owner>-<proj>-<token>` label (create.rs uses the same
+    //      validator), so a genuine orphan always does.
+    // Either signal failing → Foreign (never adopted, never reaped): we must
+    // not act on an unverifiable identity. A matched row (Anomaly/ReapEligible
+    // below) is already corroborated — seadog wrote that row at provision — so
+    // neither gate applies there.
     let env = match db_row {
         Some(env) => env,
         None => {
-            if uuid::Uuid::parse_str(&guid).is_ok() {
+            if uuid::Uuid::parse_str(&guid).is_ok()
+                && crate::validate::validate_guest_name(&signals.name).is_ok()
+            {
                 return Classification::Orphan {
                     guid,
                     owner: signals.owner.clone(),
@@ -275,6 +287,16 @@ mod tests {
         // UUID must be ignored: the re-adopt path is destructive, so an
         // unverifiable GUID must never enter it.
         let s = signals("not-a-uuid", Some("aa:bb:cc:dd:ee:ff"));
+        assert_eq!(classify(&s, None), Classification::Foreign);
+    }
+
+    #[test]
+    fn valid_uuid_but_non_seadog_name_no_row_is_foreign() {
+        // Second re-adopt gate: even a valid UUID must NOT be re-adopted when
+        // the name is not a `seadog-…` label. Both signals must agree before
+        // the destructive re-adopt path runs.
+        let mut s = signals("550e8400-e29b-41d4-a716-446655440000", None);
+        s.name = "totally-foreign".to_string();
         assert_eq!(classify(&s, None), Classification::Foreign);
     }
 
