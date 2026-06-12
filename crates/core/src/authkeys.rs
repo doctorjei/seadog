@@ -328,7 +328,10 @@ mod tests {
 
     #[test]
     fn key_blob_of_line_on_bare_line() {
-        assert_eq!(key_blob_of_line(&format!("ssh-ed25519 {BLOB} c@h")), Some(BLOB));
+        assert_eq!(
+            key_blob_of_line(&format!("ssh-ed25519 {BLOB} c@h")),
+            Some(BLOB)
+        );
         // No comment.
         assert_eq!(key_blob_of_line(&format!("ssh-ed25519 {BLOB}")), Some(BLOB));
     }

@@ -490,14 +490,21 @@ mod tests {
         k.fail_list("kento list: transient backend error");
 
         let cleared = Cell::new(false);
-        let summary = run_loop(&conn, &k, &cfg, || now, Some(3), |_d| {
-            // Clear the failure after the first (erroring) tick's sleep so the
-            // remaining ticks succeed.
-            if !cleared.get() {
-                k.clear_list_fail();
-                cleared.set(true);
-            }
-        })
+        let summary = run_loop(
+            &conn,
+            &k,
+            &cfg,
+            || now,
+            Some(3),
+            |_d| {
+                // Clear the failure after the first (erroring) tick's sleep so the
+                // remaining ticks succeed.
+                if !cleared.get() {
+                    k.clear_list_fail();
+                    cleared.set(true);
+                }
+            },
+        )
         .unwrap();
 
         // The loop survived the erroring tick and ran to the bound (3 ticks:

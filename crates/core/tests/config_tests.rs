@@ -268,10 +268,7 @@ images:
   b: { ref: r/same:1, modes: [vm], user: bob }
 "#;
     let cfg = Config::from_yaml_str(diverge_default).expect("parse");
-    assert!(matches!(
-        cfg.validate(),
-        Err(Error::ConfigValidation(_))
-    ));
+    assert!(matches!(cfg.validate(), Err(Error::ConfigValidation(_))));
 }
 
 #[test]
@@ -312,7 +309,8 @@ images:
   b: { ref: r/same:1, modes: [lxc], user: agent }
 "#;
     let cfg = Config::from_yaml_str(via_default).expect("parse");
-    cfg.validate().expect("default-resolved agreement must validate");
+    cfg.validate()
+        .expect("default-resolved agreement must validate");
 }
 
 #[test]

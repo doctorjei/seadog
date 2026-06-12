@@ -159,7 +159,10 @@ fn set_ttl_deadline_clamps_to_max_ttl_window() {
     // max_ttl of 3_600s ⇒ ceiling = created_at + 3_600 = 4_600. A request far
     // past the ceiling is clamped DOWN to it; the clamped value is returned.
     let stored = store::set_ttl_deadline(&conn, "g1", 999_999_999, 3_600).unwrap();
-    assert_eq!(stored, 4_600, "deadline clamped down to created_at + max_ttl");
+    assert_eq!(
+        stored, 4_600,
+        "deadline clamped down to created_at + max_ttl"
+    );
     assert_eq!(
         store::get_env(&conn, "g1").unwrap().unwrap().ttl_deadline,
         4_600

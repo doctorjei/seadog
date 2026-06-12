@@ -271,7 +271,14 @@ fn ack_refuses_foreign_healthy_env_but_allows_flagged() {
     // bob's Flagged env — anyone may silence the anomaly heads-up.
     store::insert_env(
         &conn,
-        &mk_env("g-bob-flagged", 10011, "bob", EnvStatus::Flagged, 1000, 5000),
+        &mk_env(
+            "g-bob-flagged",
+            10011,
+            "bob",
+            EnvStatus::Flagged,
+            1000,
+            5000,
+        ),
     )
     .unwrap();
 
