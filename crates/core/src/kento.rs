@@ -80,16 +80,18 @@ pub struct InstanceSignals {
     /// kento-reported status text (informational).
     pub status: String,
     /// Backend family, collapsed to the backend-neutral [`Mode`]
-    /// ([`Mode::Lxc`] / [`Mode::Vm`]). kento `inspect --json` emits an
-    /// authoritative `type` field ∈ {`LXC`, `VM`} (always present:
-    /// `info.py:97`) that is the unambiguous family signal: `VM` →
-    /// [`Mode::Vm`], `LXC` → [`Mode::Lxc`]. The accompanying `mode` string
-    /// (`inspect.mode` ∈ {`lxc`, `vm`, `pve`, `pve-vm`} — note a PVE-LXC is
-    /// promoted to bare `pve`, NOT `pve-lxc`) is informational and serves
-    /// only as a defensive fallback if `type` is ever missing/unrecognized.
-    /// Lets reap recover an orphan's family precisely instead of guessing
-    /// from the status text. Defaults to [`Mode::Lxc`] when kento reports
-    /// nothing recognizable.
+    /// ([`Mode::Lxc`] / [`Mode::Vm`]). kento `inspect --json` (and `list
+    /// --json`) emits an authoritative `type` field ∈ {`LXC`, `VM`} (always
+    /// present: `info.py:97`) that is the unambiguous family signal: `VM` →
+    /// [`Mode::Vm`], `LXC` → [`Mode::Lxc`]. The accompanying `mode` string is
+    /// informational and serves only as a defensive fallback if `type` is ever
+    /// missing/unrecognized. kento 1.5.3 normalizes that `mode` string to
+    /// `pve-lxc` for a PVE-LXC (matching it across both `list --json` and
+    /// `inspect --json`); the fallback's catch-all maps everything that isn't
+    /// `vm`/`pve-vm` to the LXC family, so `pve` (older kento) OR `pve-lxc`
+    /// (≥1.5.3) both resolve to [`Mode::Lxc`]. Lets reap recover an orphan's
+    /// family precisely instead of guessing from the status text. Defaults to
+    /// [`Mode::Lxc`] when kento reports nothing recognizable.
     pub mode: Mode,
     /// Backend vmid when kento exposes one (PVE backends only);
     /// informational, never an identity key.
@@ -242,6 +244,15 @@ pub fn inspect_argv(name: &str) -> Vec<String> {
         name.to_string(),
         "--json".to_string(),
     ]
+}
+
+/// Build the argv for `kento list --json`.
+///
+/// One enumerating call (kento 1.5.3+): it prints a JSON array of the same
+/// per-object shape `inspect --json` emits, so the sweeper enumerates the live
+/// set in a single shell-out instead of `list` + N× `inspect`.
+pub fn list_json_argv() -> Vec<String> {
+    vec!["list".to_string(), "--json".to_string()]
 }
 
 /// In-memory [`Kento`] for tests. Always compiled (not `#[cfg(test)]`) so
@@ -575,99 +586,32 @@ mod real {
         }
     }
 
-    /// The decision for a failing per-instance `kento inspect` in
-    /// [`RealKento::list_instances`]: keep the sweep going (skip the one bad
-    /// instance) or abort it (a global condition).
-    enum PerInstance {
-        /// A GLOBAL condition — propagate and abort the whole sweep.
-        Propagate(Error),
-        /// A per-instance fault — log it and skip just this instance.
-        Skip(Error),
-    }
-
-    /// Classify a per-instance `inspect` exec error into propagate-vs-skip.
-    ///
-    /// [`Error::QuorumLost`] is a GLOBAL pmxcfs/cluster condition (not a fault
-    /// of the one instance), so continuing the sweep would be wrong — it
-    /// propagates and aborts. Every OTHER error (a `kento inspect` exec
-    /// failure — e.g. a "ghost" instance present in `kento list` with no
-    /// backing guest, whose inspect exits non-zero) is per-instance: it is
-    /// skipped so a single broken instance can't blind the reaper to every
-    /// other env. Pure (no I/O) so the resilience contract is unit-testable
-    /// without a real `kento` in the loop.
-    fn classify_per_instance_error(e: Error) -> PerInstance {
-        match e {
-            Error::QuorumLost(_) => PerInstance::Propagate(e),
-            _ => PerInstance::Skip(e),
-        }
-    }
-
     impl Kento for RealKento {
         fn list_instances(&self) -> Result<Vec<InstanceSignals>, Error> {
-            // Strategy (kento-only — no pvesh/qm/pct):
-            //   1. `kento list` enumerates the kento-managed instances as a
-            //      columnar table (NAME col first). A quorum-loss surfaces
-            //      here. `kento` only sees its own instances, so the live set
-            //      IS the kento list — no vmid-range scan.
-            //   2. For each NAME, `kento inspect <name> --json` emits a stable
-            //      dict we parse into the `InstanceSignals` the sweeper
-            //      classifies on (guid/owner from the injected env, mac,
-            //      host-key fps, image, status, vmid).
-            // Parsing is split into pure functions (`parse_kento_list` /
-            // `parse_kento_inspect`) so they are unit-tested on sample output
-            // with no real command in the loop.
-            // Enumeration is GLOBAL: a failing `kento list` (incl. quorum
-            // loss) means we cannot see the live set at all, so it MUST
-            // propagate — the sweep aborts rather than reaping against an
-            // empty/partial view.
-            let list_out = self.run(&["list"])?;
-            let names = parse_kento_list(&list_out);
-
-            let mut out = Vec::with_capacity(names.len());
-            for name in names {
-                // Per-instance inspect/parse is RESILIENT: a single broken
-                // instance (a "ghost" in `kento list` with no backing guest
-                // whose `inspect` exits non-zero, or one emitting unparseable
-                // JSON) must NOT blind the reaper to every OTHER env. We log +
-                // skip such an instance and keep evaluating the rest.
-                //
-                // The ONE exception is `Error::QuorumLost`: that is a GLOBAL
-                // pmxcfs/cluster condition, not a per-instance fault, so
-                // continuing would be wrong — it propagates and aborts the
-                // sweep just like a failing `list`.
-                let inspect = inspect_argv(&name);
-                let inspect: Vec<&str> = inspect.iter().map(String::as_str).collect();
-                let json = match self.run(&inspect) {
-                    Ok(json) => json,
-                    // `classify_per_instance_error` is the single point that
-                    // decides propagate (QuorumLost) vs skip (everything
-                    // else); it is unit-tested without shelling out.
-                    Err(e) => match classify_per_instance_error(e) {
-                        PerInstance::Propagate(e) => return Err(e),
-                        PerInstance::Skip(e) => {
-                            tracing::warn!(
-                                instance = %name,
-                                "skipping instance: kento inspect failed: {e}"
-                            );
-                            continue;
-                        }
-                    },
-                };
-                match parse_kento_inspect(&json) {
-                    Ok(signals) => out.push(signals),
-                    Err(e) => {
-                        // A parse failure is always per-instance (it never
-                        // carries a global quorum signal), so it is always
-                        // log+skip.
-                        tracing::warn!(
-                            instance = %name,
-                            "skipping instance: failed to parse kento inspect output: {e}"
-                        );
-                        continue;
-                    }
-                }
-            }
-            Ok(out)
+            // Strategy (kento-only — no pvesh/qm/pct): ONE `kento list --json`
+            // call (kento 1.5.3+) enumerates every kento-managed instance as a
+            // JSON array of the same per-object shape `inspect --json` emits, so
+            // the sweeper reads the whole live set in a single shell-out — no
+            // `list` + N× `inspect` fan-out, no vmid-range scan (`kento` only
+            // sees its own instances, so the live set IS the kento list).
+            //
+            // Resilience semantics:
+            //   - The WHOLE-call failure is GLOBAL: a failing `kento list`
+            //     (exec error, or a quorum-loss surfacing as
+            //     [`Error::QuorumLost`]) means we cannot see the live set at
+            //     all, so the `?` propagates and the sweep ABORTS rather than
+            //     reaping against an empty/partial view. A malformed top-level
+            //     (non-array) is likewise untrustworthy whole output → it
+            //     propagates as [`Error::Kento`], NOT an empty list.
+            //   - A single non-object array element is per-element resilient:
+            //     `parse_kento_list_json` logs + skips it and keeps the rest, so
+            //     one bad element can't blind the reaper to every other env.
+            // Parsing is the pure `parse_kento_list_json` (unit-tested on sample
+            // output with no real command in the loop).
+            let argv = list_json_argv();
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let out = self.run(&argv)?;
+            parse_kento_list_json(&out).map_err(Error::Kento)
         }
 
         fn teardown(&self, name: &str, mode: Mode) -> Result<(), Error> {
@@ -721,44 +665,6 @@ mod real {
 
     // --- Pure parsers (no exec): unit-testable on sample strings. ---
 
-    /// Parse the NAME column out of `kento list`'s columnar output.
-    ///
-    /// `kento list` prints a header row (`NAME  TYPE  IMAGE  STATUS  UPPER
-    /// SIZE`), a separator row of dashes, then one space-padded row per
-    /// instance — NAME is the first column. When there are no instances it
-    /// prints a single `(no instances found)` line. seadog names never
-    /// contain whitespace (`seadog-<owner>-<shortproj>-<token>`, a DNS
-    /// label), so the first whitespace-delimited token of each data row is
-    /// the instance name. We skip the header, the dash separator, and the
-    /// empty-set sentinel.
-    pub fn parse_kento_list(text: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            // Empty-set sentinel.
-            if trimmed == "(no instances found)" {
-                continue;
-            }
-            let first = match trimmed.split_whitespace().next() {
-                Some(t) => t,
-                None => continue,
-            };
-            // Header row: first column is the literal "NAME".
-            if first == "NAME" {
-                continue;
-            }
-            // Separator row: all dashes.
-            if first.chars().all(|c| c == '-') {
-                continue;
-            }
-            out.push(first.to_string());
-        }
-        out
-    }
-
     /// Parse `kento inspect <name> --json` into [`InstanceSignals`].
     ///
     /// kento emits a stable dict (`json.dumps(data, indent=2)`); fields that
@@ -775,21 +681,71 @@ mod real {
     /// - family ← the authoritative `.type` ∈ {`LXC`, `VM`} (ALWAYS present:
     ///   kento `info.py:97`): `VM` → [`Mode::Vm`], `LXC` → [`Mode::Lxc`].
     ///   That `type` is the unambiguous family signal — immune to the
-    ///   `pve`/`pve-vm` mode-string nuance below. `.mode` (the raw kento-mode
-    ///   ∈ {`lxc`, `vm`, `pve`, `pve-vm`} — kento `info.py:96`; note a
-    ///   PVE-LXC is promoted to bare `pve`, NOT `pve-lxc`, at kento
-    ///   `create.py:410-421`/`628`, and `pve-lxc` exists ONLY in the `list`
-    ///   TYPE column, never in `inspect --json`) is read as a DEFENSIVE
-    ///   fallback used ONLY when `type` is missing/unrecognized: `vm`/`pve-vm`
-    ///   → [`Mode::Vm`], everything else → [`Mode::Lxc`]. reap uses the
-    ///   collapsed family to recover an orphan's mode precisely.
+    ///   mode-string nuance below. `.mode` (the raw kento-mode string — kento
+    ///   `info.py:96`; 1.5.3 normalizes a PVE-LXC to `pve-lxc`, matching it
+    ///   across both `list --json` and `inspect --json`) is read as a
+    ///   DEFENSIVE fallback used ONLY when `type` is missing/unrecognized:
+    ///   `vm`/`pve-vm` → [`Mode::Vm`], everything else → [`Mode::Lxc`] (so
+    ///   `pve` from older kento OR `pve-lxc` from ≥1.5.3 both resolve to Lxc).
+    ///   reap uses the collapsed family to recover an orphan's mode precisely.
     /// - `vmid` ← `.vmid` (present only on PVE backends; informational).
+    ///
+    /// Parsing splits into the top-level `as_object()` check here and the
+    /// infallible per-object extraction in `parse_signals_obj`, which `list
+    /// --json` reuses verbatim per array element.
     pub fn parse_kento_inspect(json: &str) -> Result<InstanceSignals, String> {
         let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
         let obj = value
             .as_object()
             .ok_or_else(|| "expected a top-level JSON object".to_string())?;
+        Ok(parse_signals_obj(obj))
+    }
 
+    /// Parse `kento list --json` into a [`Vec<InstanceSignals>`].
+    ///
+    /// kento 1.5.3+ prints a JSON ARRAY (`[]` when zero instances), one object
+    /// per instance carrying the SAME keys/types `inspect --json` emits per
+    /// object. This single enumerating call replaces the old columnar `list`
+    /// plus N× `inspect` fan-out: each element is fed through the same
+    /// `parse_signals_obj` extraction `parse_kento_inspect` uses, so a `list`
+    /// row and an `inspect` of the same instance yield identical signals.
+    ///
+    /// Per-element resilient: a non-object element is logged + skipped (one bad
+    /// element can't blind the reaper to every other env). The WHOLE-call
+    /// failure (a non-array top level, an exec error, or a quorum-loss) is the
+    /// caller's to handle — it propagates so the sweep aborts rather than
+    /// reaping against an untrustworthy/partial view.
+    pub fn parse_kento_list_json(json: &str) -> Result<Vec<InstanceSignals>, String> {
+        let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let arr = value
+            .as_array()
+            .ok_or_else(|| "expected a top-level JSON array".to_string())?;
+
+        let mut out = Vec::with_capacity(arr.len());
+        for elem in arr {
+            match elem.as_object() {
+                Some(obj) => out.push(parse_signals_obj(obj)),
+                None => {
+                    // Per-element resilience: a non-object element is skipped
+                    // (kento would have to break its own contract) so one bad
+                    // element can't blind the reaper to every other instance.
+                    tracing::warn!(
+                        element = ?elem,
+                        "skipping non-object element in kento list --json output"
+                    );
+                    continue;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Extract the [`InstanceSignals`] from one already-parsed kento JSON
+    /// object (an `inspect --json` dict, or one element of a `list --json`
+    /// array — they share the same shape). Infallible: every field already
+    /// defaults (absent ⇒ `None`/empty/`Mode::Lxc`), so there is nothing left
+    /// to reject once the value is known to be an object.
+    fn parse_signals_obj(obj: &serde_json::Map<String, serde_json::Value>) -> InstanceSignals {
         let str_field = |key: &str| -> Option<String> {
             obj.get(key)
                 .and_then(|v| v.as_str())
@@ -805,12 +761,14 @@ mod real {
         // Collapse the backend family to the neutral Mode on the AUTHORITATIVE
         // `.type` field (kento info.py:97 — ALWAYS present, ∈ {LXC, VM}): it is
         // the unambiguous family signal, immune to the raw `.mode` string's
-        // pve/pve-vm nuance (a PVE-LXC reports bare `pve`, NOT `pve-lxc`, so a
-        // mode-only match would be fragile). `.type` is the primary path.
+        // nuance. `.type` is the primary path.
         //
         // DEFENSIVE fallback ONLY when `.type` is missing/unrecognized (kento
         // would have to break its own contract): fall back to the `.mode`
-        // string — vm-family (`vm`/`pve-vm`) → Vm, everything else → Lxc.
+        // string — vm-family (`vm`/`pve-vm`) → Vm, everything else → Lxc. kento
+        // 1.5.3 normalizes a PVE-LXC's `.mode` to `pve-lxc`; the catch-all maps
+        // it (and bare `pve` from older kento) to Lxc, so the fallback is
+        // version-agnostic.
         let mode = match str_field("type").as_deref() {
             Some("VM") => Mode::Vm,
             Some("LXC") => Mode::Lxc,
@@ -885,7 +843,7 @@ mod real {
             ssh_host_key_fps.sort();
         }
 
-        Ok(InstanceSignals {
+        InstanceSignals {
             name,
             guid,
             owner,
@@ -895,7 +853,7 @@ mod real {
             status,
             mode,
             vmid,
-        })
+        }
     }
 
     #[cfg(test)]
@@ -903,48 +861,125 @@ mod real {
         use super::*;
 
         #[test]
-        fn parse_list_extracts_name_column_skips_header_and_separator() {
-            // The exact shape `kento list` prints: header, dash separator,
-            // then space-padded rows. NAME is the first column. (`pve-lxc` in
-            // the TYPE column is the LIST-table display label — the only place
-            // kento ever renders that string; `inspect --json` reports bare
-            // `pve` + `type:"LXC"` instead. Only the NAME column is parsed.)
-            let text = "\
-NAME                       TYPE     IMAGE              STATUS   UPPER SIZE
--------------------------  -------  -----------------  -------  ----------
-seadog-alice-proj-ab12     pve-lxc  registry/loom:1    running  1.2M
-seadog-bob-proj-cd34       vm       registry/stuff:2   stopped  512K
-foreign-thing              lxc      some/other:img     running  0
-";
-            let names = parse_kento_list(text);
+        fn parse_list_json_two_instances_reuses_inspect_extraction() {
+            // `kento list --json` prints an array of the SAME per-object shape
+            // `inspect --json` emits, so each element flows through the shared
+            // `parse_signals_obj` extraction. One PVE-LXC (1.5.3 `mode`
+            // "pve-lxc", a vmid, host-key fps, the SEADOG anchor env, NO mac)
+            // and one VM (`mode` "vm", a mac, stopped).
+            let json = r#"[
+                {
+                    "name": "seadog-alice-proj-ab12",
+                    "image": "registry/loom:1",
+                    "mode": "pve-lxc",
+                    "type": "LXC",
+                    "status": "running",
+                    "vmid": 10010,
+                    "environment": [
+                        "SEADOG_GUID=guid-abc",
+                        "SEADOG_OWNER=alice",
+                        "TERM=xterm"
+                    ],
+                    "ssh_host_key_fingerprints": {
+                        "ed25519": "SHA256:aaa",
+                        "rsa": "SHA256:bbb"
+                    }
+                },
+                {
+                    "name": "seadog-bob-proj-cd34",
+                    "image": "registry/stuff:2",
+                    "mode": "vm",
+                    "type": "VM",
+                    "status": "stopped",
+                    "mac": "12:34:56:78:9a:bc",
+                    "environment": ["SEADOG_GUID=g-bob", "SEADOG_OWNER=bob"],
+                    "ssh_host_key_fingerprints": {}
+                }
+            ]"#;
+            let v = parse_kento_list_json(json).unwrap();
+            assert_eq!(v.len(), 2);
+
+            // The PVE-LXC: `type` LXC ⇒ Lxc (1.5.3 `mode` "pve-lxc" agrees),
+            // anchor env extracted, fps sorted, vmid parsed, NO mac.
+            let lxc = &v[0];
+            assert_eq!(lxc.name, "seadog-alice-proj-ab12");
+            assert_eq!(lxc.mode, Mode::Lxc, "type LXC (mode pve-lxc) ⇒ Lxc");
+            assert_eq!(lxc.guid.as_deref(), Some("guid-abc"));
+            assert_eq!(lxc.owner.as_deref(), Some("alice"));
+            assert_eq!(lxc.vmid, Some(10010));
+            assert_eq!(lxc.mac, None, "LXC reports no mac ⇒ None");
             assert_eq!(
-                names,
-                vec![
-                    "seadog-alice-proj-ab12".to_string(),
-                    "seadog-bob-proj-cd34".to_string(),
-                    "foreign-thing".to_string(),
-                ]
+                lxc.ssh_host_key_fps,
+                vec!["SHA256:aaa".to_string(), "SHA256:bbb".to_string()],
+                "fps flattened + sorted"
             );
+
+            // The VM: `type` VM ⇒ Vm, mac present, stopped.
+            let vm = &v[1];
+            assert_eq!(vm.name, "seadog-bob-proj-cd34");
+            assert_eq!(vm.mode, Mode::Vm, "type VM ⇒ Vm");
+            assert_eq!(vm.guid.as_deref(), Some("g-bob"));
+            assert_eq!(vm.owner.as_deref(), Some("bob"));
+            assert_eq!(vm.mac.as_deref(), Some("12:34:56:78:9a:bc"));
+            assert_eq!(vm.status, "stopped");
+            assert!(vm.ssh_host_key_fps.is_empty());
         }
 
         #[test]
-        fn parse_list_empty_set_sentinel_yields_no_names() {
-            assert!(parse_kento_list("(no instances found)\n").is_empty());
-            assert!(parse_kento_list("").is_empty());
-            // Header + separator with no data rows.
-            let text = "NAME  TYPE\n----  ----\n";
-            assert!(parse_kento_list(text).is_empty());
+        fn parse_list_json_empty_array_yields_empty_vec() {
+            // The zero-instance case: an empty array ⇒ an empty Vec (NOT an
+            // error — that is the well-formed "no live instances" signal).
+            assert!(parse_kento_list_json("[]").unwrap().is_empty());
+        }
+
+        #[test]
+        fn parse_list_json_non_array_top_level_is_err() {
+            // A non-array top level means kento's whole output is untrustworthy:
+            // it must Err (the caller propagates + aborts the sweep), NOT decay
+            // to an empty list.
+            assert!(parse_kento_list_json("{}").is_err());
+            assert!(parse_kento_list_json("\"x\"").is_err());
+            assert!(parse_kento_list_json("not json").is_err());
+        }
+
+        #[test]
+        fn parse_list_json_skips_non_object_element() {
+            // Per-element resilience: a non-object element (here a bare number)
+            // is skipped, the valid object survives — one bad element can't
+            // blind the reaper to every other instance.
+            let json = r#"[
+                {"name":"n","type":"LXC","mode":"lxc","environment":["SEADOG_GUID=g"]},
+                42
+            ]"#;
+            let v = parse_kento_list_json(json).unwrap();
+            assert_eq!(v.len(), 1, "the non-object 42 is skipped");
+            assert_eq!(v[0].name, "n");
+            assert_eq!(v[0].guid.as_deref(), Some("g"));
+        }
+
+        #[test]
+        fn parse_list_json_carries_orphan_status() {
+            // "orphan" is a list-only status (a kento instance with no backing
+            // guest). It parses and rides through unchanged on `status`.
+            let json = r#"[
+                {"name":"ghost","type":"LXC","mode":"lxc","status":"orphan",
+                 "environment":["SEADOG_GUID=g"]}
+            ]"#;
+            let v = parse_kento_list_json(json).unwrap();
+            assert_eq!(v.len(), 1);
+            assert_eq!(v[0].status, "orphan", "orphan status carried through");
         }
 
         #[test]
         fn parse_inspect_ours_maps_guid_owner_mac_fps() {
             // A kento instance seadog provisioned: SEADOG_GUID/SEADOG_OWNER in
             // environment[], a realized mac, a vmid (PVE backend), and two
-            // host-key fingerprints.
+            // host-key fingerprints. kento 1.5.3 reports a PVE-LXC's `mode` as
+            // the normalized "pve-lxc".
             let json = r#"{
                 "name": "seadog-alice-proj-ab12",
                 "image": "registry/loom:1",
-                "mode": "pve",
+                "mode": "pve-lxc",
                 "type": "LXC",
                 "status": "running",
                 "directory": "/var/lib/kento/lxc/10010",
@@ -979,7 +1014,7 @@ foreign-thing              lxc      some/other:img     running  0
             assert_eq!(
                 s.mode,
                 Mode::Lxc,
-                "bare `pve` mode + type LXC collapses to Lxc"
+                "`pve-lxc` mode + type LXC collapses to Lxc"
             );
             assert_eq!(s.vmid, Some(10010));
             // Flattened + sorted fingerprint values (map order not trusted).
@@ -1064,13 +1099,23 @@ foreign-thing              lxc      some/other:img     running  0
             // type=LXC ⇒ Lxc.
             let lxc_by_type = r#"{"name":"n","mode":"weird-future-lxc","type":"LXC","environment":["SEADOG_GUID=g"]}"#;
             assert_eq!(parse_kento_inspect(lxc_by_type).unwrap().mode, Mode::Lxc);
-            // Bare `pve` (the REAL PVE-LXC kento-mode) + type=LXC ⇒ Lxc.
+            // PVE-LXC (kento 1.5.3 normalizes the `mode` to `pve-lxc`) +
+            // type=LXC ⇒ Lxc.
             let pve_lxc =
-                r#"{"name":"n","mode":"pve","type":"LXC","environment":["SEADOG_GUID=g"]}"#;
+                r#"{"name":"n","mode":"pve-lxc","type":"LXC","environment":["SEADOG_GUID=g"]}"#;
             assert_eq!(
                 parse_kento_inspect(pve_lxc).unwrap().mode,
                 Mode::Lxc,
-                "bare `pve` mode + type=LXC ⇒ Lxc (kento never emits `pve-lxc` from inspect)"
+                "`pve-lxc` mode + type=LXC ⇒ Lxc"
+            );
+            // Back-compat: a legacy bare `pve` mode (older kento, pre-1.5.3) +
+            // type=LXC still ⇒ Lxc (the catch-all is version-agnostic).
+            let legacy_pve =
+                r#"{"name":"n","mode":"pve","type":"LXC","environment":["SEADOG_GUID=g"]}"#;
+            assert_eq!(
+                parse_kento_inspect(legacy_pve).unwrap().mode,
+                Mode::Lxc,
+                "legacy bare `pve` mode + type=LXC ⇒ Lxc (defensive back-compat)"
             );
             // PVE-VM: mode `pve-vm` + type=VM ⇒ Vm.
             let pve_vm =
@@ -1196,30 +1241,6 @@ foreign-thing              lxc      some/other:img     running  0
         fn parse_inspect_rejects_non_object() {
             assert!(parse_kento_inspect("[]").is_err());
             assert!(parse_kento_inspect("not json").is_err());
-        }
-
-        #[test]
-        fn per_instance_kento_error_is_skipped() {
-            // A ghost/broken instance whose `kento inspect` exits non-zero
-            // surfaces as Error::Kento — it must be skipped (not propagated)
-            // so one bad instance can't blind the sweep to every other env.
-            let e = Error::Kento("kento exited Some(255): no such guest".into());
-            assert!(matches!(
-                classify_per_instance_error(e),
-                PerInstance::Skip(_)
-            ));
-        }
-
-        #[test]
-        fn per_instance_quorum_loss_propagates() {
-            // QuorumLost is a GLOBAL condition, never a per-instance fault:
-            // continuing the sweep would be wrong, so it must propagate and
-            // abort even though it surfaced through a per-instance inspect.
-            let e = Error::QuorumLost("kento reported quorum loss".into());
-            assert!(matches!(
-                classify_per_instance_error(e),
-                PerInstance::Propagate(_)
-            ));
         }
     }
 }
@@ -1616,5 +1637,10 @@ mod argv_tests {
             inspect_argv("seadog-alice-proj-ab12"),
             vec!["inspect", "seadog-alice-proj-ab12", "--json"]
         );
+    }
+
+    #[test]
+    fn list_json_argv_pins_json_form() {
+        assert_eq!(list_json_argv(), vec!["list", "--json"]);
     }
 }
