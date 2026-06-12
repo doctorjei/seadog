@@ -25,9 +25,10 @@
 //! - **name** and **MAC** are *hard* confirmers: present-and-mismatched →
 //!   [`Classification::Anomaly`] (flag, never reap).
 //! - **SSH host-key fingerprints** are a *soft* confirmer: a present-but-
-//!   mismatched set is recorded in the `ReapEligible` path's detail (via the
-//!   reap layer) but NEVER blocks a reap — regenerated host keys must not
-//!   strand an env. `classify` returns [`Classification::ReapEligible`] even
+//!   mismatched set is carried out on [`Classification::ReapEligible`]'s
+//!   `host_key_mismatch` flag, which the reap layer routes as a non-blocking
+//!   operator note — it NEVER blocks a reap (regenerated host keys must not
+//!   strand an env). `classify` returns [`Classification::ReapEligible`] even
 //!   on a host-key mismatch.
 //!
 //! [`Classification::Vanished`] is **not** produced here: reap detects a
@@ -47,9 +48,10 @@ pub enum Reason {
     NameMismatch,
     /// Both sides expose a MAC and they disagree.
     MacMismatch,
-    /// SSH host-key fingerprints disagree. **Soft** — recorded for the
-    /// operator but never blocks a reap, so this reason rides the
-    /// `ReapEligible` detail rather than producing an `Anomaly`.
+    /// SSH host-key fingerprints disagree. **Soft** — surfaced to the
+    /// operator but never blocks a reap, so this rides the `ReapEligible`
+    /// `host_key_mismatch` flag (routed as a non-blocking note by the reap
+    /// layer) rather than producing an `Anomaly`.
     HostKeyMismatch,
 }
 
@@ -80,6 +82,11 @@ pub enum Classification {
     ReapEligible {
         /// The matched GUID (= the DB row's primary key).
         guid: String,
+        /// SSH host-key fingerprints disagree (both sides present, disjoint).
+        /// A **soft** signal: surfaced by [`crate::reap`] as a non-blocking
+        /// operator breadcrumb, but it NEVER changes the reap decision —
+        /// regenerated host keys must not strand an env.
+        host_key_mismatch: bool,
     },
 }
 
@@ -143,17 +150,20 @@ pub fn classify(signals: &InstanceSignals, db_row: Option<&Env>) -> Classificati
     }
 
     // Host-key fps are a SOFT confirmer: a present-but-disjoint set is
-    // recorded but NEVER blocks the reap. We surface it in the detail so the
-    // operator can see it, but still return ReapEligible.
+    // surfaced but NEVER blocks the reap. We carry the mismatch out on the
+    // ReapEligible verdict so reap can route a non-blocking note; the reap
+    // decision is unchanged either way.
     let host_key_mismatch = !env.ssh_host_key_fps.is_empty()
         && !signals.ssh_host_key_fps.is_empty()
         && !signals
             .ssh_host_key_fps
             .iter()
             .any(|fp| env.ssh_host_key_fps.contains(fp));
-    let _ = host_key_mismatch; // soft: logged by reap, never blocks here.
 
-    Classification::ReapEligible { guid }
+    Classification::ReapEligible {
+        guid,
+        host_key_mismatch,
+    }
 }
 
 #[cfg(test)]
@@ -233,7 +243,13 @@ mod tests {
         let e = env("g-abc", "aa:bb:cc:dd:ee:ff");
         let s = signals("g-abc", Some("aa:bb:cc:dd:ee:ff"));
         match classify(&s, Some(&e)) {
-            Classification::ReapEligible { guid } => assert_eq!(guid, "g-abc"),
+            Classification::ReapEligible {
+                guid,
+                host_key_mismatch,
+            } => {
+                assert_eq!(guid, "g-abc");
+                assert!(!host_key_mismatch, "agreeing fps must not flag a mismatch");
+            }
             other => panic!("expected ReapEligible, got {other:?}"),
         }
     }
@@ -250,7 +266,7 @@ mod tests {
         // no MAC (None) — it drops out of the decision entirely.
         s.mac = None;
         match classify(&s, Some(&e)) {
-            Classification::ReapEligible { guid } => assert_eq!(guid, "g-lxc"),
+            Classification::ReapEligible { guid, .. } => assert_eq!(guid, "g-lxc"),
             other => panic!("expected ReapEligible, got {other:?}"),
         }
     }
@@ -262,7 +278,7 @@ mod tests {
         e.mode = Mode::Lxc;
         let s = signals("g-lxc", Some("02:aa:bb:cc:dd:ee"));
         match classify(&s, Some(&e)) {
-            Classification::ReapEligible { guid } => assert_eq!(guid, "g-lxc"),
+            Classification::ReapEligible { guid, .. } => assert_eq!(guid, "g-lxc"),
             other => panic!("expected ReapEligible, got {other:?}"),
         }
     }
@@ -304,14 +320,25 @@ mod tests {
     #[test]
     fn host_key_mismatch_is_soft_still_reap_eligible() {
         // The host-key fps disagree entirely, but name + MAC agree. Soft
-        // confirmer: must NOT flag — still ReapEligible (regenerated keys
-        // must not strand the env).
+        // confirmer: must NOT flag an Anomaly — still ReapEligible (regenerated
+        // keys must not strand the env). The mismatch IS surfaced on the
+        // verdict's `host_key_mismatch` flag for reap to route a non-blocking
+        // note.
         let mut e = env("g-abc", "aa:bb:cc:dd:ee:ff");
         e.ssh_host_key_fps = vec!["SHA256:old-key".to_string()];
         let mut s = signals("g-abc", Some("aa:bb:cc:dd:ee:ff"));
         s.ssh_host_key_fps = vec!["SHA256:regenerated-key".to_string()];
         match classify(&s, Some(&e)) {
-            Classification::ReapEligible { guid } => assert_eq!(guid, "g-abc"),
+            Classification::ReapEligible {
+                guid,
+                host_key_mismatch,
+            } => {
+                assert_eq!(guid, "g-abc");
+                assert!(
+                    host_key_mismatch,
+                    "disjoint host-key fps must surface the soft mismatch signal"
+                );
+            }
             other => panic!("host-key mismatch must stay ReapEligible, got {other:?}"),
         }
     }
@@ -323,7 +350,12 @@ mod tests {
         let mut s = signals("g-abc", Some("aa:bb:cc:dd:ee:ff"));
         s.ssh_host_key_fps = Vec::new();
         match classify(&s, Some(&e)) {
-            Classification::ReapEligible { .. } => {}
+            Classification::ReapEligible {
+                host_key_mismatch, ..
+            } => assert!(
+                !host_key_mismatch,
+                "an absent fp set on either side is not a mismatch"
+            ),
             other => panic!("expected ReapEligible, got {other:?}"),
         }
     }

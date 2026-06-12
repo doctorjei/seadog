@@ -121,11 +121,35 @@ pub fn sweep(
 
             // Reap-eligible: GUID + confirmers agree. A ReapEligible always
             // implies a DB row (classify returns it only when one matched).
-            Classification::ReapEligible { guid } => {
+            // `host_key_mismatch` is a soft, non-blocking signal: when set we
+            // route an info-level breadcrumb (below) but the reap proceeds
+            // exactly as if it were clear.
+            Classification::ReapEligible {
+                guid,
+                host_key_mismatch,
+            } => {
                 let env = match db_row {
                     Some(e) => e,
                     None => continue, // unreachable: ReapEligible implies a row
                 };
+                // Non-blocking breadcrumb: a reused GUID whose guest
+                // regenerated its host keys. Purely additive observability —
+                // it does NOT gate, abort, or alter the reap below.
+                if host_key_mismatch {
+                    route(
+                        conn,
+                        config,
+                        now_unix,
+                        Event::Lifecycle {
+                            guid: guid.clone(),
+                            detail: format!(
+                                "env {} ({}) ssh host-key fingerprints regenerated \
+                                 (soft signal); reaping unaffected",
+                                guid, sig.name
+                            ),
+                        },
+                    );
+                }
                 handle_reap_candidate(
                     kento,
                     conn,
@@ -158,20 +182,33 @@ pub fn sweep(
                 if now_unix - env.created_at < age_floor {
                     continue;
                 }
-                outcome.vanished += 1;
-                let _ = store::mark_vanished(conn, &env.guid);
-                route(
-                    conn,
-                    config,
-                    now_unix,
-                    Event::Lifecycle {
-                        guid: env.guid.clone(),
-                        detail: format!(
-                            "env {} ({}) vanished: no live kento instance carries its guid",
-                            env.guid, env.name
-                        ),
-                    },
-                );
+                // Gate the success-side effects on the UPDATE succeeding: a
+                // transient lock must leave the row Active and route nothing,
+                // so the next sweep retries (self-healing). Don't `?` here —
+                // one stuck row must not abort the rest of the pass.
+                match store::mark_vanished(conn, &env.guid) {
+                    Ok(()) => {
+                        outcome.vanished += 1;
+                        route(
+                            conn,
+                            config,
+                            now_unix,
+                            Event::Lifecycle {
+                                guid: env.guid.clone(),
+                                detail: format!(
+                                    "env {} ({}) vanished: no live kento instance carries its guid",
+                                    env.guid, env.name
+                                ),
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "mark_vanished failed for {}: {e}; leaving Active for next sweep",
+                            env.guid
+                        );
+                    }
+                }
             }
         }
     }
@@ -476,6 +513,34 @@ images:
             EnvStatus::Reaped
         );
         assert_eq!(store::read_heartbeat(&conn).unwrap(), Some(now));
+    }
+
+    #[test]
+    fn host_key_mismatch_is_non_blocking_still_reaps() {
+        // A reused-GUID guest whose host keys regenerated: live fps are
+        // disjoint from the DB row's. The soft signal must NOT change the reap
+        // decision — the env is reaped exactly as a clean agreeing env would
+        // be (the breadcrumb routed alongside is best-effort observability).
+        let c = config();
+        let conn = store::open_in_memory().unwrap();
+        let now = 1_000_000i64;
+        insert_active(&conn, "g1", now - 3600, now - 100);
+        let mut s = signals_for(&conn, "g1");
+        // Disjoint from the row's vec!["SHA256:hk"] → host_key_mismatch=true.
+        s.ssh_host_key_fps = vec!["SHA256:regenerated".into()];
+        let k = FakeKento::new();
+        k.set_instances(vec![s]);
+
+        let out = sweep(&k, &conn, &c, now).unwrap();
+        assert_eq!(out.reaped, 1, "host-key mismatch must not block the reap");
+        assert_eq!(
+            k.teardowns(),
+            vec![("seadog-alice-p-g1".to_string(), Mode::Vm)]
+        );
+        assert_eq!(
+            store::get_env(&conn, "g1").unwrap().unwrap().status,
+            EnvStatus::Reaped
+        );
     }
 
     #[test]

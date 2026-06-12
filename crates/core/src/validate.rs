@@ -1,8 +1,11 @@
 //! Pure input validation for caller-supplied values.
 //!
 //! These checks run before anything touches the runtime or the DB: a
-//! guest `name` must be a strict DNS label of the `seadog-…` family, and
-//! an image must resolve through the **allowlist by bare name** only — a
+//! guest `name` must be a `seadog-`-prefixed label over `[a-z0-9-]`
+//! (lowercase, no underscores, no leading/trailing hyphen, ≤ 63 chars —
+//! not a fully strict DNS label, since internal consecutive hyphens are
+//! permitted), and an image must resolve through the **allowlist by bare
+//! name** only — a
 //! caller-supplied OCI ref must never resolve to a runnable image. All
 //! functions are side-effect-free and return [`Error::Validation`] on
 //! rejection so the front-end can surface a clear message.
@@ -21,17 +24,22 @@ use crate::Error;
 /// least one char after it. Leading/trailing hyphen and the overall
 /// length cap are enforced separately in [`validate_guest_name`] (the
 /// regex deliberately stays simple; the extra rules are clearer as code).
+/// Note the class permits internal consecutive hyphens (e.g. `seadog--x`),
+/// so this is not a fully strict DNS label; names are minted internally,
+/// so that is acceptable.
 fn name_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^seadog-[a-z0-9-]{1,}$").expect("static guest-name regex"))
 }
 
-/// Validate a PVE guest name as a strict DNS label of the `seadog-`
-/// family.
+/// Validate a PVE guest name: a `seadog-`-prefixed label over the charset
+/// `[a-z0-9-]`.
 ///
 /// Rules: matches `^seadog-[a-z0-9-]{1,}$`, total length ≤ 63, no
 /// underscores, no leading/trailing hyphen, lowercase only. (Guest names
-/// are `seadog-<owner>-<shortproj>-<token>`.)
+/// are `seadog-<owner>-<shortproj>-<token>`.) This is NOT a fully strict
+/// DNS label — internal consecutive hyphens like `seadog--x` are
+/// permitted; names are minted internally, so this is acceptable.
 pub fn validate_guest_name(name: &str) -> Result<(), Error> {
     if name.len() > 63 {
         return Err(Error::Validation(format!(

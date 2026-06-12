@@ -8,7 +8,9 @@
 //! unit-testable without a journal. The emit layer ([`emit`]) does the
 //! journald write (falling back to stderr if the socket is unavailable —
 //! a logging failure must never stop reaping) and runs the optional push
-//! sink.
+//! sink under a hard timeout ([`PUSH_TIMEOUT`]) so a flaky *or hanging*
+//! webhook can't wedge the reaper: emit runs inside the sweep, so the push
+//! command is bounded, killed + reaped on expiry, and its failure swallowed.
 //!
 //! ## Class policy
 //! - **Foreign-in-range heads-up**: emit ONCE per appearance, with an
@@ -22,8 +24,10 @@
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 use std::sync::Once;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use wait_timeout::ChildExt as _;
 
 use crate::config::Config;
 use crate::models::NotifyState;
@@ -291,7 +295,9 @@ pub fn init_logging() {
 ///
 /// Never returns an error from the journald path — logging is best-effort
 /// (init already falls back to stderr). Push-sink failures are logged but
-/// also swallowed so a flaky webhook can't wedge the reaper.
+/// also swallowed, and the push command runs under [`PUSH_TIMEOUT`]
+/// (killed + reaped on expiry), so a flaky *or hanging* webhook can't
+/// wedge the reaper.
 pub fn emit(event: &Event, decision: &NotifyDecision, config: &Config) {
     if !decision.emit {
         return;
@@ -349,6 +355,13 @@ fn push_payload(event: &Event, decision: &NotifyDecision) -> Result<String, Erro
     serde_json::to_string(&v).map_err(|e| Error::Kento(format!("json: {e}")))
 }
 
+/// Hard wall-clock bound on the operator's push command. emit() runs
+/// inside the sweep, so an unbounded `wait()` on a hanging hook (e.g. curl
+/// to a black-holed host) would stall ALL reaping. We kill + reap on expiry
+/// instead of blocking forever; the timeout is reported as a non-fatal
+/// [`Error::Kento`] that the caller logs and swallows.
+const PUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn run_command(cmd: &str, payload: &str) -> Result<(), Error> {
     // Pass the JSON both as a single argv argument and on stdin so simple
     // sinks can use either. Built as an argv vector (no shell).
@@ -362,9 +375,23 @@ fn run_command(cmd: &str, payload: &str) -> Result<(), Error> {
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(payload.as_bytes());
     }
-    let status = child
-        .wait()
-        .map_err(|e| Error::Kento(format!("wait push command: {e}")))?;
+    // Bounded wait: a hanging hook must not wedge the sweep. On expiry, kill
+    // and reap the child (the reaper is long-running — no zombies) and map to
+    // a non-fatal error the caller logs + swallows.
+    let status = match child
+        .wait_timeout(PUSH_TIMEOUT)
+        .map_err(|e| Error::Kento(format!("wait push command: {e}")))?
+    {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Kento(format!(
+                "push command '{cmd}' timed out after {}s",
+                PUSH_TIMEOUT.as_secs()
+            )));
+        }
+    };
     if !status.success() {
         return Err(Error::Kento(format!(
             "push command exited {:?}",
@@ -530,6 +557,30 @@ images:
             soft_deadline: created_at + 50,
             status,
         }
+    }
+
+    #[test]
+    fn run_command_bounds_a_hanging_hook() {
+        // A hanging push command (here `sleep` for far longer than the bound)
+        // must NOT block emit forever: run_command kills + reaps it and returns
+        // a non-fatal error well inside a generous wall-clock budget. This is
+        // the regression guard for the "can't wedge the reaper" claim.
+        use std::time::Instant;
+
+        // Sleep ~60s — wildly past PUSH_TIMEOUT (5s) — so a successful return
+        // can only come from the timeout path, never the child finishing.
+        let started = Instant::now();
+        let result = run_command("/bin/sleep", "60");
+        let elapsed = started.elapsed();
+
+        // Timed out → non-fatal error (logged + swallowed by fire_push).
+        assert!(result.is_err(), "a hanging hook must surface as an error");
+        // Returned promptly: bounded by PUSH_TIMEOUT, not the 60s sleep. The
+        // slack absorbs kill/reap + scheduler jitter without flaking.
+        assert!(
+            elapsed < PUSH_TIMEOUT + Duration::from_secs(10),
+            "run_command must return within the bound, took {elapsed:?}"
+        );
     }
 
     #[test]

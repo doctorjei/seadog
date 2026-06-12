@@ -119,6 +119,29 @@ pub fn validate_key_line(key_line: &str) -> Result<(), crate::Error> {
     Ok(())
 }
 
+/// Extract the base64 key blob from **any** `authorized_keys` line — managed
+/// (`command="…",restrict <keytype> <blob> …`) or bare (`<keytype> <blob>
+/// …`) — by scanning whitespace-split tokens left-to-right, taking the
+/// **first** token that is a recognized [`KEY_TYPES`] keytype and returning
+/// the token immediately after it as the blob. `None` if no keytype token is
+/// found or it is the last token (no blob follows).
+///
+/// Unlike [`key_body_of_line`] (a substring `find`), this is positional, so a
+/// keytype string embedded inside an option/comment can never mis-locate the
+/// blob: only a *whole* token equal to a keytype is recognized, and the blob
+/// is unambiguously the next token. This is what the `add-owner` conflict
+/// guard uses to compare an incoming blob against every existing line's blob,
+/// managed or not.
+pub fn key_blob_of_line(line: &str) -> Option<&str> {
+    let mut toks = line.split_whitespace();
+    while let Some(t) = toks.next() {
+        if KEY_TYPES.contains(&t) {
+            return toks.next();
+        }
+    }
+    None
+}
+
 /// Locate the `<keytype> <blob> [comment]` substring of an
 /// `authorized_keys` line, skipping any leading options field (e.g.
 /// `command="…",restrict`). Returns `None` if no recognizable key type is
@@ -301,6 +324,35 @@ mod tests {
     fn key_body_of_line_on_bare_body_is_identity() {
         let body = format!("ssh-ed25519 {BLOB} c@h");
         assert_eq!(key_body_of_line(&body), Some(body.as_str()));
+    }
+
+    #[test]
+    fn key_blob_of_line_on_bare_line() {
+        assert_eq!(key_blob_of_line(&format!("ssh-ed25519 {BLOB} c@h")), Some(BLOB));
+        // No comment.
+        assert_eq!(key_blob_of_line(&format!("ssh-ed25519 {BLOB}")), Some(BLOB));
+    }
+
+    #[test]
+    fn key_blob_of_line_on_managed_line() {
+        let line = format!("command=\"x --owner alice\",restrict ssh-ed25519 {BLOB} c@h");
+        assert_eq!(key_blob_of_line(&line), Some(BLOB));
+    }
+
+    #[test]
+    fn key_blob_of_line_none_when_no_keytype_or_no_blob() {
+        assert_eq!(key_blob_of_line(""), None);
+        assert_eq!(key_blob_of_line("# just a comment"), None);
+        // Keytype present but nothing follows it → no blob.
+        assert_eq!(key_blob_of_line("ssh-ed25519"), None);
+    }
+
+    #[test]
+    fn key_blob_of_line_ignores_keytype_token_in_comment() {
+        // A comment that merely mentions a keytype must not steal the slot:
+        // the FIRST whole keytype token wins, and its next token is the blob.
+        let line = format!("ssh-ed25519 {BLOB} note ssh-rsa elsewhere");
+        assert_eq!(key_blob_of_line(&line), Some(BLOB));
     }
 
     #[test]

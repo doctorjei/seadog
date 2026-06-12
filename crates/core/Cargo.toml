@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [features]
 # RealKento shells out to kento. Off by default so the lib
 # builds + tests with zero external tools (no blue).
-real-kento = ["dep:wait-timeout"]
+real-kento = []
 
 [dependencies]
 serde = { workspace = true }
@@ -27,4 +27,4 @@ regex = { workspace = true }
 tracing = { workspace = true }
 tracing-journald = { workspace = true }
 tracing-subscriber = { workspace = true }
-wait-timeout = { workspace = true, optional = true }
+wait-timeout = { workspace = true }

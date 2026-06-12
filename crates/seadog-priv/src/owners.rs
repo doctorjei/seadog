@@ -192,21 +192,34 @@ pub fn add_owner(args: &AddOwnerArgs) -> Result<Value> {
     let path = authkeys_path();
     let current = read_authkeys(&path)?;
 
-    // Idempotency / conflict check on the blob across managed lines.
+    // Idempotency / conflict check on the blob across EVERY parseable key
+    // line — managed *or* bare. We compare the incoming blob against the blob
+    // of each line via `key_blob_of_line` (positional, so a bare/non-managed
+    // line, or a managed line whose `--owner` is absent/malformed and thus
+    // invisible to `parse_owner_line`, is still covered). A same-owner managed
+    // duplicate stays an idempotent no-op; anything else carrying this blob is
+    // a conflict.
     for line in current.lines() {
-        if let Some(entry) = authkeys::parse_owner_line(line) {
-            if entry.blob == blob {
-                if entry.owner == args.owner {
-                    return Ok(json!({
-                        "ok": true,
-                        "added": false,
-                        "owner": args.owner,
-                        "blob": blob,
-                    }));
-                }
-                bail!("key already mapped to owner '{}'", entry.owner);
-            }
+        if authkeys::key_blob_of_line(line) != Some(blob.as_str()) {
+            continue;
         }
+        // The blob is already present on this line. If it is a managed line
+        // for *this* owner, re-adding it is idempotent (no-op success).
+        if let Some(entry) = authkeys::parse_owner_line(line) {
+            if entry.owner == args.owner {
+                return Ok(json!({
+                    "ok": true,
+                    "added": false,
+                    "owner": args.owner,
+                    "blob": blob,
+                }));
+            }
+            bail!("key already mapped to owner '{}'", entry.owner);
+        }
+        // A bare key, or a managed-looking line with no readable owner: the
+        // blob is spoken for, but not by a resolvable owner. Refuse rather
+        // than bind it to a possibly-unintended owner.
+        bail!("key blob already present in authorized_keys under a non-managed or owner-less line");
     }
 
     let new_line = authkeys::forced_command_line(FRONTEND_BIN, &args.owner, &args.key);
@@ -357,6 +370,47 @@ mod tests {
         // Not appended.
         let list = list_owners(&ListOwnersArgs {}).unwrap();
         assert_eq!(list["owners"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn add_rejects_blob_already_present_as_bare_key() {
+        let env = AuthkeysEnv::new();
+        // A pre-existing BARE (non-managed) authorized_keys line carrying the
+        // blob — never bound to an owner. add-owner must NOT silently bind it.
+        env.write(&format!("{}\n", key(BLOB_A, "preexisting@host")));
+        let err = add_owner(&AddOwnerArgs {
+            owner: "eve".into(),
+            key: key(BLOB_A, "eve@host"),
+        })
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("already present in authorized_keys"));
+        // The bare line is untouched; no managed eve line was appended.
+        let list = list_owners(&ListOwnersArgs {}).unwrap();
+        assert_eq!(list["owners"].as_array().unwrap().len(), 0);
+        assert!(env.read().contains(BLOB_A));
+    }
+
+    #[test]
+    fn add_rejects_blob_present_under_ownerless_managed_line() {
+        let env = AuthkeysEnv::new();
+        // A managed-LOOKING line whose forced command lacks `--owner` →
+        // `parse_owner_line` returns None, so the old guard missed it. The
+        // blob is still spoken for; widened guard must reject.
+        env.write(&format!(
+            "command=\"/usr/lib/seadog/seadog\",restrict ssh-ed25519 {BLOB_A} orphan@host\n"
+        ));
+        let err = add_owner(&AddOwnerArgs {
+            owner: "eve".into(),
+            key: key(BLOB_A, "eve@host"),
+        })
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("already present in authorized_keys"));
+        let list = list_owners(&ListOwnersArgs {}).unwrap();
+        assert_eq!(list["owners"].as_array().unwrap().len(), 0);
     }
 
     #[test]
