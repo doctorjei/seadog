@@ -600,25 +600,29 @@ main() {
   chmod 0666 "$FAKE_KENTO_STATE" 2>/dev/null || true
 
   printf '\n== scenario: pve (PVE-LXC) mode + vmid parse round-trip ==\n'
-  # Exercise parse_kento_inspect's type-driven family collapse + vmid
-  # extraction (kento.rs): inject a live instance reporting the REAL PVE-LXC
-  # kento-mode `pve` (kento promotes PVE-LXC to bare `pve`, NOT `pve-lxc`; the
-  # shim synthesizes the authoritative `type:"LXC"` for it) and a numeric
+  # Exercise the type-driven family collapse + vmid extraction (kento.rs):
+  # inject a live instance reporting the legacy bare PVE-LXC kento-mode `pve`
+  # (kento 1.5.3 normalizes this to `pve-lxc`, but seadog collapses family on
+  # the authoritative `type:"LXC"` the shim synthesizes, so bare `pve` is the
+  # defensive/back-compat case and still resolves to Mode::Lxc) and a numeric
   # `vmid`, carrying a SEADOG_GUID but with NO DB row → the sweep classifies it
-  # as an orphan and RE-ADOPTS it onto a fresh Active row. Because seadog parsed
-  # the inspect, the re-adopted row must record Mode::Lxc (the type-LXC
-  # collapse over bare `pve`) and the extracted vmid — proving both parse paths.
+  # as an orphan and RE-ADOPTS it onto a fresh Active row. The GUID must be a
+  # genuine seadog UUID (the re-adopt gate) and the name a valid `seadog-…`
+  # label. The re-adopted row must record Mode::Lxc (the type-LXC collapse) and
+  # the extracted vmid — proving both parse paths.
+  local pve_guid
+  pve_guid="7c9e6679-7425-40de-944b-e07fc1f90ae7"
   make_instance "seadog-jei-pve-bb22" \
-    '.mode="pve" | .vmid=10042 | .environment=["SEADOG_GUID=pve-guid","SEADOG_OWNER=jei"]' | inject_instance
+    '.mode="pve" | .vmid=10042 | .environment=["SEADOG_GUID='"$pve_guid"'","SEADOG_OWNER=jei"]' | inject_instance
   share_db_perms
   sweep_json="$(priv_sweep)"
   local pve_mode pve_vmid
-  pve_mode="$(sqlite3 "$SEADOG_DB" "SELECT mode FROM envs WHERE guid='pve-guid';")"
-  pve_vmid="$(sqlite3 "$SEADOG_DB" "SELECT vmid FROM envs WHERE guid='pve-guid';")"
+  pve_mode="$(sqlite3 "$SEADOG_DB" "SELECT mode FROM envs WHERE guid='$pve_guid';")"
+  pve_vmid="$(sqlite3 "$SEADOG_DB" "SELECT vmid FROM envs WHERE guid='$pve_guid';")"
   if [ "$pve_mode" = "lxc" ]; then pass "pve: bare-pve mode + type LXC parsed + collapsed to Mode::Lxc on the re-adopted row"; else fail "pve: mode not collapsed to lxc (got '$pve_mode')"; fi
   if [ "$pve_vmid" = "10042" ]; then pass "pve: vmid 10042 extracted + recorded"; else fail "pve: vmid not recorded (got '$pve_vmid')"; fi
   # Tear it down so it does not linger into the watch-singleton drain.
-  priv teardown --owner jei --guid pve-guid --mode lxc >/dev/null 2>&1 || true
+  priv teardown --owner jei --guid "$pve_guid" --mode lxc >/dev/null 2>&1 || true
 
   printf '\n== scenario: honest flock-gating (fresh skips, aged overrides) ==\n'
   # cadence.fast is a NONZERO 30s ⇒ the stale-watcher threshold is 3×30=90s.
