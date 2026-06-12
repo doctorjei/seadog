@@ -140,7 +140,7 @@ pub fn sweep(
                         conn,
                         config,
                         now_unix,
-                        Event::Lifecycle {
+                        Event::HostKeyRegen {
                             guid: guid.clone(),
                             detail: format!(
                                 "env {} ({}) ssh host-key fingerprints regenerated \
@@ -193,7 +193,7 @@ pub fn sweep(
                             conn,
                             config,
                             now_unix,
-                            Event::Lifecycle {
+                            Event::Vanished {
                                 guid: env.guid.clone(),
                                 detail: format!(
                                     "env {} ({}) vanished: no live kento instance carries its guid",
@@ -314,7 +314,7 @@ fn handle_reap_candidate(
                 conn,
                 config,
                 now_unix,
-                Event::Lifecycle {
+                Event::GraceWarning {
                     guid: guid.to_string(),
                     detail: format!("env {} ({}) within grace of ttl deadline", guid, sig.name),
                 },
@@ -353,7 +353,7 @@ fn handle_reap_candidate(
                 conn,
                 config,
                 now_unix,
-                Event::Lifecycle {
+                Event::Reaped {
                     guid: guid.to_string(),
                     detail: format!("reaped env {} ({}) past ttl", guid, sig.name),
                 },
@@ -385,24 +385,15 @@ fn handle_reap_candidate(
 /// [`emit`], and persist the new state when it emitted. Best-effort —
 /// notify failures never abort a sweep.
 fn route(conn: &Connection, config: &Config, now_unix: i64, event: Event) {
-    let key = event_key(&event);
+    // Load prior state by the event's OWN notify key (now namespaced per-kind
+    // for the one-shot lifecycle events). Use `Event::key` directly — no local
+    // mirror to drift out of sync.
+    let key = event.key();
     let prior = store::get_notify_state(conn, &key).ok().flatten();
     let decision = decide(&event, prior.as_ref(), config, now_unix);
     emit(&event, &decision, config);
     if decision.emit {
         let _ = store::put_notify_state(conn, &decision.new_state);
-    }
-}
-
-/// The notify-state key for an event (mirrors `Event::key`, exposed here
-/// only to load prior state before `decide`).
-fn event_key(event: &Event) -> String {
-    match event {
-        Event::ForeignHeadsUp { guid_or_vmid, .. } => guid_or_vmid.clone(),
-        Event::Anomaly { guid, .. }
-        | Event::OverdueUnreaped { guid, .. }
-        | Event::Lifecycle { guid, .. } => guid.clone(),
-        Event::SweeperDegraded { .. } => "sweeper".to_string(),
     }
 }
 
@@ -513,6 +504,53 @@ images:
             EnvStatus::Reaped
         );
         assert_eq!(store::read_heartbeat(&conn).unwrap(), Some(now));
+    }
+
+    #[test]
+    fn grace_warning_does_not_swallow_a_later_reap() {
+        // Regression for the dedup-collision bug: an env that logs a grace
+        // warning and is THEN reaped must produce BOTH notify_state rows. With
+        // the per-kind keys, the prior `{guid}:grace` row no longer suppresses
+        // the `{guid}:reaped` emission on the next sweep.
+        let c = config();
+        let conn = store::open_in_memory().unwrap();
+        let grace = c.lifecycle.grace.as_secs() as i64;
+        let deadline = 2_000_000i64;
+        // Created well before the age floor so the env is reap-eligible by age.
+        insert_active(&conn, "g1", deadline - 100_000, deadline);
+
+        // First sweep: inside the grace window (before the deadline) → warn,
+        // no reap, and a `{guid}:grace` notify_state row lands.
+        let now1 = deadline - grace / 2;
+        let k = FakeKento::new();
+        k.set_instances(vec![signals_for(&conn, "g1")]);
+        let out1 = sweep(&k, &conn, &c, now1).unwrap();
+        assert_eq!(out1.reaped, 0, "within grace: not reaped");
+        assert!(
+            store::get_notify_state(&conn, "g1:grace")
+                .unwrap()
+                .is_some(),
+            "grace warning must persist a `{{guid}}:grace` notify_state row"
+        );
+
+        // Second sweep: past the deadline → reap. The reap event keys on
+        // `g1:reaped`, distinct from the existing `g1:grace`, so it is NOT
+        // swallowed and its row lands.
+        let now2 = deadline + 100;
+        let k2 = FakeKento::new();
+        k2.set_instances(vec![signals_for(&conn, "g1")]);
+        let out2 = sweep(&k2, &conn, &c, now2).unwrap();
+        assert_eq!(out2.reaped, 1, "past deadline: reaped");
+        assert_eq!(
+            store::get_env(&conn, "g1").unwrap().unwrap().status,
+            EnvStatus::Reaped
+        );
+        assert!(
+            store::get_notify_state(&conn, "g1:reaped")
+                .unwrap()
+                .is_some(),
+            "reap event must NOT be swallowed by the prior grace row"
+        );
     }
 
     #[test]

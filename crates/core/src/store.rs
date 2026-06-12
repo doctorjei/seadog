@@ -499,8 +499,12 @@ pub fn mark_vanished(conn: &Connection, guid: &str) -> Result<(), Error> {
 /// `notify_state` no longer has an FK to `envs` (see the schema comment), so
 /// the old `ON DELETE CASCADE` that auto-removed an env's notify_state row is
 /// gone. We replicate it explicitly here: BEFORE deleting the env rows, drop
-/// the env-keyed notify_state rows for exactly the envs about to be pruned
-/// (same cutoff). Non-env keys ("vmid-<N>", "sweeper") are left untouched.
+/// the notify_state rows for exactly the envs about to be pruned (same
+/// cutoff). This covers BOTH the bare-guid escalating rows (`Anomaly`/
+/// `OverdueUnreaped`, keyed on the env guid) AND the per-kind one-shot
+/// lifecycle rows keyed `{guid}:<kind>` (grace/vanished/hostkey/reaped).
+/// Non-env keys ("vmid-<N>", "sweeper") never match an env guid or its
+/// `{guid}:` prefix, so they are left untouched.
 pub fn prune_terminal(
     conn: &Connection,
     now_unix: i64,
@@ -511,12 +515,22 @@ pub fn prune_terminal(
     // prune commit atomically (they emulate the dropped FK cascade).
     let tx = conn.unchecked_transaction()?;
     // Replace the dropped FK cascade: clear notify_state for exactly the
-    // terminal envs we're about to prune (env-keyed rows only).
+    // terminal envs we're about to prune. Two match shapes:
+    //   1. exact bare guid  — the escalating Anomaly/OverdueUnreaped rows.
+    //   2. `{guid}:%` prefix — the per-kind one-shot lifecycle rows.
+    // Env guids are validated UUIDs (hex + hyphens; no `%`/`_`/`:`), so the
+    // `LIKE e.guid || ':%'` prefix needs no ESCAPE clause — no guid contains a
+    // LIKE wildcard, and the literal ':' separator can't appear inside a guid.
     tx.execute(
         "DELETE FROM notify_state \
          WHERE guid IN ( \
              SELECT guid FROM envs \
              WHERE status IN ('reaped', 'vanished') AND created_at < ?1 \
+         ) \
+         OR guid IN ( \
+             SELECT ns.guid FROM notify_state ns \
+             JOIN envs e ON ns.guid LIKE e.guid || ':%' \
+             WHERE e.status IN ('reaped', 'vanished') AND e.created_at < ?1 \
          )",
         params![cutoff],
     )?;
@@ -705,6 +719,22 @@ images:
             },
         )
         .unwrap();
+        // Its per-kind one-shot lifecycle rows (namespaced `{guid}:<kind>`):
+        // these must be pruned alongside the bare-guid row.
+        for kind in ["g1:grace", "g1:reaped"] {
+            put_notify_state(
+                &conn,
+                &NotifyState {
+                    guid: kind.into(),
+                    last_severity: "notice".into(),
+                    last_emitted_at: now - retention - 10,
+                    acked: false,
+                    acked_by: None,
+                    acked_at: None,
+                },
+            )
+            .unwrap();
+        }
         // A foreign heads-up row keyed on a vmid token.
         put_notify_state(
             &conn,
@@ -725,6 +755,14 @@ images:
         assert!(
             get_notify_state(&conn, "g1").unwrap().is_none(),
             "env-keyed notify_state must be cleared with its env"
+        );
+        assert!(
+            get_notify_state(&conn, "g1:grace").unwrap().is_none(),
+            "per-kind `{{guid}}:grace` row must be cleared with its env"
+        );
+        assert!(
+            get_notify_state(&conn, "g1:reaped").unwrap().is_none(),
+            "per-kind `{{guid}}:reaped` row must be cleared with its env"
         );
         assert!(
             get_notify_state(&conn, "vmid-9999").unwrap().is_some(),

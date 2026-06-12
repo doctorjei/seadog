@@ -98,21 +98,40 @@ pub enum Event {
     /// Our env is overdue but still unreaped (e.g. herd-capped or
     /// teardown-failing). Re-alerts on backoff with climbing severity.
     OverdueUnreaped { guid: String, detail: String },
-    /// A normal lifecycle event (reaped / ttl / vanished). One emit.
-    Lifecycle { guid: String, detail: String },
+    /// Our env is within `grace` of its ttl deadline (warned, not killed).
+    /// Per-env, one emit; key `{guid}:grace`.
+    GraceWarning { guid: String, detail: String },
+    /// Our env's backing kento instance vanished (no live guid). Per-env,
+    /// one emit; key `{guid}:vanished`.
+    Vanished { guid: String, detail: String },
+    /// Soft breadcrumb: a reused-guid guest regenerated its ssh host keys.
+    /// Purely additive; per-env, one emit; key `{guid}:hostkey`.
+    HostKeyRegen { guid: String, detail: String },
+    /// Our env was reaped past its ttl deadline. Per-env, one emit; key
+    /// `{guid}:reaped`.
+    Reaped { guid: String, detail: String },
     /// The sweeper itself is degraded (quorum loss). Always crit.
     SweeperDegraded { detail: String },
 }
 
 impl Event {
-    /// The state key (env guid, or a vmid token for foreign guests).
-    fn key(&self) -> &str {
+    /// The state key. Escalating env events (`Anomaly`/`OverdueUnreaped`)
+    /// key on the BARE env guid — the `ack` verb acks by that bare guid, so
+    /// they must stay un-namespaced. Foreign keys on its vmid token, the
+    /// sweeper on its synthetic token. The four one-shot per-env lifecycle
+    /// events get a PER-KIND namespaced key (`{guid}:<kind>`) so distinct
+    /// events for one guid no longer collide in dedup, while two of the SAME
+    /// kind still share a key (dedup preserved). `pub(crate)` so `reap.rs`
+    /// loads prior state via this exact key (no mirror to drift).
+    pub(crate) fn key(&self) -> String {
         match self {
-            Event::ForeignHeadsUp { guid_or_vmid, .. } => guid_or_vmid,
-            Event::Anomaly { guid, .. }
-            | Event::OverdueUnreaped { guid, .. }
-            | Event::Lifecycle { guid, .. } => guid,
-            Event::SweeperDegraded { .. } => "sweeper",
+            Event::ForeignHeadsUp { guid_or_vmid, .. } => guid_or_vmid.clone(),
+            Event::Anomaly { guid, .. } | Event::OverdueUnreaped { guid, .. } => guid.clone(),
+            Event::GraceWarning { guid, .. } => format!("{guid}:grace"),
+            Event::Vanished { guid, .. } => format!("{guid}:vanished"),
+            Event::HostKeyRegen { guid, .. } => format!("{guid}:hostkey"),
+            Event::Reaped { guid, .. } => format!("{guid}:reaped"),
+            Event::SweeperDegraded { .. } => "sweeper".to_string(),
         }
     }
 
@@ -122,7 +141,10 @@ impl Event {
             Event::ForeignHeadsUp { detail, .. }
             | Event::Anomaly { detail, .. }
             | Event::OverdueUnreaped { detail, .. }
-            | Event::Lifecycle { detail, .. }
+            | Event::GraceWarning { detail, .. }
+            | Event::Vanished { detail, .. }
+            | Event::HostKeyRegen { detail, .. }
+            | Event::Reaped { detail, .. }
             | Event::SweeperDegraded { detail } => detail,
         }
     }
@@ -138,7 +160,11 @@ impl Event {
         match self {
             Event::ForeignHeadsUp { .. } => Severity::Info,
             Event::Anomaly { .. } => Severity::Warning,
-            Event::OverdueUnreaped { .. } | Event::Lifecycle { .. } => Severity::Notice,
+            Event::OverdueUnreaped { .. }
+            | Event::GraceWarning { .. }
+            | Event::Vanished { .. }
+            | Event::HostKeyRegen { .. }
+            | Event::Reaped { .. } => Severity::Notice,
             Event::SweeperDegraded { .. } => Severity::Crit,
         }
     }
@@ -169,7 +195,7 @@ pub fn decide(
     config: &Config,
     now_unix: i64,
 ) -> NotifyDecision {
-    let key = event.key().to_string();
+    let key = event.key();
     let reescalate = config.notify.reescalate.as_secs() as i64;
 
     // Acked → fully suppressed until the operator clears it.
@@ -315,10 +341,10 @@ pub fn emit(event: &Event, decision: &NotifyDecision, config: &Config) {
     // the severity as a field and rely on init's SYSLOG_IDENTIFIER.
     match sev {
         Severity::Crit | Severity::Warning => {
-            tracing::warn!(severity = sev.as_str(), key, "{detail}");
+            tracing::warn!(severity = sev.as_str(), key = %key, "{detail}");
         }
         Severity::Notice | Severity::Info => {
-            tracing::info!(severity = sev.as_str(), key, "{detail}");
+            tracing::info!(severity = sev.as_str(), key = %key, "{detail}");
         }
     }
 
@@ -427,7 +453,7 @@ fn sanitize_key(key: &str) -> String {
 fn drop_file(dir: &str, event: &Event, payload: &str) -> Result<(), Error> {
     let path = std::path::Path::new(dir).join(format!(
         "seadog-{}-{}.json",
-        sanitize_key(event.key()),
+        sanitize_key(&event.key()),
         crate::now_unix()
     ));
     std::fs::write(&path, payload)
@@ -470,13 +496,85 @@ images:
         // No journal socket in this sandbox → must not panic / error.
         init_logging();
         let c = config();
-        let ev = Event::Lifecycle {
+        let ev = Event::Reaped {
             guid: "g1".into(),
             detail: "reaped".into(),
         };
         let d = decide(&ev, None, &c, 1000);
         emit(&ev, &d, &c); // must not panic
         assert!(d.emit);
+    }
+
+    #[test]
+    fn per_env_lifecycle_kinds_have_distinct_keys() {
+        // The four one-shot per-env events for the SAME guid must yield four
+        // DISTINCT keys, so emitting one no longer suppresses the others.
+        let guid = "g1";
+        let grace = Event::GraceWarning {
+            guid: guid.into(),
+            detail: "grace".into(),
+        };
+        let vanished = Event::Vanished {
+            guid: guid.into(),
+            detail: "vanished".into(),
+        };
+        let hostkey = Event::HostKeyRegen {
+            guid: guid.into(),
+            detail: "hostkey".into(),
+        };
+        let reaped = Event::Reaped {
+            guid: guid.into(),
+            detail: "reaped".into(),
+        };
+        let keys = [grace.key(), vanished.key(), hostkey.key(), reaped.key()];
+        assert_eq!(keys[0], "g1:grace");
+        assert_eq!(keys[1], "g1:vanished");
+        assert_eq!(keys[2], "g1:hostkey");
+        assert_eq!(keys[3], "g1:reaped");
+        let unique: std::collections::HashSet<_> = keys.iter().collect();
+        assert_eq!(unique.len(), 4, "all four per-kind keys must be distinct");
+    }
+
+    #[test]
+    fn same_grace_kind_shares_key_so_dedup_is_preserved() {
+        // Two grace warnings for one guid share `{guid}:grace`, so a recurring
+        // 60s grace tick still dedups to one emission.
+        let a = Event::GraceWarning {
+            guid: "g1".into(),
+            detail: "within grace (tick 1)".into(),
+        };
+        let b = Event::GraceWarning {
+            guid: "g1".into(),
+            detail: "within grace (tick 2)".into(),
+        };
+        assert_eq!(a.key(), b.key());
+
+        let c = config();
+        let first = decide(&a, None, &c, 1000);
+        assert!(first.emit, "first grace warning emits");
+        // Same key → the persisted prior suppresses the second.
+        let second = decide(&b, Some(&first.new_state), &c, 1060);
+        assert!(!second.emit, "second grace warning dedups");
+    }
+
+    #[test]
+    fn reaped_emits_even_with_a_separate_grace_row() {
+        // A Reaped (key `g1:reaped`) with no prior of its OWN key emits, even
+        // though a grace row (`g1:grace`) exists — distinct keys, so the prior
+        // grace no longer swallows the reap. This is the core bug fix.
+        let c = config();
+        let reaped = Event::Reaped {
+            guid: "g1".into(),
+            detail: "reaped env g1 past ttl".into(),
+        };
+        // `route()` loads prior by the event's OWN key; a grace row lives under
+        // a different key, so `Reaped`'s prior is None → it emits.
+        let d = decide(&reaped, None, &c, 2000);
+        assert!(
+            d.emit,
+            "reaped must emit; not blocked by a separate grace row"
+        );
+        assert_eq!(d.severity, Severity::Notice);
     }
 
     #[test]
