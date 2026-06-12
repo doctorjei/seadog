@@ -130,9 +130,12 @@ fn set_ttl_deadline_updates_and_errors_on_missing() {
     let env = sample_env("g1", Some(10000), "alice");
     store::insert_env(&conn, &env).unwrap();
     assert_eq!(env.ttl_deadline, 4_600);
+    assert_eq!(env.created_at, 1_000);
 
-    // Bump the deadline (the `extend` verb's DB op).
-    store::set_ttl_deadline(&conn, "g1", 9_000).unwrap();
+    // Bump the deadline (the `extend` verb's DB op). A generous ceiling
+    // (created_at + 1e9) leaves 9_000 unclamped; the stored value is returned.
+    let stored = store::set_ttl_deadline(&conn, "g1", 9_000, 1_000_000_000).unwrap();
+    assert_eq!(stored, 9_000);
     assert_eq!(
         store::get_env(&conn, "g1").unwrap().unwrap().ttl_deadline,
         9_000
@@ -144,7 +147,31 @@ fn set_ttl_deadline_updates_and_errors_on_missing() {
     assert_eq!(got.status, EnvStatus::Active);
 
     // Missing guid is a typed NotFound error.
-    assert!(store::set_ttl_deadline(&conn, "nope", 1).is_err());
+    assert!(store::set_ttl_deadline(&conn, "nope", 1, 1_000_000_000).is_err());
+}
+
+#[test]
+fn set_ttl_deadline_clamps_to_max_ttl_window() {
+    let conn = store::open_in_memory().unwrap();
+    let env = sample_env("g1", Some(10000), "alice"); // created_at = 1_000
+    store::insert_env(&conn, &env).unwrap();
+
+    // max_ttl of 3_600s ⇒ ceiling = created_at + 3_600 = 4_600. A request far
+    // past the ceiling is clamped DOWN to it; the clamped value is returned.
+    let stored = store::set_ttl_deadline(&conn, "g1", 999_999_999, 3_600).unwrap();
+    assert_eq!(stored, 4_600, "deadline clamped down to created_at + max_ttl");
+    assert_eq!(
+        store::get_env(&conn, "g1").unwrap().unwrap().ttl_deadline,
+        4_600
+    );
+
+    // A request BELOW created_at is clamped UP to created_at (never earlier).
+    let stored = store::set_ttl_deadline(&conn, "g1", 0, 3_600).unwrap();
+    assert_eq!(stored, 1_000, "deadline clamped up to created_at");
+
+    // A request inside the window passes through unchanged.
+    let stored = store::set_ttl_deadline(&conn, "g1", 2_000, 3_600).unwrap();
+    assert_eq!(stored, 2_000);
 }
 
 #[test]
@@ -180,16 +207,20 @@ fn notify_state_write_read() {
         last_severity: "warning".to_string(),
         last_emitted_at: 1234,
         acked: false,
+        acked_by: None,
+        acked_at: None,
     };
     store::put_notify_state(&conn, &s).unwrap();
     assert_eq!(store::get_notify_state(&conn, "g1").unwrap().unwrap(), s);
 
-    // Upsert path.
+    // Upsert path: also exercises the ack-audit columns round-tripping.
     let s2 = NotifyState {
         guid: "g1".to_string(),
         last_severity: "critical".to_string(),
         last_emitted_at: 5678,
         acked: true,
+        acked_by: Some("alice".to_string()),
+        acked_at: Some(5678),
     };
     store::put_notify_state(&conn, &s2).unwrap();
     assert_eq!(store::get_notify_state(&conn, "g1").unwrap().unwrap(), s2);

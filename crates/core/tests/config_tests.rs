@@ -248,6 +248,95 @@ fn rejects_empty_images() {
 }
 
 #[test]
+fn rejects_same_ref_aliases_with_divergent_user() {
+    // Two aliases sharing one ref but pinning DIFFERENT effective users:
+    // login_user_for_ref would mis-attribute, so validate must reject.
+    let diverge_user = r#"
+images:
+  a: { ref: r/same:1, modes: [vm], user: alice }
+  b: { ref: r/same:1, modes: [vm], user: bob }
+"#;
+    let cfg = Config::from_yaml_str(diverge_user).expect("parse");
+    let err = cfg.validate().expect_err("divergent user must fail");
+    assert!(matches!(err, Error::ConfigValidation(_)), "{err:?}");
+
+    // Diverging via the DEFAULT user vs an explicit one that differs from it:
+    // alias `a` resolves to default_user "root", alias `b` pins "bob".
+    let diverge_default = r#"
+images:
+  a: { ref: r/same:1, modes: [vm] }
+  b: { ref: r/same:1, modes: [vm], user: bob }
+"#;
+    let cfg = Config::from_yaml_str(diverge_default).expect("parse");
+    assert!(matches!(
+        cfg.validate(),
+        Err(Error::ConfigValidation(_))
+    ));
+}
+
+#[test]
+fn accepts_same_ref_aliases_that_agree() {
+    // Two aliases on one ref that AGREE on the effective user are fine (a
+    // legitimate aliasing of the same image).
+    let yaml = r#"
+default_user: agent
+images:
+  a: { ref: r/same:1, modes: [vm], user: agent, allow_nesting: true }
+  b: { ref: r/same:1, modes: [lxc], user: agent, allow_nesting: true }
+"#;
+    let cfg = Config::from_yaml_str(yaml).expect("parse");
+    cfg.validate().expect("agreeing aliases must validate");
+
+    // Agreement holds on the USER even when nesting DIFFERS: serving one ref
+    // under a nesting-off and a nesting-on alias (same user) is the intended,
+    // shipped feature that nesting_ok_for_ref relies on — validate must accept.
+    let diverge_nesting_same_user = r#"
+default_user: droste
+images:
+  stuffer:        { ref: r/stuffer:1, modes: [vm], allow_nesting: false }
+  stuffer-nested: { ref: r/stuffer:1, modes: [vm], allow_nesting: true }
+"#;
+    let cfg = Config::from_yaml_str(diverge_nesting_same_user).expect("parse");
+    cfg.validate()
+        .expect("same-ref aliases differing only on nesting must validate");
+    // And the by-ref nesting resolver distinguishes the two requests.
+    assert!(cfg.nesting_ok_for_ref("r/stuffer:1", true));
+    assert!(cfg.nesting_ok_for_ref("r/stuffer:1", false));
+
+    // Agreement also holds when one relies on the default and the other pins
+    // the same value explicitly (both resolve to "agent", nesting absent⇒false).
+    let via_default = r#"
+default_user: agent
+images:
+  a: { ref: r/same:1, modes: [vm] }
+  b: { ref: r/same:1, modes: [lxc], user: agent }
+"#;
+    let cfg = Config::from_yaml_str(via_default).expect("parse");
+    cfg.validate().expect("default-resolved agreement must validate");
+}
+
+#[test]
+fn max_ttl_defaults_to_7_days() {
+    let yaml = r#"
+images:
+  loom: { ref: r/loom:1, modes: [lxc] }
+"#;
+    let cfg = Config::from_yaml_str(yaml).expect("parse");
+    cfg.validate().expect("validates");
+    assert_eq!(cfg.lifecycle.max_ttl, Duration::from_secs(7 * 24 * 3600));
+
+    // Overridable via humantime.
+    let custom = r#"
+lifecycle:
+  max_ttl: 2d
+images:
+  loom: { ref: r/loom:1, modes: [lxc] }
+"#;
+    let cfg = Config::from_yaml_str(custom).expect("parse");
+    assert_eq!(cfg.lifecycle.max_ttl, Duration::from_secs(2 * 24 * 3600));
+}
+
+#[test]
 fn rejects_malformed_ip_range() {
     let yaml = r#"
 allocation:

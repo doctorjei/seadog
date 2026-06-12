@@ -149,4 +149,9 @@ pub struct NotifyState {
     pub last_emitted_at: i64,
     /// Operator acknowledged — suppresses further escalation.
     pub acked: bool,
+    /// Who acked, when acked (audit trail). `None` until an `ack` sets
+    /// `acked = true`; the emit path leaves both `None`.
+    pub acked_by: Option<String>,
+    /// When the ack happened, unix epoch seconds. `None` until acked.
+    pub acked_at: Option<i64>,
 }

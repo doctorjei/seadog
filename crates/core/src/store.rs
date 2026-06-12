@@ -18,7 +18,8 @@
 //! whose `version` exceeds the DB's current `user_version`, in ascending
 //! order, each inside its own transaction. [`MIGRATIONS`] carries the
 //! version-2 `envs` rebuild (`vmid` made nullable + `ssh_host_key_fps`
-//! added) — the framework's first real migration.
+//! added) and the version-3 `notify_state` ack-audit columns (`acked_by` /
+//! `acked_at`).
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -74,11 +75,18 @@ const BASELINE_VERSION: i64 = 1;
 /// `version`, every version above the baseline. Version 2 rebuilds `envs`
 /// to make `vmid` nullable and add the `ssh_host_key_fps` column (the PVE
 /// decouple: vmid drops to optional informational, host-key fps become a
-/// confirmer).
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 2,
-    up: m2_vmid_nullable_add_fps,
-}];
+/// confirmer). Version 3 adds the `acked_by` / `acked_at` audit columns to
+/// `notify_state`.
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 2,
+        up: m2_vmid_nullable_add_fps,
+    },
+    Migration {
+        version: 3,
+        up: m3_notify_ack_audit,
+    },
+];
 
 /// Migration v2 — make `vmid` nullable and add `ssh_host_key_fps`.
 ///
@@ -118,6 +126,21 @@ fn m2_vmid_nullable_add_fps(conn: &Connection) -> Result<(), Error> {
         ALTER TABLE envs_new RENAME TO envs;
         CREATE INDEX IF NOT EXISTS idx_envs_owner  ON envs(owner);
         CREATE INDEX IF NOT EXISTS idx_envs_status ON envs(status);
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Migration v3 — add the `acked_by` / `acked_at` ack-audit columns.
+///
+/// Plain additive `ALTER TABLE ... ADD COLUMN` (both nullable, no default),
+/// so no table rebuild is needed: existing rows read the new columns as
+/// NULL. The engine wraps this in its own transaction.
+fn m3_notify_ack_audit(conn: &Connection) -> Result<(), Error> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE notify_state ADD COLUMN acked_by TEXT;
+        ALTER TABLE notify_state ADD COLUMN acked_at INTEGER;
         "#,
     )?;
     Ok(())
@@ -380,18 +403,45 @@ pub fn mark_reaped(conn: &Connection, guid: &str) -> Result<(), Error> {
 }
 
 /// Update an env's hard-kill `ttl_deadline` (the DB-authoritative kill
-/// time). Used by the unprivileged `extend` verb — no PVE/root op is
-/// needed since the deadline lives only in the DB. `NotFound` if the
-/// `guid` has no row.
-pub fn set_ttl_deadline(conn: &Connection, guid: &str, ttl_deadline: i64) -> Result<(), Error> {
+/// time), clamped to a sane window. Used by the unprivileged `extend` verb
+/// (and indirectly `create`) — no PVE/root op is needed since the deadline
+/// lives only in the DB.
+///
+/// This is the authoritative sanity gate: the requested `ttl_deadline` is
+/// clamped into `[created_at, created_at + max_ttl_secs]` — never before the
+/// row's own create time, never past the `max_ttl` ceiling — so no caller can
+/// store an absurd deadline that yields an effectively-never-reaped env. The
+/// CLAMPED value actually written is returned. `NotFound` if the `guid` has
+/// no row.
+pub fn set_ttl_deadline(
+    conn: &Connection,
+    guid: &str,
+    ttl_deadline: i64,
+    max_ttl_secs: i64,
+) -> Result<i64, Error> {
+    let created_at: i64 = conn
+        .query_row(
+            "SELECT created_at FROM envs WHERE guid = ?1",
+            params![guid],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| Error::NotFound(format!("env guid '{guid}'")))?;
+
+    // Clamp into [created_at, created_at + max_ttl_secs]: up to created_at if
+    // below, down to the ceiling if above. saturating_add guards a huge
+    // max_ttl_secs against i64 overflow.
+    let cap_hi = created_at.saturating_add(max_ttl_secs);
+    let clamped = ttl_deadline.clamp(created_at, cap_hi);
+
     let n = conn.execute(
         "UPDATE envs SET ttl_deadline = ?1 WHERE guid = ?2",
-        params![ttl_deadline, guid],
+        params![clamped, guid],
     )?;
     if n == 0 {
         return Err(Error::NotFound(format!("env guid '{guid}'")));
     }
-    Ok(())
+    Ok(clamped)
 }
 
 /// Update an env's recorded `mac` to the **effective** MAC the guest
@@ -485,13 +535,22 @@ pub fn prune_terminal(
 pub fn put_notify_state(conn: &Connection, s: &NotifyState) -> Result<(), Error> {
     conn.execute(
         r#"INSERT INTO notify_state
-              (guid, last_severity, last_emitted_at, acked)
-           VALUES (?1, ?2, ?3, ?4)
+              (guid, last_severity, last_emitted_at, acked, acked_by, acked_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6)
            ON CONFLICT(guid) DO UPDATE SET
               last_severity   = excluded.last_severity,
               last_emitted_at = excluded.last_emitted_at,
-              acked           = excluded.acked"#,
-        params![s.guid, s.last_severity, s.last_emitted_at, s.acked as i64],
+              acked           = excluded.acked,
+              acked_by        = excluded.acked_by,
+              acked_at        = excluded.acked_at"#,
+        params![
+            s.guid,
+            s.last_severity,
+            s.last_emitted_at,
+            s.acked as i64,
+            s.acked_by,
+            s.acked_at,
+        ],
     )?;
     Ok(())
 }
@@ -500,7 +559,7 @@ pub fn put_notify_state(conn: &Connection, s: &NotifyState) -> Result<(), Error>
 pub fn get_notify_state(conn: &Connection, guid: &str) -> Result<Option<NotifyState>, Error> {
     let s = conn
         .query_row(
-            "SELECT guid, last_severity, last_emitted_at, acked \
+            "SELECT guid, last_severity, last_emitted_at, acked, acked_by, acked_at \
              FROM notify_state WHERE guid = ?1",
             params![guid],
             |row| {
@@ -510,6 +569,8 @@ pub fn get_notify_state(conn: &Connection, guid: &str) -> Result<Option<NotifySt
                     last_severity: row.get("last_severity")?,
                     last_emitted_at: row.get("last_emitted_at")?,
                     acked: acked != 0,
+                    acked_by: row.get("acked_by")?,
+                    acked_at: row.get("acked_at")?,
                 })
             },
         )
@@ -588,6 +649,8 @@ images:
             last_severity: "info".into(),
             last_emitted_at: 1000,
             acked: false,
+            acked_by: None,
+            acked_at: None,
         };
         put_notify_state(&conn, &s).unwrap();
         let got = get_notify_state(&conn, "vmid-10001").unwrap();
@@ -637,6 +700,8 @@ images:
                 last_severity: "notice".into(),
                 last_emitted_at: now - retention - 10,
                 acked: false,
+                acked_by: None,
+                acked_at: None,
             },
         )
         .unwrap();
@@ -648,6 +713,8 @@ images:
                 last_severity: "info".into(),
                 last_emitted_at: now,
                 acked: false,
+                acked_by: None,
+                acked_at: None,
             },
         )
         .unwrap();
@@ -842,7 +909,10 @@ images:
         assert_eq!(user_version(&conn), BASELINE_VERSION);
 
         run_migrations(&conn, MIGRATIONS).unwrap();
-        assert_eq!(user_version(&conn), 2);
+        // Fresh-from-baseline applies every registered migration, landing at
+        // the highest version (currently v3, the ack-audit columns).
+        let latest = MIGRATIONS.iter().map(|m| m.version).max().unwrap();
+        assert_eq!(user_version(&conn), latest);
 
         // The pre-existing row survives: vmid still readable (Some), the new
         // fps column present and defaulted to '' (→ empty Vec on read).
@@ -874,6 +944,42 @@ images:
             )
             .unwrap();
         assert_eq!(idx, 0, "idx_envs_vmid must be gone after v2");
+    }
+
+    /// The production v3 migration adds the `acked_by` / `acked_at` columns
+    /// to `notify_state`: pre-existing rows read the new columns as NULL
+    /// (→ `None`), and a fresh write round-trips a populated ack audit.
+    #[test]
+    fn migration_v3_adds_ack_audit_columns() {
+        // A fresh DB has already applied the whole chain (v2 + v3).
+        let conn = open_in_memory().unwrap();
+        let latest = MIGRATIONS.iter().map(|m| m.version).max().unwrap();
+        assert_eq!(user_version(&conn), latest);
+        assert!(latest >= 3, "v3 must be registered");
+
+        // A row written without audit reads back None/None.
+        let plain = NotifyState {
+            guid: "vmid-1".into(),
+            last_severity: "info".into(),
+            last_emitted_at: 1000,
+            acked: false,
+            acked_by: None,
+            acked_at: None,
+        };
+        put_notify_state(&conn, &plain).unwrap();
+        assert_eq!(get_notify_state(&conn, "vmid-1").unwrap(), Some(plain));
+
+        // A populated ack audit round-trips through the new columns.
+        let acked = NotifyState {
+            guid: "g1".into(),
+            last_severity: "warning".into(),
+            last_emitted_at: 2000,
+            acked: true,
+            acked_by: Some("alice".into()),
+            acked_at: Some(2500),
+        };
+        put_notify_state(&conn, &acked).unwrap();
+        assert_eq!(get_notify_state(&conn, "g1").unwrap(), Some(acked));
     }
 
     /// Insert/read round-trip through the production schema: an `Option`

@@ -239,6 +239,8 @@ fn ack_flips_notify_state() {
             last_severity: "warn".into(),
             last_emitted_at: 1234,
             acked: false,
+            acked_by: None,
+            acked_at: None,
         },
     )
     .unwrap();
@@ -251,6 +253,51 @@ fn ack_flips_notify_state() {
     let s = store::get_notify_state(&fx.conn(), "g-1").unwrap().unwrap();
     assert!(s.acked);
     assert_eq!(s.last_severity, "warn", "ack must not clobber severity");
+    // Audit recorded: who acked (the trusted owner) and when (some time).
+    assert_eq!(s.acked_by.as_deref(), Some("alice"));
+    assert!(s.acked_at.is_some(), "ack must record acked_at");
+}
+
+#[test]
+fn ack_refuses_foreign_healthy_env_but_allows_flagged() {
+    let fx = Fixture::new();
+    let conn = fx.conn();
+    // bob's healthy (Active) env — alice must NOT be able to mute it.
+    store::insert_env(
+        &conn,
+        &mk_env("g-bob-active", 10010, "bob", EnvStatus::Active, 1000, 5000),
+    )
+    .unwrap();
+    // bob's Flagged env — anyone may silence the anomaly heads-up.
+    store::insert_env(
+        &conn,
+        &mk_env("g-bob-flagged", 10011, "bob", EnvStatus::Flagged, 1000, 5000),
+    )
+    .unwrap();
+
+    // alice acking bob's healthy env is refused (scope check).
+    let (ok, _json, err) = fx.run("alice", &["ack", "g-bob-active"]);
+    assert!(!ok, "acking a foreign healthy env must be refused");
+    let errobj: Value = serde_json::from_str(&err).unwrap();
+    assert!(
+        errobj["error"].as_str().unwrap().contains("not yours"),
+        "error should explain the scope: {err}"
+    );
+    // No notify_state row was created for the refused env.
+    assert!(store::get_notify_state(&fx.conn(), "g-bob-active")
+        .unwrap()
+        .is_none());
+
+    // alice acking bob's Flagged env is allowed (the legitimate case), and
+    // the audit records alice as the acker even though she isn't the owner.
+    let (ok, json, err) = fx.run("alice", &["ack", "g-bob-flagged"]);
+    assert!(ok, "acking a flagged env must be allowed; stderr: {err}");
+    assert_eq!(json["acked"], true);
+    let s = store::get_notify_state(&fx.conn(), "g-bob-flagged")
+        .unwrap()
+        .unwrap();
+    assert!(s.acked);
+    assert_eq!(s.acked_by.as_deref(), Some("alice"));
 }
 
 #[test]

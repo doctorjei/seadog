@@ -63,10 +63,18 @@ pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
     let mode = resolved.mode;
 
     // 2. Compute deadlines from overrides or lifecycle defaults.
-    let ttl_secs = match &args.ttl {
+    let mut ttl_secs = match &args.ttl {
         Some(s) => parse_secs(s)?,
         None => ctx.config.lifecycle.default_ttl.as_secs() as i64,
     };
+    // Clamp the hard TTL to the configured ceiling so a create can't mint an
+    // effectively-never-reaped env (the store re-clamps on the way in too;
+    // this keeps the JSON `ttl_deadline` honest at create time). The soft
+    // `duration`/`dur_secs` below is informational and intentionally
+    // unclamped.
+    let max_ttl_secs = i64::try_from(ctx.config.lifecycle.max_ttl.as_secs())
+        .map_err(|_| anyhow!("configured max_ttl is too large"))?;
+    ttl_secs = ttl_secs.min(max_ttl_secs);
     let dur_secs = match &args.duration {
         Some(s) => parse_secs(s)?,
         None => ctx.config.lifecycle.default_duration.as_secs() as i64,

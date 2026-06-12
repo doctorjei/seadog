@@ -200,6 +200,8 @@ pub fn decide(
                         last_severity: sev.as_str().to_string(),
                         last_emitted_at: now_unix,
                         acked: false,
+                        acked_by: None,
+                        acked_at: None,
                     },
                 }
             }
@@ -225,6 +227,8 @@ pub fn decide(
                             last_severity: next.as_str().to_string(),
                             last_emitted_at: now_unix,
                             acked: false,
+                            acked_by: None,
+                            acked_at: None,
                         },
                     }
                 }
@@ -253,6 +257,8 @@ pub fn decide(
                     last_severity: sev.as_str().to_string(),
                     last_emitted_at: now_unix,
                     acked: false,
+                    acked_by: None,
+                    acked_at: None,
                 },
             }
         }

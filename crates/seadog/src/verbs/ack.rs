@@ -3,29 +3,44 @@
 //!
 //! DB-only: flips the `acked` flag in the env's `notify_state` row. Keyed by
 //! the env-id (`guid`) — the same id `destroy`/`show` take — which is also
-//! the `notify_state` primary key. `ack` exists to silence a foreign/anomaly
-//! heads-up, so it is intentionally *not* owner-scoped (an anomaly env may
-//! not be owned by the acker).
+//! the `notify_state` primary key.
+//!
+//! Scoped: an owner may ack their **own** env, or any env that is `Flagged`
+//! (the legitimate "silence a foreign/anomaly heads-up" case — a flagged env
+//! may not be owned by the acker). Acking another owner's *healthy* env is
+//! refused, so a stranger who knows a guid can't mute someone's live env. The
+//! ack also records who acked and when (`acked_by` / `acked_at`) for audit.
 
 use anyhow::{anyhow, Result};
-use seadog_core::models::NotifyState;
+use seadog_core::models::{EnvStatus, NotifyState};
 use seadog_core::store;
 use serde_json::{json, Value};
 
 use super::Ctx;
 
-/// `ack <env-id>`. Resolves the env-id (guid) to its env, then sets that
-/// env's notify-state `acked = true` (creating the row if none exists yet,
-/// so an ack lands even before the reaper has emitted). Returns the affected
-/// guid.
+/// `ack <env-id>`. Resolves the env-id (guid) to its env, enforces the ack
+/// scope (own env OR `Flagged`), then sets that env's notify-state
+/// `acked = true` plus the `acked_by` / `acked_at` audit (creating the row if
+/// none exists yet, so an ack lands even before the reaper has emitted).
+/// Returns the affected guid.
 pub fn run(ctx: &Ctx, env_id: &str) -> Result<Value> {
     let env =
         store::get_env(ctx.conn, env_id)?.ok_or_else(|| anyhow!("env '{env_id}' not found"))?;
+
+    // Scope: only the owner may mute their own env; anyone may silence a
+    // Flagged anomaly heads-up. Refuse acking a foreign healthy env.
+    if env.owner != ctx.owner && env.status != EnvStatus::Flagged {
+        return Err(anyhow!(
+            "env '{env_id}' is not yours and not flagged; cannot ack"
+        ));
+    }
 
     let prior = store::get_notify_state(ctx.conn, &env.guid)?;
     let new_state = match prior {
         Some(mut s) => {
             s.acked = true;
+            s.acked_by = Some(ctx.owner.clone());
+            s.acked_at = Some(ctx.now_unix);
             s
         }
         None => NotifyState {
@@ -33,6 +48,8 @@ pub fn run(ctx: &Ctx, env_id: &str) -> Result<Value> {
             last_severity: String::new(),
             last_emitted_at: ctx.now_unix,
             acked: true,
+            acked_by: Some(ctx.owner.clone()),
+            acked_at: Some(ctx.now_unix),
         },
     };
     store::put_notify_state(ctx.conn, &new_state)?;

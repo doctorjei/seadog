@@ -8,7 +8,7 @@
 //! [`Config::validate`] after parsing to catch semantic errors the type
 //! system can't (empty allowlist, inverted ranges).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::time::Duration;
@@ -187,6 +187,13 @@ pub struct Lifecycle {
     /// Hard kill; per-env override at create.
     #[serde(with = "humantime_serde", default = "mins_60")]
     pub default_ttl: Duration,
+    /// Hard ceiling on any env's lifetime: no create `--ttl` or `extend`
+    /// may push the hard-kill deadline beyond `created_at + max_ttl`. The
+    /// authoritative store layer ([`crate::store::set_ttl_deadline`]) clamps
+    /// to this, so even a malformed/oversized request can't yield an
+    /// effectively-never-reaped env. Default 7 days.
+    #[serde(with = "humantime_serde", default = "days_7")]
+    pub max_ttl: Duration,
     /// Warning window before the hard kill (warn at ttl - grace).
     #[serde(with = "humantime_serde", default = "mins_10")]
     pub grace: Duration,
@@ -202,6 +209,7 @@ impl Default for Lifecycle {
             age_floor: mins_5(),
             default_duration: mins_30(),
             default_ttl: mins_60(),
+            max_ttl: days_7(),
             grace: mins_10(),
             herd_cap: herd_cap_default(),
         }
@@ -273,7 +281,9 @@ impl Config {
     /// Validate semantic invariants the type system can't enforce.
     ///
     /// Errors on: an empty `images` allowlist; an inverted/degenerate
-    /// IP-pool range.
+    /// IP-pool range; two aliases sharing one OCI `ref` but disagreeing on
+    /// their effective login user (which would make `login_user_for_ref`
+    /// ambiguous).
     pub fn validate(&self) -> Result<(), Error> {
         if self.images.is_empty() {
             return Err(Error::ConfigValidation(
@@ -285,6 +295,37 @@ impl Config {
                 return Err(Error::ConfigValidation(format!(
                     "image '{name}' must allow at least one mode"
                 )));
+            }
+        }
+
+        // Two aliases may legitimately share one OCI `ref`, but
+        // [`Config::login_user_for_ref`] resolves the login user by ref alone,
+        // so aliases that share a ref MUST agree on the effective login user
+        // (default-resolved). Otherwise login_user_for_ref would mis-attribute
+        // the user (default root) to whichever alias happened to sort first.
+        // Reject a divergent pair loudly here so that resolver stays
+        // unambiguous. Nesting is allowed to differ between same-ref aliases
+        // (that's an intentional feature) and is handled separately by
+        // [`Config::nesting_ok_for_ref`], so it is NOT checked here.
+        let mut seen: HashMap<&str, (&str, &String)> = HashMap::new();
+        for (name, img) in &self.images {
+            let eff_user = img.user.as_ref().unwrap_or(&self.default_user);
+            match seen.get(img.image_ref.as_str()) {
+                None => {
+                    seen.insert(img.image_ref.as_str(), (name, eff_user));
+                }
+                Some((first_name, first_user)) => {
+                    if first_user != &eff_user {
+                        return Err(Error::ConfigValidation(format!(
+                            "images '{first_name}' and '{name}' share ref \
+                             '{}' but pin different login users \
+                             ('{first_user}' vs '{eff_user}'); aliases sharing \
+                             a ref must agree on user (login_user_for_ref \
+                             resolves by ref alone)",
+                            img.image_ref
+                        )));
+                    }
+                }
             }
         }
 

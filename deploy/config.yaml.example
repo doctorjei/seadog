@@ -51,6 +51,7 @@ lifecycle:
   age_floor: 5m                 # never reap envs younger than this (non-atomic create window)
   default_duration: 30m         # soft "expected done" alert (informational)
   default_ttl: 1h               # hard kill; per-env override at create
+  max_ttl: 7d                   # hard ceiling on any env's lifetime; create --ttl / extend are clamped to created_at + this
   grace: 10m                    # warning window before the hard kill (warn at ttl - grace)
   herd_cap: 10                  # max reaps per sweep; remainder carried to next tick
 
