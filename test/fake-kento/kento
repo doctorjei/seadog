@@ -4,6 +4,7 @@
 # surface (see crates/core/src/kento.rs, the source of truth):
 #
 #   kento list                               # columnar table, NAME first col
+#   kento list --json                        # all instances as a JSON array
 #   kento inspect <name> --json              # one instance as a JSON dict
 #   kento <lxc|vm> create [flags] <image>    # create + (--start) start
 #   kento <lxc|vm> destroy -f NAME           # remove BY NAME (-f forces)
@@ -209,12 +210,57 @@ do_inspect() {
   fi
 }
 
-# `kento list`. The columnar table RealKento `parse_kento_list` reads: a NAME
-# header, a dash separator, then one space-padded row per instance (NAME is
-# the first column). When there are no instances it prints the empty-set
-# sentinel `(no instances found)`.
+# `kento list` / `kento list --json`. WITHOUT --json: the columnar table
+# RealKento `parse_kento_list` reads — a NAME header, a dash separator, then
+# one space-padded row per instance (NAME is the first column); when there are
+# no instances it prints the empty-set sentinel `(no instances found)`.
+#
+# WITH --json: emits a JSON ARRAY of all stored instances, each object in the
+# SAME shape `inspect --json` emits (name/mode/type/image/status always, with
+# the present-only mac/vmid/environment/ssh_host_key_fingerprints carried as
+# stored). The authoritative `type` is synthesized from `mode` exactly like
+# `do_inspect` (`VM` for vm/pve-vm modes, else `LXC`) when a stored/injected
+# row omits it, and internal bookkeeping keys (any `_`-prefixed key, e.g.
+# `_inspect_fail`, `_list_malformed`) are stripped so they never leak. Zero
+# instances ⇒ `[]`. This single `list --json` call is now how seadog's reaper
+# enumerates (replacing the old `list` + N×`inspect --json`).
+#
+# Resilience hook: a stored row carrying a truthy `_list_malformed` marker is
+# emitted as a NON-object garbage element (the JSON number `42`) IN PLACE of
+# its object, driving seadog's `parse_kento_list_json` per-element skip; all
+# other rows emit as normal objects.
 do_list() {
   quorum_guard
+  local json=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift ;;
+      -*)
+        printf 'fake kento: unsupported list flag %s\n' "$1" >&2
+        exit 2
+        ;;
+      *)
+        printf 'fake kento: unsupported list argument %s\n' "$1" >&2
+        exit 2
+        ;;
+    esac
+  done
+  if [ "$json" -eq 1 ]; then
+    # Build the array in one jq pass: a `_list_malformed` row becomes the bare
+    # number 42; every other row is stripped of its `_`-prefixed bookkeeping
+    # keys and gains the synthesized authoritative `type` when absent. Guard
+    # corrupt/empty state so `set -e`/pipefail don't make it fatally error;
+    # fall back to the empty array `[]` exactly as zero instances would emit.
+    local arr
+    arr="$(read_state | jq -c '[.instances[] | if (._list_malformed // false) then 42 else (with_entries(select(.key | startswith("_") | not)) | if has("type") then . else . + {type: (if (.mode == "vm" or .mode == "pve-vm") then "VM" else "LXC" end)} end) end]' 2>/dev/null)"
+    if [ -z "$arr" ]; then
+      arr="[]"
+    fi
+    # Real kento emits json.dumps(indent=2); seadog parses regardless of
+    # whitespace, so pretty-print for fidelity.
+    printf '%s\n' "$arr" | jq '.'
+    return 0
+  fi
   # Default to 0 and guard the integer test: corrupt/empty state must not make
   # the `-eq` comparison fatally error under `set -e`.
   local count

@@ -6,14 +6,23 @@
 //! injected anchor: kento carries the `SEADOG_GUID` env on every seadog
 //! instance and reports it back via `inspect --json`. The GUID is the sole
 //! identity key — there is no description-marker parsing, no name-prefix
-//! gate, and no hardware fingerprint anymore.
+//! gate, and no hardware fingerprint anymore. A *present* GUID is trusted as
+//! seadog's only when it parses as a seadog-minted UUID (seadog mints GUIDs as
+//! `Uuid::new_v4()`); a matched DB row is itself corroboration (seadog wrote
+//! the row at provision), so the UUID gate applies only to the unmatched
+//! (no-row) case.
 //!
 //! ## Taxonomy
-//! - **Foreign** — no `SEADOG_GUID` at all. Not ours; ignored. (kento only
-//!   ever lists kento instances, so this is rare, but a non-seadog kento
-//!   guest would land here.)
-//! - **Orphan** — a GUID is present but no DB row backs it. The DB was lost
-//!   / the instance predates the row; reap re-adopts it onto a fresh row.
+//! - **Foreign** — no `SEADOG_GUID` at all, OR a GUID is present with no DB row
+//!   but it does **not** parse as a seadog-minted UUID. Either way it is not
+//!   ours; ignored — never re-adopted, never reaped. (kento only ever lists
+//!   kento instances, so a missing GUID is rare, but a non-seadog kento guest
+//!   would land here.) An unparseable present GUID is refused here precisely
+//!   because re-adoption is destructive (see Orphan) and must not act on an
+//!   unverifiable identity.
+//! - **Orphan** — a GUID is present, no DB row backs it, AND the GUID parses as
+//!   a canonical seadog-minted UUID. The DB was lost / the instance predates
+//!   the row; reap re-adopts it onto a fresh row.
 //! - **Anomaly** — a GUID-matched DB row exists but a **confirming-when-
 //!   present** signal disagrees (name or MAC). Flagged for a human, never
 //!   reaped.
@@ -59,9 +68,13 @@ pub enum Reason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Classification {
-    /// No `SEADOG_GUID` — not a seadog instance. Ignored.
+    /// Not a seadog instance — ignored (never re-adopted, never reaped).
+    /// Either no `SEADOG_GUID` at all, or a GUID present with no DB row that
+    /// does not parse as a seadog-minted UUID (an unverifiable identity must
+    /// not enter the destructive re-adopt path; see [`Self::Orphan`]).
     Foreign,
-    /// A GUID is present but no DB row backs it → re-adopt onto a fresh row.
+    /// A seadog-minted GUID (parses as a canonical UUID) is present but no DB
+    /// row backs it → re-adopt onto a fresh row.
     Orphan {
         /// The instance's injected GUID.
         guid: String,
@@ -104,7 +117,9 @@ fn mac_eq(a: &str, b: &str) -> bool {
 ///
 /// `db_row`, when `Some`, is the row whose `guid` equals `signals.guid`
 /// (the caller looks it up by GUID). A `None` row with a present GUID is an
-/// orphan to re-adopt.
+/// orphan to re-adopt **only** when the GUID parses as a seadog-minted UUID;
+/// a present-but-unparseable GUID with no row is [`Classification::Foreign`]
+/// (re-adoption is destructive and must not act on an unverifiable identity).
 pub fn classify(signals: &InstanceSignals, db_row: Option<&Env>) -> Classification {
     // No injected GUID → not ours.
     let guid = match &signals.guid {
@@ -112,14 +127,25 @@ pub fn classify(signals: &InstanceSignals, db_row: Option<&Env>) -> Classificati
         None => return Classification::Foreign,
     };
 
-    // GUID present but no row backs it → orphan (DB lost / predates row).
+    // GUID present but no row backs it → re-adopt ONLY if the GUID is
+    // genuinely seadog-minted. Seadog mints GUIDs as `Uuid::new_v4()`
+    // (create.rs), so a real seadog GUID always parses as a canonical UUID.
+    // The re-adopt path is destructive (fresh row → reap at deadline →
+    // `kento destroy -f`) and has NO DB corroboration here, so we must refuse
+    // to act on an unverifiable identity: a present-but-unparseable GUID with
+    // no row cannot be seadog-minted and is treated as Foreign (never adopted,
+    // never reaped). A matched row (Anomaly/ReapEligible below) is already
+    // corroborated — seadog wrote that row at provision — so no UUID gate there.
     let env = match db_row {
         Some(env) => env,
         None => {
-            return Classification::Orphan {
-                guid,
-                owner: signals.owner.clone(),
-            };
+            if uuid::Uuid::parse_str(&guid).is_ok() {
+                return Classification::Orphan {
+                    guid,
+                    owner: signals.owner.clone(),
+                };
+            }
+            return Classification::Foreign;
         }
     };
 
@@ -215,10 +241,15 @@ mod tests {
 
     #[test]
     fn guid_no_row_is_orphan() {
-        let s = signals("g-orphan", Some("aa:bb:cc:dd:ee:ff"));
+        // A seadog-minted GUID is a canonical UUID, so this exercises the
+        // genuine orphan (re-adopt) path.
+        let s = signals(
+            "550e8400-e29b-41d4-a716-446655440000",
+            Some("aa:bb:cc:dd:ee:ff"),
+        );
         match classify(&s, None) {
             Classification::Orphan { guid, owner } => {
-                assert_eq!(guid, "g-orphan");
+                assert_eq!(guid, "550e8400-e29b-41d4-a716-446655440000");
                 assert_eq!(owner.as_deref(), Some("alice"));
             }
             other => panic!("expected Orphan, got {other:?}"),
@@ -227,12 +258,36 @@ mod tests {
 
     #[test]
     fn guid_no_row_no_owner_is_orphan() {
-        let mut s = signals("g-orphan", None);
+        let mut s = signals("550e8400-e29b-41d4-a716-446655440000", None);
         s.owner = None;
         match classify(&s, None) {
             Classification::Orphan { guid, owner } => {
-                assert_eq!(guid, "g-orphan");
+                assert_eq!(guid, "550e8400-e29b-41d4-a716-446655440000");
                 assert_eq!(owner, None);
+            }
+            other => panic!("expected Orphan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_uuid_guid_no_row_is_foreign() {
+        // A present GUID with no DB row that does NOT parse as a seadog-minted
+        // UUID must be ignored: the re-adopt path is destructive, so an
+        // unverifiable GUID must never enter it.
+        let s = signals("not-a-uuid", Some("aa:bb:cc:dd:ee:ff"));
+        assert_eq!(classify(&s, None), Classification::Foreign);
+    }
+
+    #[test]
+    fn valid_uuid_guid_no_row_is_orphan() {
+        // A canonical seadog-minted UUID with no DB row is a genuine orphan.
+        let s = signals(
+            "550e8400-e29b-41d4-a716-446655440000",
+            Some("aa:bb:cc:dd:ee:ff"),
+        );
+        match classify(&s, None) {
+            Classification::Orphan { guid, .. } => {
+                assert_eq!(guid, "550e8400-e29b-41d4-a716-446655440000");
             }
             other => panic!("expected Orphan, got {other:?}"),
         }

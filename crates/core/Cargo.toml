@@ -28,3 +28,4 @@ tracing = { workspace = true }
 tracing-journald = { workspace = true }
 tracing-subscriber = { workspace = true }
 wait-timeout = { workspace = true }
+uuid = { workspace = true }

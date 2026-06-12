@@ -460,59 +460,103 @@ main() {
   # reaped this tick — it must still be live (proves the sweep didn't over-reap).
   if instance_exists_in_table "$name"; then pass "sweep: in-window real env untouched ($name)"; else fail "sweep: in-window real env was reaped"; fi
 
-  printf '\n== scenario: a ghost instance does NOT blind the sweep ==\n'
-  # Resilience contract (kento.rs::RealKento::list_instances): a per-instance
-  # `kento inspect` failure (a "ghost" present in `kento list` but with no
-  # backing guest — exit 255 on a real host) must be LOGGED + SKIPPED, never
-  # abort the whole sweep. Prove it by placing a ghost ALONGSIDE a healthy
+  printf '\n== scenario: a malformed list element does NOT blind the sweep ==\n'
+  # Resilience contract (kento.rs::parse_kento_list_json): the reaper now
+  # enumerates via a SINGLE `kento list --json`. A non-object / malformed
+  # element in that array must be LOGGED + SKIPPED per-element, never abort the
+  # whole sweep. Prove it by placing a malformed element ALONGSIDE a healthy
   # EXPIRED env and asserting the sweep still runs and reaps the healthy one:
-  #   - healthy: a fresh Active DB row + matching live instance, ttl in the
-  #     past + created before the age floor ⇒ ReapEligible ⇒ reaped;
-  #   - ghost:   a live instance carrying `_inspect_fail` (the fake's
-  #     inspect-exits-255 marker) + a SEADOG_GUID but NO DB row. With a
-  #     WORKING inspect it would re-adopt as an orphan; because inspect FAILS
-  #     it is skipped instead — so it neither aborts the sweep nor gains a row.
-  # If list_instances were still all-or-nothing, the ghost's failing inspect
-  # would propagate and the sweep would reap NOTHING (the healthy env would
-  # survive) — that is exactly what this scenario rules out.
-  local ghost_guid healthy_guid healthy_name
-  ghost_guid="ghost-no-backing-guid"
-  healthy_guid="healthy-expired-guid"
-  healthy_name="seadog-jei-healthy-gh01"
+  #   - healthy:   a fresh Active DB row + matching live instance, ttl in the
+  #                past + created before the age floor ⇒ ReapEligible ⇒ reaped
+  #                (uses the SAME setup as "sweep reaps an expired unanimous
+  #                env": sqlite3 INSERT + make_instance + a valid-UUID guid,
+  #                which classify now requires);
+  #   - malformed: a stored row carrying `_list_malformed=true`, which the shim
+  #                emits as the bare JSON number 42 in place of its object. It
+  #                carries a (valid-UUID) SEADOG_GUID but has NO DB row; the
+  #                parser skips the garbage element before classify ever sees
+  #                it, so it neither aborts the sweep nor gains a row.
+  # If list parsing were all-or-nothing, the malformed element would propagate
+  # and the sweep would reap NOTHING (the healthy env would survive) — that is
+  # exactly what this scenario rules out.
+  local malformed_guid healthy_guid healthy_name
+  malformed_guid="6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+  healthy_guid="9f8b2c1a-4e3d-4a6b-8c7d-1e2f3a4b5c6d"
+  healthy_name="seadog-jei-healthy-ml01"
   sqlite3 "$SEADOG_DB" "INSERT INTO envs (guid,vmid,mode,owner,image,name,ip,mac,created_at,ttl_deadline,soft_deadline,status) VALUES ('$healthy_guid',NULL,'lxc','jei','loom','$healthy_name','192.168.0.230','',$created_old,$ttl_past,$((ttl_past - 600)),'active');"
   make_instance "$healthy_name" \
     '.environment=["SEADOG_GUID='"$healthy_guid"'","SEADOG_OWNER=jei"]' | inject_instance
-  # The ghost: appears in `kento list`, but its inspect exits non-zero.
-  make_instance "seadog-jei-ghost-gh02" \
-    '._inspect_fail=true | .environment=["SEADOG_GUID='"$ghost_guid"'","SEADOG_OWNER=jei"]' | inject_instance
+  # The malformed element: emitted as the bare number 42 by `list --json`.
+  make_instance "seadog-jei-malformed-ml02" \
+    '._list_malformed=true | .environment=["SEADOG_GUID='"$malformed_guid"'","SEADOG_OWNER=jei"]' | inject_instance
   share_db_perms
-  # Sanity: the ghost's inspect really does fail (the injected marker works),
-  # so the assertions below test resilience, not a no-op fake.
-  if ! /usr/local/bin/kento inspect "seadog-jei-ghost-gh02" --json >/dev/null 2>&1; then
-    pass "ghost: fake kento inspect exits non-zero for the ghost"
-  else
-    fail "ghost: fake kento inspect unexpectedly succeeded for the ghost"
-  fi
-  local ghost_sweep_rc=0
-  sweep_json="$(priv_sweep)" || ghost_sweep_rc=$?
+  local ml_sweep_rc=0
+  sweep_json="$(priv_sweep)" || ml_sweep_rc=$?
   # 1. Non-abort: the sweep completed and emitted its JSON outcome.
-  if [ "$ghost_sweep_rc" -eq 0 ] && printf '%s' "$sweep_json" | jq -e '.reaped' >/dev/null 2>&1; then
-    pass "ghost: sweep did NOT abort (completed with an outcome despite the ghost)"
+  if [ "$ml_sweep_rc" -eq 0 ] && printf '%s' "$sweep_json" | jq -e '.reaped' >/dev/null 2>&1; then
+    pass "malformed: sweep did NOT abort (completed with an outcome despite the bad element)"
   else
-    fail "ghost: sweep aborted or emitted no outcome (rc=$ghost_sweep_rc json=$sweep_json)"
+    fail "malformed: sweep aborted or emitted no outcome (rc=$ml_sweep_rc json=$sweep_json)"
   fi
   # 2. The healthy expired env WAS evaluated + reaped (the sweep saw past the
-  #    ghost) — both the live instance and the DB row reflect the reap.
-  if ! instance_exists_in_table "$healthy_name"; then pass "ghost: healthy expired env was still reaped (skip didn't blind the sweep)"; else fail "ghost: healthy expired env survived (the ghost blinded the sweep)"; fi
-  if [ "$(db_status "$healthy_guid")" = "reaped" ]; then pass "ghost: healthy env's DB row marked reaped"; else fail "ghost: healthy env DB row not reaped ($(db_status "$healthy_guid"))"; fi
-  # 3. The ghost was SKIPPED: it has no DB row and was NOT re-adopted (a
-  #    working inspect would have orphaned+re-adopted it onto a fresh row).
-  local ghost_rows
-  ghost_rows="$(sqlite3 "$SEADOG_DB" "SELECT count(*) FROM envs WHERE guid='$ghost_guid';")"
-  if [ "$ghost_rows" = "0" ]; then pass "ghost: skipped instance gained no DB row (not re-adopted)"; else fail "ghost: skipped instance was re-adopted ($ghost_rows rows)"; fi
-  # Clean the ghost so it does not perturb later sweeps (it would be skipped
-  # every tick, but the watch-singleton drain reasons about active leases).
-  remove_instance "seadog-jei-ghost-gh02"
+  #    malformed element) — both the live instance and the DB row reflect it.
+  if ! instance_exists_in_table "$healthy_name"; then pass "malformed: healthy expired env was still reaped (skip didn't blind the sweep)"; else fail "malformed: healthy expired env survived (the bad element blinded the sweep)"; fi
+  if [ "$(db_status "$healthy_guid")" = "reaped" ]; then pass "malformed: healthy env's DB row marked reaped"; else fail "malformed: healthy env DB row not reaped ($(db_status "$healthy_guid"))"; fi
+  # 3. The malformed element was SKIPPED before classify: it gained no DB row
+  #    (never re-adopted — the parser dropped it as garbage).
+  local malformed_rows
+  malformed_rows="$(sqlite3 "$SEADOG_DB" "SELECT count(*) FROM envs WHERE guid='$malformed_guid';")"
+  if [ "$malformed_rows" = "0" ]; then pass "malformed: skipped element gained no DB row (never classified)"; else fail "malformed: skipped element was re-adopted ($malformed_rows rows)"; fi
+  # Clean both so they do not perturb later sweeps (the watch-singleton drain
+  # reasons about active leases).
+  remove_instance "$healthy_name"
+  remove_instance "seadog-jei-malformed-ml02"
+  chmod 0666 "$FAKE_KENTO_STATE" 2>/dev/null || true
+
+  printf '\n== scenario: orphan re-adopt requires a genuine seadog UUID ==\n'
+  # Safety contract (kento.rs reaper classify): an enumerated instance carrying
+  # a SEADOG_GUID with NO DB row is an "orphan" the reaper RE-ADOPTS (mints a
+  # fresh Active row + flags) — but ONLY when that GUID parses as a valid
+  # canonical UUID (seadog mints GUIDs as UUIDv4). A non-UUID SEADOG_GUID with
+  # no row is IGNORED entirely (never adopted, never reaped). The destructive
+  # re-adopt path must never act on an unverifiable GUID. Inject BOTH, sweep
+  # once, and assert each:
+  #   (i)  GENUINE orphan: valid canonical UUID ⇒ re-adopted onto a fresh row
+  #        (fresh ttl in the future ⇒ NOT reaped, so we assert the row exists);
+  #   (ii) SPOOFED/unverifiable: non-UUID string ⇒ ignored, no row, untouched.
+  local orphan_guid spoof_guid orphan_name spoof_name
+  orphan_guid="550e8400-e29b-41d4-a716-446655440000"
+  spoof_guid="not-a-seadog-guid"
+  orphan_name="seadog-jei-orphan-or01"
+  spoof_name="seadog-jei-spoof-or02"
+  # (i) genuine orphan: valid UUID. Re-adopt mints its own (future) deadline, so
+  #     it is not reaped this tick.
+  make_instance "$orphan_name" \
+    '.environment=["SEADOG_GUID='"$orphan_guid"'","SEADOG_OWNER=jei"]' | inject_instance
+  # (ii) spoofed: a non-UUID SEADOG_GUID with no DB row.
+  make_instance "$spoof_name" \
+    '.environment=["SEADOG_GUID='"$spoof_guid"'","SEADOG_OWNER=jei"]' | inject_instance
+  share_db_perms
+  # Before the sweep neither has a DB row — prove the sweep is what creates the
+  # genuine orphan's row (and never the spoof's).
+  local orphan_rows_pre spoof_rows_pre
+  orphan_rows_pre="$(sqlite3 "$SEADOG_DB" "SELECT count(*) FROM envs WHERE guid='$orphan_guid';")"
+  spoof_rows_pre="$(sqlite3 "$SEADOG_DB" "SELECT count(*) FROM envs WHERE guid='$spoof_guid';")"
+  if [ "$orphan_rows_pre" = "0" ] && [ "$spoof_rows_pre" = "0" ]; then pass "orphan: neither candidate has a DB row before the sweep"; else fail "orphan: a candidate had a pre-existing DB row (orphan=$orphan_rows_pre spoof=$spoof_rows_pre)"; fi
+  sweep_json="$(priv_sweep)"
+  # (i) genuine UUID orphan: re-adopted onto a fresh row (NOT reaped — re-adopt
+  #     mints its own future deadline), so a DB row now exists.
+  local orphan_rows
+  orphan_rows="$(sqlite3 "$SEADOG_DB" "SELECT count(*) FROM envs WHERE guid='$orphan_guid';")"
+  if [ "$orphan_rows" = "1" ]; then pass "orphan: genuine-UUID orphan was re-adopted (fresh DB row exists)"; else fail "orphan: genuine-UUID orphan not re-adopted ($orphan_rows rows)"; fi
+  # (ii) non-UUID spoof: ignored — no row minted AND the live instance survives.
+  local spoof_rows
+  spoof_rows="$(sqlite3 "$SEADOG_DB" "SELECT count(*) FROM envs WHERE guid='$spoof_guid';")"
+  if [ "$spoof_rows" = "0" ]; then pass "orphan: non-UUID spoof was NOT re-adopted (no DB row)"; else fail "orphan: non-UUID spoof gained a DB row ($spoof_rows rows)"; fi
+  if instance_exists_in_table "$spoof_name"; then pass "orphan: non-UUID spoof's live instance untouched (ignored, not destroyed)"; else fail "orphan: non-UUID spoof's live instance was destroyed"; fi
+  # Clean both survivors so they do not perturb later sweeps.
+  remove_instance "$orphan_name"
+  remove_instance "$spoof_name"
   chmod 0666 "$FAKE_KENTO_STATE" 2>/dev/null || true
 
   printf '\n== scenario: teardown by another owner is refused ==\n'

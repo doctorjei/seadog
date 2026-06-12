@@ -677,7 +677,7 @@ images:
         let now = 1_000_000i64;
         let s = InstanceSignals {
             name: "seadog-bob-p-orph".into(),
-            guid: Some("orph1".into()),
+            guid: Some("550e8400-e29b-41d4-a716-446655440000".into()),
             owner: Some("bob".into()),
             mac: Some("02:aa:bb:cc:dd:ee".into()),
             ssh_host_key_fps: vec!["SHA256:hk".into()],
@@ -696,7 +696,7 @@ images:
         assert!(k.teardowns().is_empty());
 
         // A fresh Active row now exists with the reused-ttl deadline.
-        let env = store::get_env(&conn, "orph1")
+        let env = store::get_env(&conn, "550e8400-e29b-41d4-a716-446655440000")
             .unwrap()
             .expect("row created");
         assert_eq!(env.status, EnvStatus::Active);
@@ -719,7 +719,7 @@ images:
         let now = 1_000_000i64;
         let s = InstanceSignals {
             name: "seadog-x".into(),
-            guid: Some("orph2".into()),
+            guid: Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".into()),
             owner: None,
             mac: None,
             ssh_host_key_fps: Vec::new(),
@@ -732,7 +732,9 @@ images:
         k.set_instances(vec![s]);
 
         sweep(&k, &conn, &c, now).unwrap();
-        let env = store::get_env(&conn, "orph2").unwrap().unwrap();
+        let env = store::get_env(&conn, "6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+            .unwrap()
+            .unwrap();
         assert_eq!(env.owner, "unknown");
         assert_eq!(env.mode, Mode::Vm, "re-adopt uses sig.mode (Vm)");
         assert_eq!(env.vmid, Some(123));
