@@ -98,6 +98,12 @@ enum Verb {
         /// Soft "expected done" duration override (humantime).
         #[arg(long)]
         duration: Option<String>,
+        /// Memory limit in MB (clamped to allocation.caps.max_memory_mb; omitted ⇒ kento default).
+        #[arg(long)]
+        memory: Option<u32>,
+        /// CPU cores (clamped to allocation.caps.max_cores; omitted ⇒ kento default).
+        #[arg(long)]
+        cores: Option<u32>,
     },
     /// Destroy an env now (elevated — routes through the bridge).
     Destroy {
@@ -203,6 +209,8 @@ fn dispatch(ctx: &Ctx, verb: Verb) -> anyhow::Result<serde_json::Value> {
             mode,
             ttl,
             duration,
+            memory,
+            cores,
         } => verbs::create::run(
             ctx,
             &CreateArgs {
@@ -210,6 +218,8 @@ fn dispatch(ctx: &Ctx, verb: Verb) -> anyhow::Result<serde_json::Value> {
                 mode,
                 ttl,
                 duration,
+                memory,
+                cores,
             },
         ),
         Verb::Destroy { env_id } => verbs::destroy::run(ctx, &env_id),

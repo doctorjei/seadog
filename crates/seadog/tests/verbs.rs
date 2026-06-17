@@ -442,6 +442,115 @@ fn create_shells_provision_and_writes_active_row() {
 }
 
 #[test]
+fn create_forwards_clamped_memory_and_cores() {
+    // A config with explicit, low ceilings so the clamp is observable.
+    let config = r#"
+allocation:
+  caps: { max_memory_mb: 4096, max_cores: 4 }
+images:
+  loom: { ref: "ghcr.io/x/droste:loom", modes: [lxc] }
+"#;
+    let fx = Fixture::with_config(config);
+    let log = fx._dir.path().join("fake.log");
+    let log_s = log.to_str().unwrap().to_string();
+
+    // Request memory ABOVE the ceiling (clamped to 4096) and cores UNDER it
+    // (passed through as 2).
+    let (ok, json, err) = fx.run_envs(
+        "alice",
+        &[
+            "create", "--image", "loom", "--memory", "8192", "--cores", "2",
+        ],
+        &[("SEADOG_FAKE_LOG", &log_s)],
+    );
+    assert!(ok, "create should succeed; stderr: {err}");
+
+    // The JSON reflects the CLAMPED values actually applied.
+    assert_eq!(json["memory"].as_u64().unwrap(), 4096);
+    assert_eq!(json["cores"].as_u64().unwrap(), 2);
+
+    // The provision argv carries the clamped sizing flags (memory first).
+    let logged = std::fs::read_to_string(&log).unwrap();
+    let prov = logged
+        .lines()
+        .find(|l| l.starts_with("provision "))
+        .expect("provision was invoked");
+    assert!(prov.contains("--memory 4096"), "argv: {prov}");
+    assert!(prov.contains("--cores 2"), "argv: {prov}");
+    // memory precedes cores in the argv.
+    let mi = prov.find("--memory").unwrap();
+    let ci = prov.find("--cores").unwrap();
+    assert!(mi < ci, "memory must precede cores: {prov}");
+}
+
+#[test]
+fn create_omits_sizing_flags_when_absent() {
+    // No --memory/--cores ⇒ neither flag in the argv ⇒ kento default. The
+    // JSON sizing fields are null.
+    let fx = Fixture::new();
+    let log = fx._dir.path().join("fake.log");
+    let log_s = log.to_str().unwrap().to_string();
+
+    let (ok, json, err) = fx.run_envs(
+        "alice",
+        &["create", "--image", "loom"],
+        &[("SEADOG_FAKE_LOG", &log_s)],
+    );
+    assert!(ok, "create should succeed; stderr: {err}");
+    assert!(
+        json["memory"].is_null(),
+        "memory should be null when omitted"
+    );
+    assert!(json["cores"].is_null(), "cores should be null when omitted");
+
+    let logged = std::fs::read_to_string(&log).unwrap();
+    let prov = logged
+        .lines()
+        .find(|l| l.starts_with("provision "))
+        .expect("provision was invoked");
+    assert!(
+        !prov.contains("--memory"),
+        "argv must omit --memory: {prov}"
+    );
+    assert!(!prov.contains("--cores"), "argv must omit --cores: {prov}");
+}
+
+#[test]
+fn create_rejects_zero_sizing_request() {
+    // kento requires >= 1; a --memory 0 request is rejected BEFORE any
+    // allocation or elevate.
+    let fx = Fixture::new();
+    let log = fx._dir.path().join("fake.log");
+    let log_s = log.to_str().unwrap().to_string();
+
+    let (ok, _json, err) = fx.run_envs(
+        "alice",
+        &["create", "--image", "loom", "--memory", "0"],
+        &[("SEADOG_FAKE_LOG", &log_s)],
+    );
+    assert!(!ok, "a zero memory request must be rejected");
+    let errobj: Value = serde_json::from_str(&err).unwrap();
+    assert!(
+        errobj["error"].as_str().unwrap().contains("memory"),
+        "error should mention memory: {err}"
+    );
+    // The helper was never shelled (rejected before elevate).
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !logged.lines().any(|l| l.starts_with("provision ")),
+        "helper must not be shelled on a rejected request"
+    );
+
+    // No Active row was inserted.
+    let actives: Vec<_> = store::list_by_owner(&fx.conn(), "alice")
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.status == EnvStatus::Active)
+        .collect();
+    assert!(actives.is_empty(), "no allocation on a rejected request");
+}
+
+#[test]
 fn create_rolls_back_when_provision_fails() {
     let fx = Fixture::new();
     let log = fx._dir.path().join("fake.log");

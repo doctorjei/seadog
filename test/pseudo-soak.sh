@@ -385,6 +385,35 @@ main() {
     return
   fi
 
+  printf '\n== scenario: create round-trips explicit --memory/--cores ==\n'
+  # Explicit sizing under the operator ceilings (defaults 8192 MB / 8 cores, so
+  # 2048/2 pass unclamped): the front-end forwards `--memory`/`--cores` through
+  # the helper to `kento <mode> create`, the fake kento records them, and they
+  # round-trip in BOTH the create JSON and the realized instance. Tear it down
+  # so it does not perturb later sweep/herd assertions.
+  local sz_json sz_guid sz_name sz_mem sz_cores
+  if sz_json="$(frontend jei create --image loom --memory 2048 --cores 2 2>/dev/null)"; then
+    share_db_perms
+    sz_guid="$(printf '%s' "$sz_json" | jq -r '.id')"
+    sz_name="$(printf '%s' "$sz_json" | jq -r '.name')"
+    sz_mem="$(instance_field "$sz_name" memory)"
+    sz_cores="$(instance_field "$sz_name" cores)"
+    if [ "$(printf '%s' "$sz_json" | jq -r '.memory')" = "2048" ] &&
+      [ "$(printf '%s' "$sz_json" | jq -r '.cores')" = "2" ]; then
+      pass "create(sizing): create JSON reports memory=2048 cores=2"
+    else
+      fail "create(sizing): create JSON sizing wrong ($(printf '%s' "$sz_json" | jq -c '{memory,cores}'))"
+    fi
+    if [ "$sz_mem" = "2048" ] && [ "$sz_cores" = "2" ]; then
+      pass "create(sizing): realized instance carries memory=2048 cores=2"
+    else
+      fail "create(sizing): instance sizing should be 2048/2, got mem=$sz_mem cores=$sz_cores"
+    fi
+    priv teardown --owner jei --guid "$sz_guid" --mode lxc >/dev/null 2>&1 || true
+  else
+    fail "create(sizing): front-end create with --memory/--cores failed"
+  fi
+
   printf '\n== scenario: VM create round-trips its MAC ==\n'
   # A VM keeps the passed `--mac`: kento accepts it (VM-only) and reports it
   # back via inspect, so the live instance AND the DB row carry that exact MAC.

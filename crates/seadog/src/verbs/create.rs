@@ -43,6 +43,10 @@ pub struct CreateArgs {
     pub ttl: Option<String>,
     /// Optional soft "expected done" duration override (humantime string).
     pub duration: Option<String>,
+    /// Optional memory request (MB), clamped to the configured ceiling.
+    pub memory: Option<u32>,
+    /// Optional cores request, clamped to the configured ceiling.
+    pub cores: Option<u32>,
 }
 
 /// `create --image <name> [--mode lxc|vm] [--ttl <dur>] [--duration <dur>]`.
@@ -87,6 +91,18 @@ pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
         .now_unix
         .checked_add(dur_secs)
         .ok_or_else(|| anyhow!("soft deadline overflows"))?;
+
+    // Clamp explicit memory/cores requests to the operator ceilings (mirrors
+    // the `--ttl` clamp: silent cap, honest JSON). `0` ceiling = unlimited; a
+    // `Some(0)` request is invalid (kento requires ≥1). Omitted (`None`) ⇒ no
+    // flag in the elevate argv ⇒ kento applies its own default. The helper
+    // re-clamps at its boundary (belt-and-suspenders).
+    let memory = clamp_resource(
+        args.memory,
+        ctx.config.allocation.caps.max_memory_mb,
+        "memory",
+    )?;
+    let cores = clamp_resource(args.cores, ctx.config.allocation.caps.max_cores, "cores")?;
 
     // 3. Cap check: count the owner's Active envs of this mode against the
     //    per-owner cap (with any config override). Reject BEFORE allocating
@@ -144,7 +160,7 @@ pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
         .get(&args.image)
         .and_then(|i| i.allow_nesting)
         .unwrap_or(false);
-    let argv = vec![
+    let mut argv = vec![
         "--guid".to_string(),
         guid.clone(),
         "--ip".to_string(),
@@ -160,6 +176,16 @@ pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
         "--allow-nesting".to_string(),
         allow_nesting.to_string(),
     ];
+    // Sizing flags (memory first), only when an explicit (clamped) value is
+    // present. Omitting them lets kento apply its own default.
+    if let Some(v) = memory {
+        argv.push("--memory".to_string());
+        argv.push(v.to_string());
+    }
+    if let Some(v) = cores {
+        argv.push("--cores".to_string());
+        argv.push(v.to_string());
+    }
     let req = ElevateArgs::new("provision", ctx.owner.clone(), argv);
 
     match elevate(&req) {
@@ -209,6 +235,10 @@ pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
                 "mode": mode.as_str(),
                 "mac": effective_mac,
                 "ttl_deadline": ttl_deadline,
+                // The sizing actually applied (clamped). `null` ⇒ no explicit
+                // request was made and kento used its own default.
+                "memory": memory,
+                "cores": cores,
             }))
         }
         Err(e) => {
@@ -232,6 +262,23 @@ fn mode_cap(ctx: &Ctx, mode: Mode) -> u32 {
     match mode {
         Mode::Lxc => ov.and_then(|o| o.max_lxc).unwrap_or(caps.max_lxc_per_owner),
         Mode::Vm => ov.and_then(|o| o.max_vm).unwrap_or(caps.max_vm_per_owner),
+    }
+}
+
+/// Clamp an explicit resource request (`--memory`/`--cores`) to an operator
+/// ceiling, mirroring the `--ttl` clamp posture:
+///
+/// - `None` ⇒ `None` (no flag forwarded; kento applies its own default).
+/// - `Some(0)` ⇒ error: kento requires `≥ 1`, so a zero request is invalid.
+/// - `ceiling == 0` ⇒ unlimited (no clamp), per the `Caps` 0-convention.
+/// - otherwise ⇒ `Some(req.min(ceiling))` (silent cap; the returned value is
+///   what's actually applied, so the JSON stays honest).
+fn clamp_resource(req: Option<u32>, ceiling: u32, label: &str) -> Result<Option<u32>> {
+    match req {
+        None => Ok(None),
+        Some(0) => Err(anyhow!("{label} must be >= 1 (got 0)")),
+        Some(v) if ceiling == 0 => Ok(Some(v)),
+        Some(v) => Ok(Some(v.min(ceiling))),
     }
 }
 
@@ -312,4 +359,51 @@ fn mint_token(n: usize) -> String {
     (0..n)
         .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_resource_none_is_none() {
+        // Omitted request ⇒ no flag forwarded ⇒ kento default.
+        assert_eq!(clamp_resource(None, 8192, "memory").unwrap(), None);
+        // Even with an unlimited ceiling, None stays None.
+        assert_eq!(clamp_resource(None, 0, "cores").unwrap(), None);
+    }
+
+    #[test]
+    fn clamp_resource_caps_to_ceiling() {
+        // Over the ceiling ⇒ silently capped.
+        assert_eq!(
+            clamp_resource(Some(16384), 8192, "memory").unwrap(),
+            Some(8192)
+        );
+        // At/under the ceiling ⇒ passed through unchanged.
+        assert_eq!(
+            clamp_resource(Some(8192), 8192, "memory").unwrap(),
+            Some(8192)
+        );
+        assert_eq!(
+            clamp_resource(Some(2048), 8192, "memory").unwrap(),
+            Some(2048)
+        );
+    }
+
+    #[test]
+    fn clamp_resource_zero_ceiling_is_unlimited() {
+        // ceiling == 0 ⇒ no clamp, any request passes through.
+        assert_eq!(
+            clamp_resource(Some(999_999), 0, "memory").unwrap(),
+            Some(999_999)
+        );
+    }
+
+    #[test]
+    fn clamp_resource_rejects_zero_request() {
+        // kento requires >= 1; a Some(0) request is an error (even unlimited).
+        assert!(clamp_resource(Some(0), 8192, "memory").is_err());
+        assert!(clamp_resource(Some(0), 0, "cores").is_err());
+    }
 }

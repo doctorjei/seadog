@@ -144,6 +144,18 @@ pub struct ProvisionSpec {
     /// `--allow-nesting` to `kento <mode> create` (UNCONDITIONAL on mode)
     /// when true, omitted when false.
     pub allow_nesting: bool,
+    /// Requested memory (MB), already clamped to the operator ceiling
+    /// (`allocation.caps.max_memory_mb`) by the front-end and re-clamped by the
+    /// helper. `Some(v)` ⇒ pushed as `--memory <v>` to `kento <mode> create`
+    /// (UNCONDITIONAL on mode — both modes accept it). `None` ⇒ flag omitted ⇒
+    /// kento's own default applies (seadog imposes none).
+    pub memory: Option<u32>,
+    /// Requested cpu cores, already clamped to the operator ceiling
+    /// (`allocation.caps.max_cores`) by the front-end and re-clamped by the
+    /// helper. `Some(v)` ⇒ pushed as `--cores <v>` to `kento <mode> create`
+    /// (UNCONDITIONAL on mode — both modes accept it). `None` ⇒ flag omitted ⇒
+    /// kento's own default applies (seadog imposes none).
+    pub cores: Option<u32>,
 }
 
 /// What [`Kento::provision`] reports back, read from kento's `inspect
@@ -218,6 +230,17 @@ pub fn provision_argv(spec: &ProvisionSpec) -> Vec<String> {
     // kento's own default applies.
     if spec.allow_nesting {
         argv.push("--allow-nesting".to_string());
+    }
+    // Sizing: push `--memory <MB>` / `--cores <N>` UNCONDITIONALLY on mode
+    // (both modes accept them) when the (already-clamped) request is `Some`.
+    // Omitted when `None` so kento's own default applies. Order: memory, cores.
+    if let Some(v) = spec.memory {
+        argv.push("--memory".to_string());
+        argv.push(v.to_string());
+    }
+    if let Some(v) = spec.cores {
+        argv.push("--cores".to_string());
+        argv.push(v.to_string());
     }
     // The image ref is the final positional argument.
     argv.push(spec.image_ref.clone());
@@ -1291,6 +1314,8 @@ mod tests {
             ssh_key_file: None,
             ssh_key_user: "root".into(),
             allow_nesting: false,
+            memory: None,
+            cores: None,
         }
     }
 
@@ -1456,6 +1481,8 @@ mod argv_tests {
             ssh_key_file: None,
             ssh_key_user: "root".into(),
             allow_nesting: false,
+            memory: None,
+            cores: None,
         }
     }
 
@@ -1617,6 +1644,99 @@ mod argv_tests {
             Some("registry.example.com/loom:1.0"),
             "image ref stays the trailing positional"
         );
+    }
+
+    #[test]
+    fn provision_argv_pushes_memory_cores_lxc() {
+        // LXC with explicit sizing: `--memory <MB>` then `--cores <N>` (in that
+        // order) are pushed UNCONDITIONALLY on mode, immediately before the
+        // trailing image positional.
+        let mut s = spec(Mode::Lxc);
+        s.memory = Some(2048);
+        s.cores = Some(4);
+        let argv = provision_argv(&s);
+        assert_eq!(
+            argv,
+            vec![
+                "lxc",
+                "create",
+                "--name",
+                "seadog-alice-proj-ab12",
+                "--network",
+                "bridge=vmbr0",
+                "--ip",
+                "192.168.99.200/24",
+                "--gateway",
+                "192.168.99.1",
+                "--ssh-host-keys",
+                "--start",
+                "--env",
+                "SEADOG_GUID=guid-abc",
+                "--env",
+                "SEADOG_OWNER=alice",
+                "--memory",
+                "2048",
+                "--cores",
+                "4",
+                "registry.example.com/loom:1.0",
+            ]
+        );
+    }
+
+    #[test]
+    fn provision_argv_pushes_memory_cores_vm() {
+        // VM with explicit sizing: the VM-only `--mac` block, then `--memory`
+        // then `--cores`, then the image positional — sizing is mode-agnostic
+        // (both modes accept it) and sits after `--mac`.
+        let mut s = spec(Mode::Vm);
+        s.memory = Some(2048);
+        s.cores = Some(4);
+        let argv = provision_argv(&s);
+        assert_eq!(
+            argv,
+            vec![
+                "vm",
+                "create",
+                "--name",
+                "seadog-alice-proj-ab12",
+                "--network",
+                "bridge=vmbr0",
+                "--ip",
+                "192.168.99.200/24",
+                "--gateway",
+                "192.168.99.1",
+                "--ssh-host-keys",
+                "--start",
+                "--env",
+                "SEADOG_GUID=guid-abc",
+                "--env",
+                "SEADOG_OWNER=alice",
+                "--mac",
+                "aa:bb:cc:dd:ee:ff",
+                "--memory",
+                "2048",
+                "--cores",
+                "4",
+                "registry.example.com/loom:1.0",
+            ]
+        );
+    }
+
+    #[test]
+    fn provision_argv_omits_memory_cores_when_none() {
+        // `None` ⇒ NO `--memory`/`--cores` (kento's default applies). Asserted
+        // for both modes so neither path leaks an unwanted sizing flag.
+        for mode in [Mode::Lxc, Mode::Vm] {
+            let argv = provision_argv(&spec(mode));
+            assert!(
+                !argv.iter().any(|a| a == "--memory"),
+                "None memory emits no --memory ({mode:?})"
+            );
+            assert!(
+                !argv.iter().any(|a| a == "--cores"),
+                "None cores emits no --cores ({mode:?})"
+            );
+        }
     }
 
     #[test]

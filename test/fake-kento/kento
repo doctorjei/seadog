@@ -18,7 +18,9 @@
 #
 # create flags honored (exactly RealKento's argv): --name --network bridge=
 # --ip --gateway --env KEY=VALUE --ssh-host-keys --start --config-mode
-# --ssh-key --ssh-key-user --mac (VM ONLY — rejected for LXC) --allow-nesting
+# --ssh-key --ssh-key-user --memory <MB> --cores <N> (both modes; pushed only
+# when the operator requested a value, else omitted so kento's default applies)
+# --mac (VM ONLY — rejected for LXC) --allow-nesting
 # (only when nesting is on; RealKento NEVER emits --no-allow-nesting).
 # Anything outside this surface is a loud `unsupported` error so future drift
 # in RealKento is caught. State + helpers live in _lib.sh.
@@ -51,7 +53,7 @@ do_create() {
   local mode="$1"
   shift
   quorum_guard
-  local name="" mac="" bridge="vmbr0" image=""
+  local name="" mac="" bridge="vmbr0" image="" memory="" cores=""
   # environment[] accumulates the injected --env KEY=VALUE pairs, as a JSON
   # array, exactly the shape `inspect` reports.
   local env_json='[]'
@@ -61,6 +63,8 @@ do_create() {
       --mac) mac="$2"; shift 2 ;;
       --network) bridge="$(network_bridge "$2")" || exit 2; shift 2 ;;
       --env) env_json="$(printf '%s' "$env_json" | jq -c --arg e "$2" '. + [$e]')"; shift 2 ;;
+      --memory) memory="$2"; shift 2 ;;
+      --cores) cores="$2"; shift 2 ;;
       --ip) shift 2 ;;
       --gateway) shift 2 ;;
       --config-mode) shift 2 ;;
@@ -109,12 +113,18 @@ do_create() {
     vm | pve-vm) type="VM" ;;
     *) type="LXC" ;;
   esac
+  # `memory`/`cores` are present-only too (mirroring `mac`): seadog only pushes
+  # the flag when the operator requested a value, so a vanilla create carries
+  # neither field. When present they round-trip as the requested integers.
   jq -nc \
     --arg name "$name" --arg mode "$mode" --arg type "$type" --arg image "$image" \
     --arg mac "$mac" --arg network "bridge=${bridge}" \
+    --arg memory "$memory" --arg cores "$cores" \
     --argjson env "$env_json" --argjson fps "$fps_json" \
     '{name:$name, mode:$mode, type:$type, image:$image, status:"running", network:$network, environment:$env, ssh_host_key_fingerprints:$fps}
-       + (if $mac == "" then {} else {mac:$mac} end)' |
+       + (if $mac == "" then {} else {mac:$mac} end)
+       + (if $memory == "" then {} else {memory:($memory|tonumber)} end)
+       + (if $cores == "" then {} else {cores:($cores|tonumber)} end)' |
     upsert_instance
   printf '{"ok":true,"mode":"%s","name":"%s"}\n' "$mode" "$name"
 }

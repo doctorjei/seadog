@@ -1,6 +1,6 @@
 [package]
 name = "seadog-priv"
-version = "0.7.3"
+version = "0.8.0"
 description = "Root-privileged helper for seadog: re-validates + realizes/destroys PVE guests"
 edition.workspace = true
 license.workspace = true

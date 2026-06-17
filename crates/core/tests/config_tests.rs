@@ -335,6 +335,38 @@ images:
 }
 
 #[test]
+fn caps_memory_cores_default() {
+    let yaml = r#"
+images:
+  loom: { ref: r/loom:1, modes: [lxc] }
+"#;
+    let cfg = Config::from_yaml_str(yaml).expect("parse");
+    cfg.validate().expect("validates");
+    assert_eq!(cfg.allocation.caps.max_memory_mb, 8192);
+    assert_eq!(cfg.allocation.caps.max_cores, 8);
+}
+
+#[test]
+fn caps_memory_cores_override_round_trips() {
+    let yaml = r#"
+allocation:
+  caps:
+    max_memory_mb: 4096
+    max_cores: 2
+images:
+  loom: { ref: r/loom:1, modes: [lxc] }
+"#;
+    let cfg = Config::from_yaml_str(yaml).expect("parse");
+    cfg.validate().expect("validates");
+    assert_eq!(cfg.allocation.caps.max_memory_mb, 4096);
+    assert_eq!(cfg.allocation.caps.max_cores, 2);
+    // The per-owner concurrency ceilings keep their defaults (override is
+    // partial: only the two sizing ceilings are set).
+    assert_eq!(cfg.allocation.caps.max_lxc_per_owner, 8);
+    assert_eq!(cfg.allocation.caps.max_vm_per_owner, 3);
+}
+
+#[test]
 fn rejects_malformed_ip_range() {
     let yaml = r#"
 allocation:

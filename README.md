@@ -52,7 +52,10 @@ ssh testenv@<kento-host> ack 4dc67469-3031-4f0a-9b21-0c7e8a2f1d44  # ack an env'
 `create` flags: `--image <name>` (required, an allowlist name — never an
 OCI ref), `--mode lxc|vm` (defaults to the image's first allowed mode),
 `--ttl <dur>` (hard-kill override), `--duration <dur>` (soft "expected
-done" override). Durations are humantime strings (`30m`, `1h`, `2h30m`).
+done" override), `--memory <MB>` / `--cores <N>` (explicit guest sizing,
+both modes; clamped to `allocation.caps.max_memory_mb` / `max_cores`).
+Durations are humantime strings (`30m`, `1h`, `2h30m`). Omit `--memory` /
+`--cores` and kento applies its own default sizing — seadog imposes none.
 
 A thin client wrapper, `deploy/seadog-wrapper.sh`, lets a caller shell out
 to seadog — it just forwards args to `ssh testenv@$SEADOG_HOST`:

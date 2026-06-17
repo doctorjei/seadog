@@ -17,6 +17,11 @@ allocation:
   caps:                         # global concurrency ceilings (per-owner overrides below)
     max_lxc_per_owner: 8
     max_vm_per_owner: 3
+    # Explicit create-time sizing ceilings (MB / cores). They CLAMP a caller's
+    # `create --memory` / `--cores` request (silent cap, like max_ttl); they do
+    # NOT impose a default — omitting the flag lets kento pick its own sizing.
+    # max_memory_mb: 8192         # default 8192 MB; 0 = unlimited (no clamp)
+    # max_cores: 8                # default 8 cores; 0 = unlimited (no clamp)
 
 # Login user the OWNER's injected SSH key authorizes inside a provisioned
 # guest (used for `--ssh-key-user`). Fail-open default: "root". A per-image

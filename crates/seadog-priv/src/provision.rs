@@ -115,6 +115,14 @@ pub struct ProvisionArgs {
     /// served image alias. Re-validated here against the allowlist.
     #[arg(long = "allow-nesting", action = clap::ArgAction::Set)]
     pub allow_nesting: bool,
+    /// Optional memory ceiling-clamped request (MB). Forwarded to kento
+    /// `--memory`; omitted ⇒ kento default.
+    #[arg(long)]
+    pub memory: Option<u32>,
+    /// Optional cores ceiling-clamped request. Forwarded to kento `--cores`;
+    /// omitted ⇒ kento default.
+    #[arg(long)]
+    pub cores: Option<u32>,
 }
 
 /// Compiled MAC regex: six lowercase hex octets, colon-separated.
@@ -149,6 +157,19 @@ fn validate_image_ref(image_ref: &str, mode: Mode, config: &Config) -> Result<()
         );
     }
     Ok(())
+}
+
+/// Boundary re-clamp for an explicit sizing request (`--memory`/`--cores`):
+/// trust nothing from the front-end. Reject `Some(0)` (kento requires ≥ 1) and
+/// clamp `Some(v)` to `ceiling` when `ceiling != 0` (0 ⇒ unlimited/no clamp).
+/// `None` stays `None` so kento applies its own default.
+fn clamp_resource(req: Option<u32>, ceiling: u32, label: &str) -> Result<Option<u32>> {
+    match req {
+        None => Ok(None),
+        Some(0) => bail!("--{label} must be >= 1"),
+        Some(v) if ceiling == 0 => Ok(Some(v)),
+        Some(v) => Ok(Some(v.min(ceiling))),
+    }
 }
 
 /// Run `provision`: re-validate all args, then create the guest (kento
@@ -199,6 +220,15 @@ pub fn run(args: &ProvisionArgs, kento: &dyn Kento, config: &Config) -> Result<V
     };
     let ssh_key_file = _owner_key.as_ref().map(|f| f.path.clone());
 
+    // BOUNDARY re-validation/clamp of the sizing requests (same posture as the
+    // mac/ip/name/nesting re-checks above — trust nothing from the front-end).
+    // Reject 0 (kento requires ≥ 1) and re-clamp to the operator ceilings; a
+    // ceiling of 0 means unlimited/no clamp.
+    let mem_ceiling = config.allocation.caps.max_memory_mb;
+    let cores_ceiling = config.allocation.caps.max_cores;
+    let memory = clamp_resource(args.memory, mem_ceiling, "memory")?;
+    let cores = clamp_resource(args.cores, cores_ceiling, "cores")?;
+
     // Create the guest with exactly the allocated params + markers. The
     // bridge + IP prefix/gateway come from the helper's own config (kento
     // owns networking; we pass `--network bridge=<bridge> --ip <ip>/<prefix>
@@ -217,6 +247,8 @@ pub fn run(args: &ProvisionArgs, kento: &dyn Kento, config: &Config) -> Result<V
         ssh_key_file,
         ssh_key_user,
         allow_nesting: args.allow_nesting,
+        memory,
+        cores,
     };
     // kento reports the realized signals (MAC + host-key fps + backend vmid
     // where one exists) via `inspect --json`. The helper just returns them;
@@ -254,6 +286,8 @@ mod tests {
             mode: "lxc".into(),
             image_ref: "registry.example.com/loom:1.0".into(),
             allow_nesting: false,
+            memory: None,
+            cores: None,
         }
     }
 
@@ -305,6 +339,78 @@ mod tests {
         assert_eq!(k.provisions().len(), 1);
         // VM: --mac is honored, so the effective MAC is the one we passed.
         assert_eq!(out["mac"], "aa:bb:cc:dd:ee:ff");
+    }
+
+    #[test]
+    fn memory_cores_none_omitted() {
+        // Default args carry no sizing ⇒ the recorded spec leaves both None so
+        // kento applies its own default (no --memory/--cores in argv).
+        let _env = AuthkeysEnv::new();
+        let cfg = config();
+        let k = FakeKento::new();
+        let out = run(&args(), &k, &cfg).unwrap();
+        assert_eq!(out["ok"], true);
+        let p = &k.provisions()[0];
+        assert_eq!(p.memory, None);
+        assert_eq!(p.cores, None);
+    }
+
+    #[test]
+    fn memory_cores_reach_spec_within_ceiling() {
+        // Explicit requests below the (default 8192/8) ceilings reach the spec
+        // verbatim.
+        let _env = AuthkeysEnv::new();
+        let cfg = config();
+        let k = FakeKento::new();
+        let mut a = args();
+        a.memory = Some(2048);
+        a.cores = Some(4);
+        let out = run(&a, &k, &cfg).unwrap();
+        assert_eq!(out["ok"], true);
+        let p = &k.provisions()[0];
+        assert_eq!(p.memory, Some(2048));
+        assert_eq!(p.cores, Some(4));
+    }
+
+    #[test]
+    fn memory_cores_clamped_to_ceiling() {
+        // A config with small operator ceilings (1024 MB / 2 cores). An
+        // over-ceiling request is silently clamped at the helper boundary.
+        let _env = AuthkeysEnv::new();
+        let yaml = r#"
+allocation:
+  caps:
+    max_memory_mb: 1024
+    max_cores: 2
+images:
+  loom:
+    ref: "registry.example.com/loom:1.0"
+    modes: [lxc, vm]
+"#;
+        let cfg = seadog_core::config::Config::from_yaml_str(yaml).unwrap();
+        cfg.validate().unwrap();
+        let k = FakeKento::new();
+        let mut a = args();
+        a.memory = Some(4096);
+        a.cores = Some(8);
+        let out = run(&a, &k, &cfg).unwrap();
+        assert_eq!(out["ok"], true);
+        let p = &k.provisions()[0];
+        assert_eq!(p.memory, Some(1024));
+        assert_eq!(p.cores, Some(2));
+    }
+
+    #[test]
+    fn memory_zero_rejected() {
+        // kento requires memory ≥ 1; a 0 request is refused at the boundary and
+        // no provision is recorded.
+        let _env = AuthkeysEnv::new();
+        let cfg = config();
+        let k = FakeKento::new();
+        let mut a = args();
+        a.memory = Some(0);
+        assert!(run(&a, &k, &cfg).is_err());
+        assert!(k.provisions().is_empty());
     }
 
     #[test]

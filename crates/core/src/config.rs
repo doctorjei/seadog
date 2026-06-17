@@ -128,6 +128,18 @@ pub struct Caps {
     pub max_lxc_per_owner: u32,
     #[serde(default = "max_vm_default")]
     pub max_vm_per_owner: u32,
+    /// Operator ceiling on a create's requested memory (MB). An explicit
+    /// `--memory` request is clamped to this; omitting `--memory` lets kento
+    /// apply its own default (seadog imposes none). `0` = unlimited / no clamp
+    /// (mirroring the `herd_cap` 0-convention).
+    #[serde(default = "max_memory_default")]
+    pub max_memory_mb: u32,
+    /// Operator ceiling on a create's requested cpu cores. An explicit
+    /// `--cores` request is clamped to this; omitting `--cores` lets kento
+    /// apply its own default (seadog imposes none). `0` = unlimited / no clamp
+    /// (mirroring the `herd_cap` 0-convention).
+    #[serde(default = "max_cores_default")]
+    pub max_cores: u32,
 }
 
 impl Default for Caps {
@@ -135,6 +147,8 @@ impl Default for Caps {
         Caps {
             max_lxc_per_owner: max_lxc_default(),
             max_vm_per_owner: max_vm_default(),
+            max_memory_mb: max_memory_default(),
+            max_cores: max_cores_default(),
         }
     }
 }
@@ -442,4 +456,10 @@ fn max_vm_default() -> u32 {
 }
 fn herd_cap_default() -> u32 {
     10
+}
+fn max_memory_default() -> u32 {
+    8192
+}
+fn max_cores_default() -> u32 {
+    8
 }
