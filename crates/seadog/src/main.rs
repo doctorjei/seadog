@@ -41,6 +41,7 @@ const DEFAULT_DB: &str = "/var/lib/seadog/seadog.db";
 #[command(
     name = "seadog",
     about = "seadog test-env provisioner (login-shell front-end)",
+    version,
     disable_help_flag = false
 )]
 struct Cli {
@@ -674,6 +675,15 @@ mod tests {
         // process::exit path itself.
         let err = Cli::try_parse_from(["seadog", "--help"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn version_flag_parses_as_display_version() {
+        // `--version` must reach run()'s DisplayVersion arm (clean print +
+        // exit 0), not fall through to the JSON error envelope. Requires the
+        // `version` attribute on the top-level command.
+        let err = Cli::try_parse_from(["seadog", "--version"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
     }
 
     #[test]
