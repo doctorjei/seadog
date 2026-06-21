@@ -89,6 +89,23 @@ jobs:
             target/x86_64-unknown-linux-musl/release/seadog
             target/x86_64-unknown-linux-musl/release/seadog-priv
 
+      # Edge .deb on every push/PR so a PRE-TAG VM test (or blue dogfood deploy)
+      # has an installable package without cutting a release tag. `--no-build`
+      # reuses the static-musl binaries built above (packaging needs no linker).
+      # The tagged rc->promote release flow (release.yml) is unchanged and still
+      # owns the published .deb/.rpm/tarball + checksums.
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build .deb (from the musl binaries above)
+        run: cargo deb -p seadog --target x86_64-unknown-linux-musl --no-build
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v7
+        with:
+          name: seadog-deb
+          path: target/debian/*.deb
+
   # Separate job so a flake in the host-mutating soak does not mask the
   # unit-test signal from `test`.
   #
