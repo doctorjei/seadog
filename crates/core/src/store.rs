@@ -721,7 +721,7 @@ images:
         .unwrap();
         // Its per-kind one-shot lifecycle rows (namespaced `{guid}:<kind>`):
         // these must be pruned alongside the bare-guid row.
-        for kind in ["g1:grace", "g1:reaped"] {
+        for kind in ["g1:grace", "g1:reaped", "g1:anomaly", "g1:overdue"] {
             put_notify_state(
                 &conn,
                 &NotifyState {
@@ -763,6 +763,14 @@ images:
         assert!(
             get_notify_state(&conn, "g1:reaped").unwrap().is_none(),
             "per-kind `{{guid}}:reaped` row must be cleared with its env"
+        );
+        assert!(
+            get_notify_state(&conn, "g1:anomaly").unwrap().is_none(),
+            "per-kind `{{guid}}:anomaly` row must be cleared with its env"
+        );
+        assert!(
+            get_notify_state(&conn, "g1:overdue").unwrap().is_none(),
+            "per-kind `{{guid}}:overdue` row must be cleared with its env"
         );
         assert!(
             get_notify_state(&conn, "vmid-9999").unwrap().is_some(),

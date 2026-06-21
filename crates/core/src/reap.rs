@@ -674,7 +674,9 @@ images:
         );
         assert!(k.teardowns().is_empty());
         assert!(
-            store::get_notify_state(&conn, "g1").unwrap().is_none(),
+            store::get_notify_state(&conn, "g1:anomaly")
+                .unwrap()
+                .is_none(),
             "no warning notify_state row must be persisted in the create window"
         );
         assert_eq!(
@@ -699,7 +701,7 @@ images:
         let out = sweep(&k, &conn, &c, now).unwrap();
         assert_eq!(out.flagged, 1, "an aged anomaly must still be flagged");
         assert!(k.teardowns().is_empty(), "anomaly is never reaped");
-        let st = store::get_notify_state(&conn, "g1")
+        let st = store::get_notify_state(&conn, "g1:anomaly")
             .unwrap()
             .expect("aged anomaly must persist a notify_state row");
         assert_eq!(st.last_severity, "warning");

@@ -93,10 +93,11 @@ pub enum Event {
         detail: String,
     },
     /// An identity anomaly that needs an operator decision. Re-alerts on
-    /// backoff with climbing severity.
+    /// backoff with climbing severity; key `{guid}:anomaly`.
     Anomaly { guid: String, detail: String },
     /// Our env is overdue but still unreaped (e.g. herd-capped or
-    /// teardown-failing). Re-alerts on backoff with climbing severity.
+    /// teardown-failing). Re-alerts on backoff with climbing severity; key
+    /// `{guid}:overdue`.
     OverdueUnreaped { guid: String, detail: String },
     /// Our env is within `grace` of its ttl deadline (warned, not killed).
     /// Per-env, one emit; key `{guid}:grace`.
@@ -115,18 +116,21 @@ pub enum Event {
 }
 
 impl Event {
-    /// The state key. Escalating env events (`Anomaly`/`OverdueUnreaped`)
-    /// key on the BARE env guid — the `ack` verb acks by that bare guid, so
-    /// they must stay un-namespaced. Foreign keys on its vmid token, the
-    /// sweeper on its synthetic token. The four one-shot per-env lifecycle
-    /// events get a PER-KIND namespaced key (`{guid}:<kind>`) so distinct
-    /// events for one guid no longer collide in dedup, while two of the SAME
-    /// kind still share a key (dedup preserved). `pub(crate)` so `reap.rs`
-    /// loads prior state via this exact key (no mirror to drift).
+    /// The state key. The escalating env events (`Anomaly`/`OverdueUnreaped`)
+    /// each get a PER-KIND namespaced key (`{guid}:anomaly` / `{guid}:overdue`)
+    /// so the two can't suppress each other in dedup if they co-occur for one
+    /// guid; the `ack` verb writes acked rows for BOTH namespaced keys, so an
+    /// ack still mutes them. Foreign keys on its vmid token, the sweeper on its
+    /// synthetic token. The four one-shot per-env lifecycle events likewise get
+    /// a PER-KIND namespaced key (`{guid}:<kind>`) so distinct events for one
+    /// guid no longer collide in dedup, while two of the SAME kind still share
+    /// a key (dedup preserved). `pub(crate)` so `reap.rs` loads prior state via
+    /// this exact key (no mirror to drift).
     pub(crate) fn key(&self) -> String {
         match self {
             Event::ForeignHeadsUp { guid_or_vmid, .. } => guid_or_vmid.clone(),
-            Event::Anomaly { guid, .. } | Event::OverdueUnreaped { guid, .. } => guid.clone(),
+            Event::Anomaly { guid, .. } => format!("{guid}:anomaly"),
+            Event::OverdueUnreaped { guid, .. } => format!("{guid}:overdue"),
             Event::GraceWarning { guid, .. } => format!("{guid}:grace"),
             Event::Vanished { guid, .. } => format!("{guid}:vanished"),
             Event::HostKeyRegen { guid, .. } => format!("{guid}:hostkey"),
@@ -650,6 +654,58 @@ images:
         let d = decide(&ev, None, &c, 0);
         assert_eq!(d.severity, Severity::Warning);
         assert!(d.emit && d.fire_push);
+    }
+
+    #[test]
+    fn escalating_kinds_have_distinct_keys() {
+        // Anomaly and OverdueUnreaped for the SAME guid must yield two DISTINCT
+        // keys, so one can't dedup/suppress the other if they co-occur. This is
+        // the escalating-event analogue of the lifecycle per-kind keys.
+        let guid = "g1";
+        let anomaly = Event::Anomaly {
+            guid: guid.into(),
+            detail: "renamed".into(),
+        };
+        let overdue = Event::OverdueUnreaped {
+            guid: guid.into(),
+            detail: "overdue".into(),
+        };
+        assert_eq!(anomaly.key(), "g1:anomaly");
+        assert_eq!(overdue.key(), "g1:overdue");
+        assert_ne!(
+            anomaly.key(),
+            overdue.key(),
+            "the two escalating kinds must not share a key"
+        );
+    }
+
+    #[test]
+    fn ack_under_each_namespaced_key_suppresses_its_escalation() {
+        // ack writes an acked row per namespaced key; with that prior loaded,
+        // a subsequent Anomaly AND OverdueUnreaped emit are both suppressed.
+        let c = config();
+        let anomaly = Event::Anomaly {
+            guid: "g1".into(),
+            detail: "renamed".into(),
+        };
+        let overdue = Event::OverdueUnreaped {
+            guid: "g1".into(),
+            detail: "overdue".into(),
+        };
+
+        let acked_for = |ev: &Event| NotifyState {
+            guid: ev.key(),
+            last_severity: String::new(),
+            last_emitted_at: 1000,
+            acked: true,
+            acked_by: Some("alice".into()),
+            acked_at: Some(1000),
+        };
+
+        let da = decide(&anomaly, Some(&acked_for(&anomaly)), &c, 5_000_000);
+        assert!(!da.emit, "an acked anomaly row must suppress the anomaly");
+        let do_ = decide(&overdue, Some(&acked_for(&overdue)), &c, 5_000_000);
+        assert!(!do_.emit, "an acked overdue row must suppress the overdue");
     }
 
     #[test]

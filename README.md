@@ -47,6 +47,8 @@ ssh testenv@<kento-host> health         # binary version, reaper heartbeat, coun
 ssh testenv@<kento-host> stats          # env counts by status / owner
 ssh testenv@<kento-host> history 24h    # terminal envs in a window
 ssh testenv@<kento-host> ack 4dc67469-3031-4f0a-9b21-0c7e8a2f1d44  # ack an env's notification
+ssh testenv@<kento-host> images         # the served image catalog (valid --image names)
+ssh testenv@<kento-host> help           # plain-text usage (also --help / <verb> --help)
 ```
 
 `create` flags: `--image <name>` (required, an allowlist name — never an

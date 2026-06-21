@@ -1,9 +1,12 @@
 //! `ack <env-id>` — acknowledge a notification, suppressing further
 //! escalation for that env.
 //!
-//! DB-only: flips the `acked` flag in the env's `notify_state` row. Keyed by
-//! the env-id (`guid`) — the same id `destroy`/`show` take — which is also
-//! the `notify_state` primary key.
+//! DB-only: flips the `acked` flag in the env's `notify_state` rows. The
+//! escalating events (`Anomaly`/`OverdueUnreaped`) load their prior state via
+//! per-kind namespaced keys (`{guid}:anomaly` / `{guid}:overdue`), so ack
+//! writes an acked row for BOTH of those keys (no escalation reads a bare-guid
+//! env row any more). The env-id (`guid`) is the same id `destroy`/`show`
+//! take.
 //!
 //! Scoped: an owner may ack their **own** env, or any env that is `Flagged`
 //! (the legitimate "silence a foreign/anomaly heads-up" case — a flagged env
@@ -19,10 +22,11 @@ use serde_json::{json, Value};
 use super::Ctx;
 
 /// `ack <env-id>`. Resolves the env-id (guid) to its env, enforces the ack
-/// scope (own env OR `Flagged`), then sets that env's notify-state
-/// `acked = true` plus the `acked_by` / `acked_at` audit (creating the row if
-/// none exists yet, so an ack lands even before the reaper has emitted).
-/// Returns the affected guid.
+/// scope (own env OR `Flagged`), then sets `acked = true` plus the
+/// `acked_by` / `acked_at` audit on the notify-state rows for BOTH escalating
+/// keys (`{guid}:anomaly` and `{guid}:overdue`), creating either if none
+/// exists yet (so an ack lands even before the reaper has emitted). Returns
+/// the affected guid.
 pub fn run(ctx: &Ctx, env_id: &str) -> Result<Value> {
     let env =
         store::get_env(ctx.conn, env_id)?.ok_or_else(|| anyhow!("env '{env_id}' not found"))?;
@@ -35,24 +39,31 @@ pub fn run(ctx: &Ctx, env_id: &str) -> Result<Value> {
         ));
     }
 
-    let prior = store::get_notify_state(ctx.conn, &env.guid)?;
-    let new_state = match prior {
-        Some(mut s) => {
-            s.acked = true;
-            s.acked_by = Some(ctx.owner.clone());
-            s.acked_at = Some(ctx.now_unix);
-            s
-        }
-        None => NotifyState {
-            guid: env.guid.clone(),
-            last_severity: String::new(),
-            last_emitted_at: ctx.now_unix,
-            acked: true,
-            acked_by: Some(ctx.owner.clone()),
-            acked_at: Some(ctx.now_unix),
-        },
-    };
-    store::put_notify_state(ctx.conn, &new_state)?;
+    // The escalating events load prior state via per-kind namespaced keys, so
+    // ack must write an acked row for each — a single bare-guid row would no
+    // longer be read by either.
+    for key in [
+        format!("{}:anomaly", env.guid),
+        format!("{}:overdue", env.guid),
+    ] {
+        let new_state = match store::get_notify_state(ctx.conn, &key)? {
+            Some(mut s) => {
+                s.acked = true;
+                s.acked_by = Some(ctx.owner.clone());
+                s.acked_at = Some(ctx.now_unix);
+                s
+            }
+            None => NotifyState {
+                guid: key,
+                last_severity: String::new(),
+                last_emitted_at: ctx.now_unix,
+                acked: true,
+                acked_by: Some(ctx.owner.clone()),
+                acked_at: Some(ctx.now_unix),
+            },
+        };
+        store::put_notify_state(ctx.conn, &new_state)?;
+    }
 
     Ok(json!({
         "guid": env.guid,

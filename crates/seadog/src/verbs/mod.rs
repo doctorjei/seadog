@@ -21,6 +21,7 @@ pub mod destroy;
 pub mod extend;
 pub mod health;
 pub mod history;
+pub mod images;
 pub mod ls;
 pub mod show;
 pub mod stats;

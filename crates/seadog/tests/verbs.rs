@@ -231,12 +231,12 @@ fn ack_flips_notify_state() {
         &mk_env("g-1", 10010, "alice", EnvStatus::Active, 1000, 5000),
     )
     .unwrap();
-    // Seed an un-acked notify state.
+    // Seed an un-acked anomaly notify state under its namespaced key.
     store::put_notify_state(
         &conn,
         &NotifyState {
-            guid: "g-1".into(),
-            last_severity: "warn".into(),
+            guid: "g-1:anomaly".into(),
+            last_severity: "warning".into(),
             last_emitted_at: 1234,
             acked: false,
             acked_by: None,
@@ -249,13 +249,47 @@ fn ack_flips_notify_state() {
     assert!(ok, "stderr: {err}");
     assert_eq!(json["guid"], "g-1");
     assert_eq!(json["acked"], true);
-    // Persisted flip.
-    let s = store::get_notify_state(&fx.conn(), "g-1").unwrap().unwrap();
-    assert!(s.acked);
-    assert_eq!(s.last_severity, "warn", "ack must not clobber severity");
-    // Audit recorded: who acked (the trusted owner) and when (some time).
-    assert_eq!(s.acked_by.as_deref(), Some("alice"));
-    assert!(s.acked_at.is_some(), "ack must record acked_at");
+
+    // The pre-existing anomaly row was flipped in place (severity preserved,
+    // audit recorded).
+    let anomaly = store::get_notify_state(&fx.conn(), "g-1:anomaly")
+        .unwrap()
+        .unwrap();
+    assert!(anomaly.acked);
+    assert_eq!(
+        anomaly.last_severity, "warning",
+        "ack must not clobber severity"
+    );
+    assert_eq!(anomaly.acked_by.as_deref(), Some("alice"));
+    assert!(anomaly.acked_at.is_some(), "ack must record acked_at");
+
+    // The overdue row was created acked even though the reaper never emitted
+    // it (so a future OverdueUnreaped is muted too).
+    let overdue = store::get_notify_state(&fx.conn(), "g-1:overdue")
+        .unwrap()
+        .unwrap();
+    assert!(overdue.acked);
+    assert_eq!(overdue.acked_by.as_deref(), Some("alice"));
+
+    // End-to-end: with the acked rows loaded as `prior`, a subsequent Anomaly
+    // AND OverdueUnreaped decision are both suppressed.
+    let cfg = seadog_core::Config::from_yaml_str(CONFIG_YAML).unwrap();
+    let anomaly_ev = seadog_core::notify::Event::Anomaly {
+        guid: "g-1".into(),
+        detail: "renamed".into(),
+    };
+    let overdue_ev = seadog_core::notify::Event::OverdueUnreaped {
+        guid: "g-1".into(),
+        detail: "overdue".into(),
+    };
+    assert!(
+        !seadog_core::notify::decide(&anomaly_ev, Some(&anomaly), &cfg, 9_999_999).emit,
+        "an acked anomaly row must suppress a later anomaly emit"
+    );
+    assert!(
+        !seadog_core::notify::decide(&overdue_ev, Some(&overdue), &cfg, 9_999_999).emit,
+        "an acked overdue row must suppress a later overdue emit"
+    );
 }
 
 #[test]
@@ -290,8 +324,11 @@ fn ack_refuses_foreign_healthy_env_but_allows_flagged() {
         errobj["error"].as_str().unwrap().contains("not yours"),
         "error should explain the scope: {err}"
     );
-    // No notify_state row was created for the refused env.
-    assert!(store::get_notify_state(&fx.conn(), "g-bob-active")
+    // No notify_state row was created for the refused env (under any key).
+    assert!(store::get_notify_state(&fx.conn(), "g-bob-active:anomaly")
+        .unwrap()
+        .is_none());
+    assert!(store::get_notify_state(&fx.conn(), "g-bob-active:overdue")
         .unwrap()
         .is_none());
 
@@ -300,7 +337,7 @@ fn ack_refuses_foreign_healthy_env_but_allows_flagged() {
     let (ok, json, err) = fx.run("alice", &["ack", "g-bob-flagged"]);
     assert!(ok, "acking a flagged env must be allowed; stderr: {err}");
     assert_eq!(json["acked"], true);
-    let s = store::get_notify_state(&fx.conn(), "g-bob-flagged")
+    let s = store::get_notify_state(&fx.conn(), "g-bob-flagged:anomaly")
         .unwrap()
         .unwrap();
     assert!(s.acked);

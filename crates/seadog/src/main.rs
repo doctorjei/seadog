@@ -72,6 +72,8 @@ enum Verb {
     },
     /// Aggregate env counts (by status / owner).
     Stats,
+    /// List the served image catalog (available --image names).
+    Images,
     /// Extend an env's hard-kill deadline (owner-scoped, DB-only).
     Extend {
         /// The env-id (guid) to extend — must be yours.
@@ -155,18 +157,38 @@ fn run() -> anyhow::Result<serde_json::Value> {
 
     // Trusted owner: `--owner <name>` (injected by the authorized_keys
     // forced command), else the key-fingerprint fallback. Never from the
-    // user's command text.
+    // user's command text. Owner resolution is deferred until AFTER the clap
+    // parse so `help`/`--help`/`--version` work without a resolvable owner.
     let (owner_flag, verb_argv) = owner::owner_from_args(&argv);
+
+    // Parse the verb argv with clap. `try_parse_from` wants argv0 first.
+    let mut clap_argv = vec!["seadog".to_string()];
+    clap_argv.extend(verb_argv);
+    let cli = match Cli::try_parse_from(&clap_argv) {
+        Ok(c) => c,
+        Err(e) => {
+            use clap::error::ErrorKind;
+            match e.kind() {
+                ErrorKind::DisplayHelp
+                | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                | ErrorKind::DisplayVersion => {
+                    // Clean meta output (clap picks stdout for help/version);
+                    // success exit — NOT the JSON error envelope.
+                    let _ = e.print();
+                    std::process::exit(0);
+                }
+                _ => return Err(anyhow::anyhow!(e.to_string())),
+            }
+        }
+    };
+
+    // Owner resolution happens after a successful clap parse (help/version
+    // already short-circuited above).
     let owner = match owner_flag {
         Some(o) => o,
         None => resolve_owner_fallback()
             .ok_or_else(|| anyhow::anyhow!("could not resolve owner (no --owner, no key match)"))?,
     };
-
-    // Parse the verb argv with clap. `try_parse_from` wants argv0 first.
-    let mut clap_argv = vec!["seadog".to_string()];
-    clap_argv.extend(verb_argv);
-    let cli = Cli::try_parse_from(&clap_argv).map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     // Load config + open store (paths overridable for tests).
     let config = load_config()?;
@@ -198,6 +220,7 @@ fn dispatch(ctx: &Ctx, verb: Verb) -> anyhow::Result<serde_json::Value> {
             verbs::history::run(ctx, secs)
         }
         Verb::Stats => verbs::stats::run(ctx),
+        Verb::Images => verbs::images::run(ctx),
         Verb::Extend { env_id, duration } => {
             let d = humantime::parse_duration(&duration)
                 .map_err(|e| anyhow::anyhow!("invalid duration '{duration}': {e}"))?;
@@ -641,6 +664,16 @@ mod tests {
         assert_eq!(argv, vec!["health".to_string()]);
         let (owner, _) = owner::owner_from_args(&argv);
         assert_eq!(owner, None);
+    }
+
+    #[test]
+    fn help_flag_parses_as_display_help() {
+        // Pins the contract the run() display-kind arm relies on: clap returns
+        // `--help` as an Err whose kind is DisplayHelp (we then print + exit 0,
+        // never the JSON error envelope). We can't easily test the
+        // process::exit path itself.
+        let err = Cli::try_parse_from(["seadog", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 
     #[test]
