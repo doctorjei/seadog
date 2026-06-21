@@ -84,6 +84,28 @@ impl Fixture {
         let json = serde_json::from_str(&stdout).unwrap_or(Value::Null);
         (out.status.success(), json, stderr)
     }
+
+    /// Like `run` but injects NO `--owner` (and no SSH auth info), i.e. the
+    /// host-operator path. Returns (success, stdout_json_or_null, stderr).
+    fn run_no_owner(&self, args: &[&str]) -> (bool, Value, String) {
+        let exe = env!("CARGO_BIN_EXE_seadog");
+        let mut cmd = Command::new(exe);
+        cmd.env("SEADOG_DB", &self.db_path)
+            .env("SEADOG_CONFIG", &self.config_path)
+            .env_remove("SSH_ORIGINAL_COMMAND")
+            .env_remove("SSH_AUTH_INFO_0")
+            .env("SEADOG_SUDO", "")
+            .env("SEADOG_SETSID", "")
+            .env("SEADOG_PRIV_BIN", fake_priv_path());
+        for a in args {
+            cmd.arg(a);
+        }
+        let out = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let json = serde_json::from_str(&stdout).unwrap_or(Value::Null);
+        (out.status.success(), json, stderr)
+    }
 }
 
 /// Absolute path to the fake `seadog-priv` script, `chmod +x`'d once. The
@@ -158,6 +180,56 @@ fn ls_shows_only_owner_active_and_all_shows_everything() {
     assert!(ok);
     assert_eq!(json["envs"].as_array().unwrap().len(), 3);
     assert_eq!(json["all"], true);
+}
+
+#[test]
+fn images_works_without_owner() {
+    // Config-only path: the host operator (no --owner) may list the catalog.
+    let fx = Fixture::new();
+    let (ok, json, err) = fx.run_no_owner(&["images"]);
+    assert!(ok, "stderr: {err}");
+    assert_eq!(json["loom"]["ref"], "ghcr.io/x/droste:loom");
+    assert!(json["ci"].is_object(), "ci alias present: {json}");
+}
+
+#[test]
+fn ls_without_owner_is_operator_view() {
+    // No --owner ⇒ operator/global view, identical to `ls --all`.
+    let fx = Fixture::new();
+    let conn = fx.conn();
+    store::insert_env(
+        &conn,
+        &mk_env("g-alice-1", 10010, "alice", EnvStatus::Active, 1000, 5000),
+    )
+    .unwrap();
+    store::insert_env(
+        &conn,
+        &mk_env("g-alice-2", 10011, "alice", EnvStatus::Reaped, 900, 4000),
+    )
+    .unwrap();
+    store::insert_env(
+        &conn,
+        &mk_env("g-bob-1", 10012, "bob", EnvStatus::Active, 1100, 6000),
+    )
+    .unwrap();
+
+    let (ok, json, err) = fx.run_no_owner(&["ls"]);
+    assert!(ok, "stderr: {err}");
+    // Operator view == `ls --all`: every seeded env regardless of owner/status.
+    assert_eq!(json["count"], 3);
+    assert_eq!(json["all"], true);
+}
+
+#[test]
+fn privileged_verb_without_owner_is_rejected() {
+    // A mutating verb with no resolvable owner must be refused.
+    let fx = Fixture::new();
+    let (ok, _json, err) = fx.run_no_owner(&["destroy", "deadbeef"]);
+    assert!(!ok, "privileged verb without owner must be rejected");
+    assert!(
+        err.contains("could not resolve owner"),
+        "stderr should explain the missing owner: {err}"
+    );
 }
 
 #[test]

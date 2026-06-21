@@ -29,8 +29,12 @@ pub mod stats;
 /// Per-invocation context handed to every verb: the trusted owner, the
 /// open store connection, the parsed config, and the injected clock.
 pub struct Ctx<'a> {
-    /// The trusted, sshd-resolved owner this invocation acts as.
-    pub owner: String,
+    /// The trusted, sshd-resolved owner this invocation acts as, when one
+    /// could be resolved. `None` means the host operator (root) ran the
+    /// command directly with no `--owner` and no key match; read-only verbs
+    /// then render the operator/global view. The dispatch gate guarantees a
+    /// `Some` owner for every mutating/elevated verb.
+    pub owner: Option<String>,
     /// Open SQLite connection (already migrated).
     pub conn: &'a Connection,
     /// Parsed config (caps, lifecycle defaults, image allowlist).
@@ -47,4 +51,15 @@ pub struct Ctx<'a> {
     /// which it opens fresh from this path — `conn` is shared (`&`) so it
     /// can't be re-borrowed mutably. WAL makes the second handle safe.
     pub db_path: String,
+}
+
+impl<'a> Ctx<'a> {
+    /// The resolved owner for verbs that REQUIRE one (all mutating/elevated
+    /// verbs). The dispatch gate guarantees `Some` for those verbs, so this
+    /// only errors as a defensive backstop.
+    pub fn require_owner(&self) -> anyhow::Result<&str> {
+        self.owner
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("could not resolve owner (no --owner, no key match)"))
+    }
 }

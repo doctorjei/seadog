@@ -51,6 +51,14 @@ ssh testenv@<kento-host> images         # the served image catalog (valid --imag
 ssh testenv@<kento-host> help           # plain-text usage (also --help / <verb> --help)
 ```
 
+On the kento host itself the operator (root) can run the read-only verbs
+(`images`, `ls`, `show`, `health`, `history`, `stats`) and `help`/`--version`
+directly — e.g. `/usr/lib/seadog/seadog images` — with no SSH and no `--owner`;
+they render the operator/global view (`ls` with no owner == `ls --all`). The
+mutating/elevated verbs (`create`/`destroy`/`extend`/`ack`) still **refuse to
+run as root** (the front-end never performs a privileged op as root) and
+require a resolved owner.
+
 `create` flags: `--image <name>` (required, an allowlist name — never an
 OCI ref), `--mode lxc|vm` (defaults to the image's first allowed mode),
 `--ttl <dur>` (hard-kill override), `--duration <dur>` (soft "expected

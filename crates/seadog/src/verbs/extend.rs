@@ -14,15 +14,16 @@ use super::Ctx;
 /// (`30m`, `1h`, `2h30m`), adds it to the env's current `ttl_deadline`,
 /// and persists. Rejects a missing env and an env owned by someone else.
 pub fn run(ctx: &Ctx, env_id: &str, duration: std::time::Duration) -> Result<Value> {
+    let owner = ctx.require_owner()?;
+
     let env =
         store::get_env(ctx.conn, env_id)?.ok_or_else(|| anyhow!("no env with id '{env_id}'"))?;
 
-    if env.owner != ctx.owner {
+    if env.owner != owner {
         // Don't extend a foreign env; refuse with a clear (non-leaky)
         // ownership error.
         return Err(anyhow!(
-            "env '{env_id}' is not owned by '{}'; cannot extend",
-            ctx.owner
+            "env '{env_id}' is not owned by '{owner}'; cannot extend"
         ));
     }
 

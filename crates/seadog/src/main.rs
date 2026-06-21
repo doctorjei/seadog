@@ -116,14 +116,6 @@ enum Verb {
 }
 
 fn main() -> ExitCode {
-    // This front-end parses untrusted SSH input and must NEVER run as root
-    // (it shells to seadog-priv via sudo for any privileged op). Refuse a
-    // root euid outright — the inverse of seadog-priv's `ensure_root`.
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!("{{\"error\":\"seadog must not run as root\"}}");
-        return ExitCode::FAILURE;
-    }
-
     // Keep the SQLite WAL/SHM sidecars group-writable (shared `seadog`
     // group) so the root reaper and this front-end can both write the DB.
     // Mirrors seadog-priv; must run before the DB is opened.
@@ -183,15 +175,34 @@ fn run() -> anyhow::Result<serde_json::Value> {
         }
     };
 
-    // Owner resolution happens after a successful clap parse (help/version
-    // already short-circuited above).
-    let owner = match owner_flag {
-        Some(o) => o,
-        None => resolve_owner_fallback()
-            .ok_or_else(|| anyhow::anyhow!("could not resolve owner (no --owner, no key match)"))?,
-    };
+    let class = verb_class(&cli.verb);
+    let is_root = unsafe { libc::geteuid() } == 0;
 
-    // Load config + open store (paths overridable for tests).
+    // The front-end parses untrusted SSH input and shells to seadog-priv for
+    // privileged ops, so it must NOT run privileged/mutating verbs as root
+    // (the untrusted-parser-as-root backstop). Read-only + config verbs are
+    // exempt — the host operator (root) may inspect state directly.
+    if class == VerbClass::Privileged && is_root {
+        return Err(anyhow::anyhow!(
+            "seadog must not run privileged verbs as root"
+        ));
+    }
+
+    // `images` (config-only): no owner, no DB — just the config.
+    if class == VerbClass::ConfigOnly {
+        let config = load_config()?;
+        return verbs::images::run(&config);
+    }
+
+    // Owner: required for privileged verbs; optional for read-only (None ⇒
+    // operator/global view). Resolved only from trusted sources.
+    let owner: Option<String> = owner_flag.or_else(resolve_owner_fallback);
+    if class == VerbClass::Privileged && owner.is_none() {
+        return Err(anyhow::anyhow!(
+            "could not resolve owner (no --owner, no key match)"
+        ));
+    }
+
     let config = load_config()?;
     let db_path = std::env::var("SEADOG_DB").unwrap_or_else(|_| DEFAULT_DB.to_string());
     let conn = store::open(&db_path)?;
@@ -205,6 +216,30 @@ fn run() -> anyhow::Result<serde_json::Value> {
     };
 
     dispatch(&ctx, cli.verb)
+}
+
+/// What a verb needs, for the root/owner gate. Default-deny via an
+/// EXHAUSTIVE match: any future verb must be explicitly classified.
+#[derive(PartialEq, Eq)]
+enum VerbClass {
+    /// Config-only read — no owner, no DB; may run as root (`images`).
+    ConfigOnly,
+    /// Read-only DB verb — may run as root; owner optional (None ⇒ operator view).
+    ReadOnly,
+    /// Mutating/elevated — hard root refusal + owner required.
+    Privileged,
+}
+
+fn verb_class(v: &Verb) -> VerbClass {
+    match v {
+        Verb::Images => VerbClass::ConfigOnly,
+        Verb::Ls { .. } | Verb::Show { .. } | Verb::Health | Verb::History { .. } | Verb::Stats => {
+            VerbClass::ReadOnly
+        }
+        Verb::Create { .. } | Verb::Destroy { .. } | Verb::Extend { .. } | Verb::Ack { .. } => {
+            VerbClass::Privileged
+        }
+    }
 }
 
 /// Dispatch a parsed verb to its module.
@@ -221,7 +256,9 @@ fn dispatch(ctx: &Ctx, verb: Verb) -> anyhow::Result<serde_json::Value> {
             verbs::history::run(ctx, secs)
         }
         Verb::Stats => verbs::stats::run(ctx),
-        Verb::Images => verbs::images::run(ctx),
+        // `images` is handled earlier in `run()` (config-only, no Ctx) and
+        // never reaches dispatch; classify it for the exhaustive match.
+        Verb::Images => verbs::images::run(ctx.config),
         Verb::Extend { env_id, duration } => {
             let d = humantime::parse_duration(&duration)
                 .map_err(|e| anyhow::anyhow!("invalid duration '{duration}': {e}"))?;

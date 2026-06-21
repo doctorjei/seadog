@@ -28,12 +28,14 @@ use super::Ctx;
 /// exists yet (so an ack lands even before the reaper has emitted). Returns
 /// the affected guid.
 pub fn run(ctx: &Ctx, env_id: &str) -> Result<Value> {
+    let owner = ctx.require_owner()?;
+
     let env =
         store::get_env(ctx.conn, env_id)?.ok_or_else(|| anyhow!("env '{env_id}' not found"))?;
 
     // Scope: only the owner may mute their own env; anyone may silence a
     // Flagged anomaly heads-up. Refuse acking a foreign healthy env.
-    if env.owner != ctx.owner && env.status != EnvStatus::Flagged {
+    if env.owner != owner && env.status != EnvStatus::Flagged {
         return Err(anyhow!(
             "env '{env_id}' is not yours and not flagged; cannot ack"
         ));
@@ -49,7 +51,7 @@ pub fn run(ctx: &Ctx, env_id: &str) -> Result<Value> {
         let new_state = match store::get_notify_state(ctx.conn, &key)? {
             Some(mut s) => {
                 s.acked = true;
-                s.acked_by = Some(ctx.owner.clone());
+                s.acked_by = Some(owner.to_string());
                 s.acked_at = Some(ctx.now_unix);
                 s
             }
@@ -58,7 +60,7 @@ pub fn run(ctx: &Ctx, env_id: &str) -> Result<Value> {
                 last_severity: String::new(),
                 last_emitted_at: ctx.now_unix,
                 acked: true,
-                acked_by: Some(ctx.owner.clone()),
+                acked_by: Some(owner.to_string()),
                 acked_at: Some(ctx.now_unix),
             },
         };

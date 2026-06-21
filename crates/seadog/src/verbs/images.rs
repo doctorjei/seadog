@@ -3,7 +3,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::Ctx;
+use seadog_core::Config;
 
 /// `images`. Return the configured image allowlist as JSON so an owner over
 /// SSH can discover the valid `--image <name>` values. Read-only and NOT
@@ -14,14 +14,13 @@ use super::Ctx;
 /// `None` `user`/`allow_nesting`, so the shape is
 /// `{ "<alias>": { "ref": "…", "modes": […], ["user": "…"], ["allow_nesting": true] } }`.
 /// The OCI `ref` is included by design (Jei, 2026-06-21).
-pub fn run(ctx: &Ctx) -> Result<Value> {
-    Ok(serde_json::to_value(&ctx.config.images)?)
+pub fn run(config: &Config) -> Result<Value> {
+    Ok(serde_json::to_value(&config.images)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seadog_core::{store, Config};
 
     #[test]
     fn images_lists_alias_ref_and_modes() {
@@ -33,16 +32,8 @@ images:
 "#,
         )
         .unwrap();
-        let conn = store::open_in_memory().unwrap();
-        let ctx = Ctx {
-            owner: "alice".to_string(),
-            conn: &conn,
-            config: &config,
-            now_unix: 0,
-            db_path: ":memory:".to_string(),
-        };
 
-        let v = run(&ctx).unwrap();
+        let v = run(&config).unwrap();
         assert_eq!(v["loom"]["ref"], "ghcr.io/x/droste:loom");
         assert_eq!(v["loom"]["modes"][0], "lxc");
         assert_eq!(v["ci"]["ref"], "ghcr.io/x/ci:latest");

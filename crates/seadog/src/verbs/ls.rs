@@ -16,7 +16,10 @@ pub fn run(ctx: &Ctx, all: bool) -> Result<Value> {
     // spawn failure never affects the listing.
     let _ = spawn_watcher();
 
-    let envs = if all {
+    // The host operator (root, no resolved owner) gets the operator view too,
+    // same as an explicit `--all`.
+    let operator_view = all || ctx.owner.is_none();
+    let envs = if operator_view {
         // Every env, newest first — union across statuses via a full scan
         // by listing each status; simpler: list by owner is wrong here, so
         // we read all four statuses and merge by created_at.
@@ -32,7 +35,11 @@ pub fn run(ctx: &Ctx, all: bool) -> Result<Value> {
         v.sort_by_key(|e| std::cmp::Reverse(e.created_at));
         v
     } else {
-        store::list_by_owner(ctx.conn, &ctx.owner)?
+        let owner = ctx
+            .owner
+            .as_deref()
+            .expect("owner present when not operator_view");
+        store::list_by_owner(ctx.conn, owner)?
             .into_iter()
             .filter(|e| e.status == EnvStatus::Active)
             .collect()
@@ -41,6 +48,6 @@ pub fn run(ctx: &Ctx, all: bool) -> Result<Value> {
     Ok(json!({
         "envs": envs,
         "count": envs.len(),
-        "all": all,
+        "all": operator_view,
     }))
 }

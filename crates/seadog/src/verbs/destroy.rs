@@ -22,6 +22,8 @@ use crate::elevate::{elevate, spawn_watcher, ElevateArgs};
 
 /// `destroy <env-id>`. env-id is the `guid`.
 pub fn run(ctx: &Ctx, env_id: &str) -> Result<Value> {
+    let owner = ctx.require_owner()?;
+
     // Opportunistic reap hook (best-effort; never blocks/fails the verb).
     let _ = spawn_watcher();
 
@@ -30,8 +32,8 @@ pub fn run(ctx: &Ctx, env_id: &str) -> Result<Value> {
     // yours" semantics — we 404 it the same as unknown for non-owners).
     let env =
         store::get_env(ctx.conn, env_id)?.ok_or_else(|| anyhow!("env '{env_id}' not found"))?;
-    if env.owner != ctx.owner {
-        return Err(anyhow!("env '{env_id}' is not owned by '{}'", ctx.owner));
+    if env.owner != owner {
+        return Err(anyhow!("env '{env_id}' is not owned by '{owner}'"));
     }
 
     // Structured teardown args. The helper is GUID-driven: it re-validates
@@ -43,7 +45,7 @@ pub fn run(ctx: &Ctx, env_id: &str) -> Result<Value> {
         "--mode".to_string(),
         env.mode.as_str().to_string(),
     ];
-    let req = ElevateArgs::new("teardown", ctx.owner.clone(), argv);
+    let req = ElevateArgs::new("teardown", owner.to_string(), argv);
 
     let outcome = elevate(&req).map_err(|e| anyhow!(e))?;
 

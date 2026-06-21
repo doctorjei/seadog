@@ -51,6 +51,8 @@ pub struct CreateArgs {
 
 /// `create --image <name> [--mode lxc|vm] [--ttl <dur>] [--duration <dur>]`.
 pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
+    let owner = ctx.require_owner()?;
+
     // Opportunistic reap hook: ensure the root watcher is alive whenever
     // someone is actively mutating the system. Best-effort — never blocks
     // or fails the verb.
@@ -107,15 +109,14 @@ pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
     // 3. Cap check: count the owner's Active envs of this mode against the
     //    per-owner cap (with any config override). Reject BEFORE allocating
     //    so a capped owner never consumes a slot or shells the helper.
-    let cap = mode_cap(ctx, mode);
-    let active_of_mode = store::list_by_owner(ctx.conn, &ctx.owner)?
+    let cap = mode_cap(ctx, owner, mode);
+    let active_of_mode = store::list_by_owner(ctx.conn, owner)?
         .into_iter()
         .filter(|e| e.status == EnvStatus::Active && e.mode == mode)
         .count() as u32;
     if active_of_mode >= cap {
         return Err(anyhow!(
-            "owner '{}' is at the {} cap ({active_of_mode}/{cap}); destroy an env first",
-            ctx.owner,
+            "owner '{owner}' is at the {} cap ({active_of_mode}/{cap}); destroy an env first",
             mode.as_str()
         ));
     }
@@ -123,7 +124,7 @@ pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
     // 4. Mint identifiers + allocate the slot and insert the Active row.
     let guid = uuid::Uuid::new_v4().to_string();
     let mac = mint_mac();
-    let name = mint_guest_name(&ctx.owner, &args.image)?;
+    let name = mint_guest_name(owner, &args.image)?;
 
     let [ip_lo, ip_hi] = ctx.config.allocation.ip_pool.range;
 
@@ -137,7 +138,7 @@ pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
         &NewEnv {
             guid: &guid,
             mode,
-            owner: &ctx.owner,
+            owner,
             image: &args.image,
             name: &name,
             mac: &mac,
@@ -186,7 +187,7 @@ pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
         argv.push("--cores".to_string());
         argv.push(v.to_string());
     }
-    let req = ElevateArgs::new("provision", ctx.owner.clone(), argv);
+    let req = ElevateArgs::new("provision", owner.to_string(), argv);
 
     match elevate(&req) {
         Ok(outcome) => {
@@ -256,9 +257,9 @@ pub fn run(ctx: &Ctx, args: &CreateArgs) -> Result<Value> {
 
 /// The per-owner cap for `mode`, applying any `config.owners[owner]`
 /// override on top of the global `allocation.caps`.
-fn mode_cap(ctx: &Ctx, mode: Mode) -> u32 {
+fn mode_cap(ctx: &Ctx, owner: &str, mode: Mode) -> u32 {
     let caps = &ctx.config.allocation.caps;
-    let ov = ctx.config.owners.get(&ctx.owner);
+    let ov = ctx.config.owners.get(owner);
     match mode {
         Mode::Lxc => ov.and_then(|o| o.max_lxc).unwrap_or(caps.max_lxc_per_owner),
         Mode::Vm => ov.and_then(|o| o.max_vm).unwrap_or(caps.max_vm_per_owner),
